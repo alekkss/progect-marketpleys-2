@@ -20,7 +20,7 @@ logger = setup_logger('data_sync')
 
 class DimensionsSynchronizer:
     """Синхронизация композитных габаритов (Длина/Ширина/Высота)"""
-    
+
     # Маппинг столбцов для каждого маркетплейса
     DIMENSIONS_MAPPING = {
         'wildberries': {
@@ -40,250 +40,339 @@ class DimensionsSynchronizer:
             'unit': 'cm'
         }
     }
-    
+
     @staticmethod
     def parse_composite_dimensions(value: str) -> Optional[Dict[str, float]]:
         """
         Парсит строку "71/68/197" в словарь {length, width, height}
-        
-        Args:
-            value: строка формата "Длина/Ширина/Высота"
-            
-        Returns:
-            {'length': 71.0, 'width': 68.0, 'height': 197.0} или None
         """
         if pd.isna(value) or not str(value).strip():
             return None
-        
+
         try:
             parts = str(value).strip().split('/')
             if len(parts) != 3:
                 return None
-            
-            # Удаляем пробелы и конвертируем в float
+
             dimensions = {
                 'length': float(parts[0].strip()),
                 'width': float(parts[1].strip()),
                 'height': float(parts[2].strip())
             }
-            
-            # Проверяем что все значения положительные
+
             if all(v > 0 for v in dimensions.values()):
                 return dimensions
-            
+
         except (ValueError, AttributeError):
             pass
-        
+
         return None
-    
+
     @staticmethod
     def format_composite_dimensions(length: float, width: float, height: float) -> str:
         """
         Форматирует габариты в строку "Длина/Ширина/Высота"
-        
-        Args:
-            length: длина в см
-            width: ширина в см  
-            height: высота в см
-            
-        Returns:
-            Строка формата "71/68/197"
         """
-        # Округляем до целых если близко к целому, иначе до 1 знака
         def smart_format(val):
             if abs(val - round(val)) < 0.01:
                 return str(int(round(val)))
             return f"{val:.1f}"
-        
+
         return f"{smart_format(length)}/{smart_format(width)}/{smart_format(height)}"
-    
+
     @staticmethod
     def mm_to_cm(value: float) -> float:
         """Конвертирует миллиметры в сантиметры"""
         return value / 10
-    
+
     @staticmethod
     def cm_to_mm(value: float) -> float:
         """Конвертирует сантиметры в миллиметры"""
         return value * 10
-    
+
     @classmethod
     def sync_dimensions(cls, dfs: Dict[str, pd.DataFrame]) -> int:
         """
         Синхронизирует габариты между всеми маркетплейсами
-        
-        Args:
-            dfs: словарь DataFrame'ов по маркетплейсам
-            
-        Returns:
-            Количество синхронизированных значений
         """
-        synced_count = 0
+        logger.info("=" * 80)
+        logger.info("🔧 НАЧАЛО СИНХРОНИЗАЦИИ ГАБАРИТОВ (DimensionsSynchronizer)")
+        logger.info("=" * 80)
         
+        synced_count = 0
+
         # Получаем названия столбцов артикулов
         article_cols = {
             'wildberries': 'Артикул продавца',
             'ozon': 'Артикул*',
             'yandex': 'Ваш SKU *'
         }
-        
+
         # Создаём маппинг артикул → данные
-        yandex_dimensions = {}  # {article: {'length': 71, 'width': 68, 'height': 197}}
+        yandex_dimensions = {}
         wb_dimensions = {}
         ozon_dimensions = {}
+
+        # ==================== ЭТАП 1: ЧТЕНИЕ ДАННЫХ ИЗ ЯНДЕКС ====================
+        logger.info("\n📖 ЭТАП 1: Чтение габаритов из Яндекс (композитный формат)")
         
-        # 1. Читаем данные из Яндекс (композитный формат)
-        if 'yandex' in dfs and cls.DIMENSIONS_MAPPING['yandex']['composite'] in dfs['yandex'].columns:
+        yandex_col = cls.DIMENSIONS_MAPPING['yandex']['composite']
+        logger.info(f"   Ищем столбец: '{yandex_col}'")
+        
+        if 'yandex' not in dfs:
+            logger.warning("   ❌ DataFrame 'yandex' отсутствует!")
+        elif yandex_col not in dfs['yandex'].columns:
+            logger.warning(f"   ❌ Столбец '{yandex_col}' не найден в Яндекс!")
+            logger.info(f"   Доступные столбцы: {list(dfs['yandex'].columns)[:10]}...")
+        else:
+            logger.info(f"   ✅ Столбец '{yandex_col}' найден")
+            
+            rows_checked = 0
+            rows_with_article = 0
+            rows_with_dimensions = 0
+            
             for idx, row in dfs['yandex'].iterrows():
+                rows_checked += 1
                 article = row.get(article_cols['yandex'])
+                
                 if pd.notna(article) and str(article).strip():
-                    composite = row.get(cls.DIMENSIONS_MAPPING['yandex']['composite'])
+                    rows_with_article += 1
+                    composite = row.get(yandex_col)
+                    
+                    if rows_with_article <= 5:
+                        logger.debug(f"   [{rows_with_article}] Артикул: '{article}', Габариты: '{composite}'")
+                    
                     dimensions = cls.parse_composite_dimensions(composite)
                     if dimensions:
+                        rows_with_dimensions += 1
                         yandex_dimensions[str(article).strip()] = dimensions
+                        if rows_with_dimensions <= 3:
+                            logger.info(f"   ✓ Яндекс [{article}]: {dimensions['length']}/{dimensions['width']}/{dimensions['height']} см")
+            
+            logger.info(f"   📊 Итого Яндекс: проверено {rows_checked} строк, с артикулами {rows_with_article}, с габаритами {rows_with_dimensions}")
+
+        # ==================== ЭТАП 2: ЧТЕНИЕ ДАННЫХ ИЗ WB ====================
+        logger.info("\n📖 ЭТАП 2: Чтение габаритов из WB (раздельные столбцы, см)")
         
-        # 2. Читаем данные из WB (раздельные столбцы, см)
-        if 'wildberries' in dfs:
+        if 'wildberries' not in dfs:
+            logger.warning("   ❌ DataFrame 'wildberries' отсутствует!")
+        else:
             wb_map = cls.DIMENSIONS_MAPPING['wildberries']
             df_wb = dfs['wildberries']
             
+            missing_cols = []
             for col in [wb_map['length'], wb_map['width'], wb_map['height']]:
                 if col not in df_wb.columns:
-                    logger.warning(f"[WB] Столбец '{col}' не найден!")
-                    return synced_count
+                    missing_cols.append(col)
+                    logger.warning(f"   ❌ Столбец '{col}' не найден!")
+                else:
+                    logger.info(f"   ✅ Столбец '{col}' найден")
             
-            for idx, row in df_wb.iterrows():
-                article = row.get(article_cols['wildberries'])
-                if pd.notna(article) and str(article).strip():
-                    article_str = str(article).strip()
-                    length = row.get(wb_map['length'])
-                    width = row.get(wb_map['width'])
-                    height = row.get(wb_map['height'])
+            if missing_cols:
+                logger.error(f"   ⛔ Пропускаю WB из-за отсутствия столбцов: {missing_cols}")
+            else:
+                rows_with_dimensions = 0
+                
+                for idx, row in df_wb.iterrows():
+                    article = row.get(article_cols['wildberries'])
                     
-                    # ✅ ИСПРАВЛЕНИЕ: Проверяем что ВСЕ ТРИ значения заполнены
-                    if all(pd.notna(v) and str(v).strip() for v in [length, width, height]):
-                        try:
-                            wb_dimensions[article_str] = {
-                                'length': float(length),
-                                'width': float(width),
-                                'height': float(height)
-                            }
-                        except ValueError:
-                            pass
+                    if pd.notna(article) and str(article).strip():
+                        article_str = str(article).strip()
+                        length = row.get(wb_map['length'])
+                        width = row.get(wb_map['width'])
+                        height = row.get(wb_map['height'])
+
+                        if all(pd.notna(v) and str(v).strip() for v in [length, width, height]):
+                            try:
+                                wb_dimensions[article_str] = {
+                                    'length': float(length),
+                                    'width': float(width),
+                                    'height': float(height)
+                                }
+                                rows_with_dimensions += 1
+                                if rows_with_dimensions <= 3:
+                                    logger.info(f"   ✓ WB [{article_str}]: {length}/{width}/{height} см")
+                            except ValueError:
+                                pass
+                
+                logger.info(f"   📊 Итого WB: {rows_with_dimensions} артикулов с полными габаритами")
+
+        # ==================== ЭТАП 3: ЧТЕНИЕ ДАННЫХ ИЗ OZON ====================
+        logger.info("\n📖 ЭТАП 3: Чтение габаритов из Ozon (раздельные столбцы, мм)")
         
-        # 3. Читаем данные из Ozon (раздельные столбцы, мм)
-        if 'ozon' in dfs:
+        if 'ozon' not in dfs:
+            logger.warning("   ❌ DataFrame 'ozon' отсутствует!")
+        else:
             ozon_map = cls.DIMENSIONS_MAPPING['ozon']
             df_ozon = dfs['ozon']
             
+            missing_cols = []
             for col in [ozon_map['length'], ozon_map['width'], ozon_map['height']]:
                 if col not in df_ozon.columns:
-                    logger.warning(f"[OZON] Столбец '{col}' не найден!")
-                    return synced_count
+                    missing_cols.append(col)
+                    logger.warning(f"   ❌ Столбец '{col}' не найден!")
+                else:
+                    logger.info(f"   ✅ Столбец '{col}' найден")
             
-            for idx, row in df_ozon.iterrows():
-                article = row.get(article_cols['ozon'])
-                if pd.notna(article) and str(article).strip():
-                    article_str = str(article).strip()
+            if missing_cols:
+                logger.error(f"   ⛔ Пропускаю Ozon из-за отсутствия столбцов: {missing_cols}")
+            else:
+                rows_with_dimensions = 0
+                
+                for idx, row in df_ozon.iterrows():
+                    article = row.get(article_cols['ozon'])
                     
-                    length_mm = row.get(ozon_map['length'])
-                    width_mm = row.get(ozon_map['width'])
-                    height_mm = row.get(ozon_map['height'])
-                    
-                    if all(pd.notna(v) and str(v).strip() for v in [length_mm, width_mm, height_mm]):
-                        try:
-                            # Конвертируем мм → см
-                            ozon_dimensions[article_str] = {
-                                'length': cls.mm_to_cm(float(length_mm)),
-                                'width': cls.mm_to_cm(float(width_mm)),
-                                'height': cls.mm_to_cm(float(height_mm))
-                            }
-                        except ValueError:
-                            pass
+                    if pd.notna(article) and str(article).strip():
+                        article_str = str(article).strip()
+                        length_mm = row.get(ozon_map['length'])
+                        width_mm = row.get(ozon_map['width'])
+                        height_mm = row.get(ozon_map['height'])
+
+                        if all(pd.notna(v) and str(v).strip() for v in [length_mm, width_mm, height_mm]):
+                            try:
+                                ozon_dimensions[article_str] = {
+                                    'length': cls.mm_to_cm(float(length_mm)),
+                                    'width': cls.mm_to_cm(float(width_mm)),
+                                    'height': cls.mm_to_cm(float(height_mm))
+                                }
+                                rows_with_dimensions += 1
+                                if rows_with_dimensions <= 3:
+                                    logger.info(f"   ✓ Ozon [{article_str}]: {length_mm}/{width_mm}/{height_mm} мм → {ozon_dimensions[article_str]['length']}/{ozon_dimensions[article_str]['width']}/{ozon_dimensions[article_str]['height']} см")
+                            except ValueError:
+                                pass
+                
+                logger.info(f"   📊 Итого Ozon: {rows_with_dimensions} артикулов с полными габаритами")
+
+        # ==================== СВОДКА СОБРАННЫХ ДАННЫХ ====================
+        logger.info("\n📊 СВОДКА СОБРАННЫХ ДАННЫХ:")
+        logger.info(f"   • Яндекс: {len(yandex_dimensions)} артикулов с габаритами")
+        logger.info(f"   • WB: {len(wb_dimensions)} артикулов с габаритами")
+        logger.info(f"   • Ozon: {len(ozon_dimensions)} артикулов с габаритами")
+
+        # ==================== ЭТАП 4: СИНХРОНИЗАЦИЯ Яндекс → WB/Ozon ====================
+        logger.info("\n🔄 ЭТАП 4: Синхронизация Яндекс → WB/Ozon")
         
-        # 4. СИНХРОНИЗАЦИЯ: Яндекс → WB/Ozon
+        yandex_to_wb_count = 0
+        yandex_to_ozon_count = 0
+        
         for article, dimensions in yandex_dimensions.items():
             # Синхронизация в WB
             if 'wildberries' in dfs:
                 df_wb = dfs['wildberries']
                 wb_map = cls.DIMENSIONS_MAPPING['wildberries']
-                
-                # Ищем строку с этим артикулом
+
                 mask = df_wb[article_cols['wildberries']].astype(str).str.strip() == article
+                
                 if mask.any():
                     idx = df_wb[mask].index[0]
-                    
-                    # Записываем в см (как есть)
-                    if pd.isna(df_wb.at[idx, wb_map['length']]) or not str(df_wb.at[idx, wb_map['length']]).strip():
-                        df_wb.at[idx, wb_map['length']] = dimensions['length']
-                        synced_count += 1
-                    
-                    if pd.isna(df_wb.at[idx, wb_map['width']]) or not str(df_wb.at[idx, wb_map['width']]).strip():
-                        df_wb.at[idx, wb_map['width']] = dimensions['width']
-                        synced_count += 1
-                    
-                    if pd.isna(df_wb.at[idx, wb_map['height']]) or not str(df_wb.at[idx, wb_map['height']]).strip():
-                        df_wb.at[idx, wb_map['height']] = dimensions['height']
-                        synced_count += 1
-            
+
+                    for dim_key, col_name in [('length', wb_map['length']), ('width', wb_map['width']), ('height', wb_map['height'])]:
+                        current_val = df_wb.at[idx, col_name]
+                        if pd.isna(current_val) or not str(current_val).strip():
+                            df_wb.at[idx, col_name] = dimensions[dim_key]
+                            synced_count += 1
+                            yandex_to_wb_count += 1
+                            logger.debug(f"   [Яндекс→WB] {article}: {dim_key}={dimensions[dim_key]}")
+
             # Синхронизация в Ozon
             if 'ozon' in dfs:
                 df_ozon = dfs['ozon']
                 ozon_map = cls.DIMENSIONS_MAPPING['ozon']
-                
+
                 mask = df_ozon[article_cols['ozon']].astype(str).str.strip() == article
+                
                 if mask.any():
                     idx = df_ozon[mask].index[0]
-                    
-                    # Записываем в мм (конвертируем из см)
-                    if pd.isna(df_ozon.at[idx, ozon_map['length']]) or not str(df_ozon.at[idx, ozon_map['length']]).strip():
-                        df_ozon.at[idx, ozon_map['length']] = int(cls.cm_to_mm(dimensions['length']))
-                        synced_count += 1
-                    
-                    if pd.isna(df_ozon.at[idx, ozon_map['width']]) or not str(df_ozon.at[idx, ozon_map['width']]).strip():
-                        df_ozon.at[idx, ozon_map['width']] = int(cls.cm_to_mm(dimensions['width']))
-                        synced_count += 1
-                    
-                    if pd.isna(df_ozon.at[idx, ozon_map['height']]) or not str(df_ozon.at[idx, ozon_map['height']]).strip():
-                        df_ozon.at[idx, ozon_map['height']] = int(cls.cm_to_mm(dimensions['height']))
-                        synced_count += 1
+
+                    for dim_key, col_name in [('length', ozon_map['length']), ('width', ozon_map['width']), ('height', ozon_map['height'])]:
+                        current_val = df_ozon.at[idx, col_name]
+                        if pd.isna(current_val) or not str(current_val).strip():
+                            value_mm = int(cls.cm_to_mm(dimensions[dim_key]))
+                            df_ozon.at[idx, col_name] = value_mm
+                            synced_count += 1
+                            yandex_to_ozon_count += 1
+                            logger.debug(f"   [Яндекс→Ozon] {article}: {dim_key}={value_mm} мм")
         
-        # 5. СИНХРОНИЗАЦИЯ: WB → Яндекс
+        logger.info(f"   📊 Яндекс → WB: {yandex_to_wb_count} значений")
+        logger.info(f"   📊 Яндекс → Ozon: {yandex_to_ozon_count} значений")
+
+        # ==================== ЭТАП 5: СИНХРОНИЗАЦИЯ WB → Яндекс и Ozon ====================
+        logger.info("\n🔄 ЭТАП 5: Синхронизация WB → Яндекс и Ozon")
+
+        wb_to_yandex_count = 0
+        wb_to_ozon_count = 0
+        wb_skipped_yandex = 0
+
         for article, dimensions in wb_dimensions.items():
+            # ============ В Яндекс ============
             if article in yandex_dimensions:
-                continue  # Уже есть данные из Яндекса
-            
-            if 'yandex' in dfs:
-                df_yandex = dfs['yandex']
-                yandex_col = cls.DIMENSIONS_MAPPING['yandex']['composite']
-                
-                mask = df_yandex[article_cols['yandex']].astype(str).str.strip() == article
-                if mask.any():
-                    idx = df_yandex[mask].index[0]
+                wb_skipped_yandex += 1
+                logger.debug(f"   [WB→Яндекс] ПРОПУСК {article}: уже есть данные в Яндексе")
+            else:
+                if 'yandex' in dfs:
+                    df_yandex = dfs['yandex']
+                    yandex_col = cls.DIMENSIONS_MAPPING['yandex']['composite']
+
+                    mask = df_yandex[article_cols['yandex']].astype(str).str.strip() == article
                     
-                    if pd.isna(df_yandex.at[idx, yandex_col]) or not str(df_yandex.at[idx, yandex_col]).strip():
-                        composite = cls.format_composite_dimensions(
-                            dimensions['length'],
-                            dimensions['width'],
-                            dimensions['height']
-                        )
-                        df_yandex.at[idx, yandex_col] = composite
-                        synced_count += 1
-                        logger.info(f"[WB→Яндекс] {article}: {composite}")
+                    if mask.any():
+                        idx = df_yandex[mask].index[0]
+                        current_val = df_yandex.at[idx, yandex_col]
+                        
+                        if pd.isna(current_val) or not str(current_val).strip():
+                            composite = cls.format_composite_dimensions(
+                                dimensions['length'],
+                                dimensions['width'],
+                                dimensions['height']
+                            )
+                            df_yandex.at[idx, yandex_col] = composite
+                            synced_count += 1
+                            wb_to_yandex_count += 1
+                            logger.info(f"   ✓ [WB→Яндекс] {article}: {composite}")
+
+            # ============ В Ozon ============
+            if 'ozon' in dfs:
+                df_ozon = dfs['ozon']
+                ozon_map = cls.DIMENSIONS_MAPPING['ozon']
+
+                mask = df_ozon[article_cols['ozon']].astype(str).str.strip() == article
+                
+                if mask.any():
+                    idx = df_ozon[mask].index[0]
+
+                    for dim_key, col_name in [('length', ozon_map['length']), ('width', ozon_map['width']), ('height', ozon_map['height'])]:
+                        current_val = df_ozon.at[idx, col_name]
+                        if pd.isna(current_val) or not str(current_val).strip():
+                            value_mm = int(cls.cm_to_mm(dimensions[dim_key]))
+                            df_ozon.at[idx, col_name] = value_mm
+                            synced_count += 1
+                            wb_to_ozon_count += 1
+                            logger.info(f"   ✓ [WB→Ozon] {article}: {dim_key}={value_mm} мм")
+
+        logger.info(f"   📊 WB → Яндекс: {wb_to_yandex_count} значений записано")
+        logger.info(f"   📊 WB → Яндекс: {wb_skipped_yandex} пропущено (уже есть в Яндексе)")
+        logger.info(f"   📊 WB → Ozon: {wb_to_ozon_count} значений")
+
+        # ==================== ЭТАП 6: СИНХРОНИЗАЦИЯ Ozon → Яндекс и WB ====================
+        logger.info("\n🔄 ЭТАП 6: Синхронизация Ozon → Яндекс и WB")
         
-        # 6. СИНХРОНИЗАЦИЯ: Ozon → Яндекс (и в WB если нет)
+        ozon_to_yandex_count = 0
+        ozon_to_wb_count = 0
+        ozon_skipped_yandex = 0
+        
         for article, dimensions in ozon_dimensions.items():
-           
-            
             # В Яндекс
             if 'yandex' in dfs:
                 df_yandex = dfs['yandex']
                 yandex_col = cls.DIMENSIONS_MAPPING['yandex']['composite']
+
                 mask = df_yandex[article_cols['yandex']].astype(str).str.strip() == article
                 
                 if mask.any():
                     idx = df_yandex[mask].index[0]
-                    if pd.isna(df_yandex.at[idx, yandex_col]) or not str(df_yandex.at[idx, yandex_col]).strip():
+                    current_val = df_yandex.at[idx, yandex_col]
+                    
+                    if pd.isna(current_val) or not str(current_val).strip():
                         composite = cls.format_composite_dimensions(
                             dimensions['length'],
                             dimensions['width'],
@@ -291,34 +380,38 @@ class DimensionsSynchronizer:
                         )
                         df_yandex.at[idx, yandex_col] = composite
                         synced_count += 1
-                        logger.info(f"[Ozon→Яндекс] {article}: {composite}")
-            
-            # В WB (теперь это будет работать всегда!)
+                        ozon_to_yandex_count += 1
+                        logger.info(f"   ✓ [Ozon→Яндекс] {article}: {composite}")
+                    else:
+                        ozon_skipped_yandex += 1
+
+            # В WB
             if 'wildberries' in dfs:
                 df_wb = dfs['wildberries']
                 wb_map = cls.DIMENSIONS_MAPPING['wildberries']
+
                 mask = df_wb[article_cols['wildberries']].astype(str).str.strip() == article
                 
                 if mask.any():
                     idx = df_wb[mask].index[0]
-                    
-                    # Заполняем ТОЛЬКО пустые поля
-                    if pd.isna(df_wb.at[idx, wb_map['length']]) or not str(df_wb.at[idx, wb_map['length']]).strip():
-                        df_wb.at[idx, wb_map['length']] = dimensions['length']
-                        synced_count += 1
-                        logger.info(f"[Ozon→WB] {article}: length={dimensions['length']}")
-                    
-                    if pd.isna(df_wb.at[idx, wb_map['width']]) or not str(df_wb.at[idx, wb_map['width']]).strip():
-                        df_wb.at[idx, wb_map['width']] = dimensions['width']
-                        synced_count += 1
-                        logger.info(f"[Ozon→WB] {article}: width={dimensions['width']}")
-                    
-                    if pd.isna(df_wb.at[idx, wb_map['height']]) or not str(df_wb.at[idx, wb_map['height']]).strip():
-                        df_wb.at[idx, wb_map['height']] = dimensions['height']
-                        synced_count += 1
-                        logger.info(f"[Ozon→WB] {article}: height={dimensions['height']}")
+
+                    for dim_key, col_name in [('length', wb_map['length']), ('width', wb_map['width']), ('height', wb_map['height'])]:
+                        current_val = df_wb.at[idx, col_name]
+                        if pd.isna(current_val) or not str(current_val).strip():
+                            df_wb.at[idx, col_name] = dimensions[dim_key]
+                            synced_count += 1
+                            ozon_to_wb_count += 1
+                            logger.info(f"   ✓ [Ozon→WB] {article}: {dim_key}={dimensions[dim_key]}")
         
-        logger.info(f"✅ Габариты: синхронизировано {synced_count} значений")
+        logger.info(f"   📊 Ozon → Яндекс: {ozon_to_yandex_count} значений записано")
+        logger.info(f"   📊 Ozon → Яндекс: {ozon_skipped_yandex} пропущено (ячейка заполнена)")
+        logger.info(f"   📊 Ozon → WB: {ozon_to_wb_count} значений")
+
+        # ==================== ИТОГОВАЯ СВОДКА ====================
+        logger.info("\n" + "=" * 80)
+        logger.info(f"✅ ГАБАРИТЫ: синхронизировано {synced_count} значений")
+        logger.info("=" * 80)
+        
         return synced_count
 
 
@@ -558,36 +651,37 @@ class DataSynchronizer:
         self,
         file_paths: Dict[str, str],
         output_paths: Dict[str, str] = None,
-        report_path: str = None  # ← ДОБАВИТЬ
+        report_path: str = None
     ) -> Tuple[Dict[str, pd.DataFrame], Dict]:
         logger.info("="*60)
         logger.info("СИНХРОНИЗАЦИЯ ДАННЫХ МЕЖДУ МАРКЕТПЛЕЙСАМИ")
         logger.info("="*60)
-        
-        # Загружаем данные из всех трех файлов
-        dfs = self._load_all_dataframes(file_paths)
 
-        # 🆕 3. СИНХРОНИЗАЦИЯ КОМПОЗИТНЫХ ГАБАРИТОВ (НОВОЕ!)
-        logger.info("\n[*] Синхронизация габаритов...")
-        dimensions_synced = DimensionsSynchronizer.sync_dimensions(dfs)
+        # 1. Загружаем данные из всех трех файлов
+        dfs = self._load_all_dataframes(file_paths)
         
-        # Синхронизируем данные
+        # 2. Выравниваем артикулы
+        dfs = self._align_articles(dfs)
+
+        # 3. 🆕 СИНХРОНИЗАЦИЯ ГАБАРИТОВ (ПЕРЕД остальными столбцами!)
+        dimensions_synced = DimensionsSynchronizer.sync_dimensions(dfs)
+
+        # 4. Синхронизируем ОСТАЛЬНЫЕ данные
+        logger.info("\n" + "="*60)
+        logger.info("📝 СИНХРОНИЗАЦИЯ ОСТАЛЬНЫХ СТОЛБЦОВ")
+        logger.info("="*60)
         synced_dfs = self._sync_all_matches(dfs)
 
-        # ⭐ ПОСТОБРАБОТКА: Конвертация габаритов WB (мм → см если из Ozon)
-        logger.info("\n[*] Постобработка габаритов WB...")
-        converted_count = self._postprocess_wb_dimensions(synced_dfs)
-        if converted_count > 0:
-            logger.info(f"✅ Сконвертировано {converted_count} значений габаритов (мм → см)")
-
-        # Сохраняем результаты
+        # 5. Сохраняем результаты
         if output_paths:
             self._save_results(synced_dfs, output_paths)
-        
-        logger.info("✅ Синхронизация завершена!")
-        
+
+        logger.info("\n" + "="*60)
+        logger.info("✅ СИНХРОНИЗАЦИЯ ЗАВЕРШЕНА!")
+        logger.info("="*60)
         
         return synced_dfs, self.changes_log
+        
     
     def _load_all_dataframes(self, file_paths: Dict[str, str]) -> Dict[str, pd.DataFrame]:
         """Загружает данные через openpyxl для сохранения форматов"""
@@ -861,6 +955,22 @@ class DataSynchronizer:
                 is_excluded_column(col_yandex)):
                 skipped_count += 1
                 continue
+
+            # ⭐ НОВОЕ: Пропускаем габариты - они обрабатываются через DimensionsSynchronizer
+            dimensions_columns = {
+                'Длина упаковки (целое число)',
+                'Ширина упаковки (целое число)', 
+                'Высота упаковки (целое число)',
+                'Длина упаковки, мм*',
+                'Ширина упаковки, мм*',
+                'Высота упаковки, мм*',
+                'Габариты с упаковкой, см'
+            }
+
+            if col_wb in dimensions_columns or col_ozon in dimensions_columns or col_yandex in dimensions_columns:
+                skipped_count += 1
+                logger.info(f"⏭️ Пропущено (габариты): {col_wb} ↔ {col_ozon} ↔ {col_yandex}")
+                continue
             
             # ⭐ ДОБАВЬ ЭТУ ПРОВЕРКУ:
             # Пропускаем габариты - они обрабатываются через DimensionsSynchronizer
@@ -920,6 +1030,22 @@ class DataSynchronizer:
                 # Пропускаем исключенные столбцы
                 if is_excluded_column(col1) or is_excluded_column(col2):
                     skipped_count += 1
+                    continue
+
+                # ⭐ НОВОЕ: Пропускаем габариты
+                dimensions_columns = {
+                    'Длина упаковки (целое число)',
+                    'Ширина упаковки (целое число)',
+                    'Высота упаковки (целое число)',
+                    'Длина упаковки, мм*',
+                    'Ширина упаковки, мм*',
+                    'Высота упаковки, мм*',
+                    'Габариты с упаковкой, см'
+                }
+
+                if col1 in dimensions_columns or col2 in dimensions_columns:
+                    skipped_count += 1
+                    logger.info(f"⏭️ Пропущено (габариты): {mp1}:{col1} ↔ {mp2}:{col2}")
                     continue
                 
                 # Проверяем, что столбцы существуют

@@ -1,0 +1,36 @@
+# Python артефакты
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Виртуальное окружение
+venv/
+.venv/
+
+# Логи и временные файлы
+*.log
+*.tmp
+
+# Тестовые и coverage файлы
+.coverage
+htmlcov/
+.tox/
+.pytest_cache/
+
+# Сборка и дистрибутивы
+build/
+dist/
+*.egg-info/
+
+# IDE/редактор
+.vscode/
+.idea/
+
+# Секреты и конфиги
+.env
+*.env
+
+tests/
+бэк/
+output/

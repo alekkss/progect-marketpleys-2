@@ -213,7 +213,7 @@ async def process_files(message: types.Message, state: FSMContext, bot):
         
         await message.answer(
             f"✅ Готово!\n\n"
-            f"📦 Обработано товаров:\n"
+            f"📦 Обработка товаров:\n"
             f"• WB: {wb_count}\n"
             f"• Ozon: {ozon_count}\n"
             f"• Яндекс: {yandex_count}\n\n"

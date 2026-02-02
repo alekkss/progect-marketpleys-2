@@ -1,6 +1,9 @@
 """
+
 Модуль для сравнения столбцов с помощью AI
+
 """
+
 from openai import OpenAI
 import json
 import re
@@ -21,7 +24,6 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
-
 
 class AIComparator:
     """Класс для сравнения столбцов с использованием AI"""
@@ -71,6 +73,7 @@ class AIComparator:
                 self.value_validation_template = f.read()
             
             print("[✓] Промпты загружены из файлов")
+        
         except FileNotFoundError as e:
             print(f"[!] ОШИБКА: Файл с промптом не найден: {e.filename}")
             print(f"[!] Убедитесь что файлы существуют в директории: {self.PROMPTS_DIR}")
@@ -101,11 +104,11 @@ class AIComparator:
         if excluded_1 or excluded_2 or excluded_3:
             print(f"\n[!] Исключены из сравнения:")
             if excluded_1:
-                print(f"    WB: {', '.join(excluded_1)}")
+                print(f"   WB: {', '.join(excluded_1)}")
             if excluded_2:
-                print(f"    Ozon: {', '.join(excluded_2)}")
+                print(f"   Ozon: {', '.join(excluded_2)}")
             if excluded_3:
-                print(f"    Яндекс: {', '.join(excluded_3)}")
+                print(f"   Яндекс: {', '.join(excluded_3)}")
         
         print("\n[*] Отправляю ПЕРВЫЙ запрос в OpenRouter AI...")
         
@@ -113,34 +116,46 @@ class AIComparator:
         prompt = self._build_prompt(filtered_1, filtered_2, filtered_3)
         response = self._call_ai(prompt)
         result = self._parse_response(response)
+        
+        # ✅ ВАЛИДАЦИЯ РЕЗУЛЬТАТА ОТ AI
+        result = self._validate_ai_result(result, filtered_1, filtered_2, filtered_3)
+        
         result = self._add_mandatory_matches(result, filtered_1, filtered_2, filtered_3)
         
         print(f"[+] Первый проход завершен!")
-        print(f"    Найдено совпадений (все 3): {len(result.get('matches_all_three', []))}")
-        print(f"    Найдено совпадений (1-2): {len(result.get('matches_1_2', []))}")
-        print(f"    Найдено совпадений (1-3): {len(result.get('matches_1_3', []))}")
-        print(f"    Найдено совпадений (2-3): {len(result.get('matches_2_3', []))}")
+        print(f"   Найдено совпадений (все 3): {len(result.get('matches_all_three', []))}")
+        print(f"   Найдено совпадений (1-2): {len(result.get('matches_1_2', []))}")
+        print(f"   Найдено совпадений (1-3): {len(result.get('matches_1_3', []))}")
+        print(f"   Найдено совпадений (2-3): {len(result.get('matches_2_3', []))}")
         
         # Второй проход - проверяем оставшиеся несовпавшие столбцы
         print("\n[*] Запускаю ВТОРОЙ проход для проверки оставшихся столбцов...")
         remaining_columns = self._get_remaining_columns(result, filtered_1, filtered_2, filtered_3)
         
         if remaining_columns[0] or remaining_columns[1] or remaining_columns[2]:
-            print(f"    Осталось проверить: WB={len(remaining_columns[0])}, "
+            print(f"   Осталось проверить: WB={len(remaining_columns[0])}, "
                   f"Ozon={len(remaining_columns[1])}, Яндекс={len(remaining_columns[2])}")
             
             second_result = self._second_pass_comparison(remaining_columns)
+            
+            # ✅ ВАЛИДАЦИЯ ВТОРОГО ПРОХОДА
+            second_result = self._validate_ai_result(
+                second_result,
+                remaining_columns[0],
+                remaining_columns[1],
+                remaining_columns[2]
+            )
             
             # Объединяем результаты
             result = self._merge_results(result, second_result)
             
             print(f"[+] Второй проход завершен!")
-            print(f"    Дополнительно найдено совпадений (все 3): {len(second_result.get('matches_all_three', []))}")
-            print(f"    Дополнительно найдено совпадений (1-2): {len(second_result.get('matches_1_2', []))}")
-            print(f"    Дополнительно найдено совпадений (1-3): {len(second_result.get('matches_1_3', []))}")
-            print(f"    Дополнительно найдено совпадений (2-3): {len(second_result.get('matches_2_3', []))}")
+            print(f"   Дополнительно найдено совпадений (все 3): {len(second_result.get('matches_all_three', []))}")
+            print(f"   Дополнительно найдено совпадений (1-2): {len(second_result.get('matches_1_2', []))}")
+            print(f"   Дополнительно найдено совпадений (1-3): {len(second_result.get('matches_1_3', []))}")
+            print(f"   Дополнительно найдено совпадений (2-3): {len(second_result.get('matches_2_3', []))}")
         else:
-            print("    Все столбцы уже сопоставлены, второй проход не требуется")
+            print("   Все столбцы уже сопоставлены, второй проход не требуется")
         
         # НОВОЕ: Добавляем исключенные столбцы в результат
         result = self._add_excluded_to_result(result, excluded_1, excluded_2, excluded_3)
@@ -181,6 +196,117 @@ class AIComparator:
         result['only_in_third'].extend(excluded_3)
         
         return result
+    
+    def _validate_ai_result(
+        self,
+        result: Dict,
+        columns_1: List[str],
+        columns_2: List[str],
+        columns_3: List[str]
+    ) -> Dict:
+        """
+        Валидирует результат от AI - удаляет несуществующие столбцы.
+        
+        Проверяет каждое совпадение и отклоняет те, где AI указал столбец,
+        которого нет в исходных списках. Это предотвращает ошибки при
+        синхронизации данных.
+        
+        Args:
+            result: результат от AI с совпадениями
+            columns_1: исходный список столбцов WB
+            columns_2: исходный список столбцов Ozon
+            columns_3: исходный список столбцов Яндекс
+        
+        Returns:
+            Валидированный результат без несуществующих столбцов
+        """
+        validated = {
+            'matches_all_three': [],
+            'matches_1_2': [],
+            'matches_1_3': [],
+            'matches_2_3': [],
+            'only_in_first': result.get('only_in_first', []),
+            'only_in_second': result.get('only_in_second', []),
+            'only_in_third': result.get('only_in_third', [])
+        }
+        
+        rejected_count = 0
+        
+        # Валидируем совпадения всех трех
+        for match in result.get('matches_all_three', []):
+            col_1 = match.get('column_1')
+            col_2 = match.get('column_2')
+            col_3 = match.get('column_3')
+            
+            # ЖЕСТКАЯ ПРОВЕРКА: столбец должен существовать!
+            if col_1 and col_1 not in columns_1:
+                print(f"[❌ ОТКЛОНЕНО] AI придумал несуществующий столбец WB: '{col_1}'")
+                rejected_count += 1
+                continue
+            if col_2 and col_2 not in columns_2:
+                print(f"[❌ ОТКЛОНЕНО] AI придумал несуществующий столбец Ozon: '{col_2}'")
+                rejected_count += 1
+                continue
+            if col_3 and col_3 not in columns_3:
+                print(f"[❌ ОТКЛОНЕНО] AI придумал несуществующий столбец Яндекс: '{col_3}'")
+                rejected_count += 1
+                continue
+            
+            # Все столбцы существуют - добавляем
+            validated['matches_all_three'].append(match)
+        
+        # Валидируем совпадения 1-2
+        for match in result.get('matches_1_2', []):
+            col_1 = match.get('column_1')
+            col_2 = match.get('column_2')
+            
+            if col_1 and col_1 not in columns_1:
+                print(f"[❌ ОТКЛОНЕНО] AI придумал несуществующий столбец WB: '{col_1}'")
+                rejected_count += 1
+                continue
+            if col_2 and col_2 not in columns_2:
+                print(f"[❌ ОТКЛОНЕНО] AI придумал несуществующий столбец Ozon: '{col_2}'")
+                rejected_count += 1
+                continue
+            
+            validated['matches_1_2'].append(match)
+        
+        # Валидируем совпадения 1-3
+        for match in result.get('matches_1_3', []):
+            col_1 = match.get('column_1')
+            col_3 = match.get('column_3')
+            
+            if col_1 and col_1 not in columns_1:
+                print(f"[❌ ОТКЛОНЕНО] AI придумал несуществующий столбец WB: '{col_1}'")
+                rejected_count += 1
+                continue
+            if col_3 and col_3 not in columns_3:
+                print(f"[❌ ОТКЛОНЕНО] AI придумал несуществующий столбец Яндекс: '{col_3}'")
+                rejected_count += 1
+                continue
+            
+            validated['matches_1_3'].append(match)
+        
+        # Валидируем совпадения 2-3
+        for match in result.get('matches_2_3', []):
+            col_2 = match.get('column_2')
+            col_3 = match.get('column_3')
+            
+            if col_2 and col_2 not in columns_2:
+                print(f"[❌ ОТКЛОНЕНО] AI придумал несуществующий столбец Ozon: '{col_2}'")
+                rejected_count += 1
+                continue
+            if col_3 and col_3 not in columns_3:
+                print(f"[❌ ОТКЛОНЕНО] AI придумал несуществующий столбец Яндекс: '{col_3}'")
+                rejected_count += 1
+                continue
+            
+            validated['matches_2_3'].append(match)
+        
+        if rejected_count > 0:
+            print(f"\n[⚠️] ВАЛИДАЦИЯ: Отклонено {rejected_count} несуществующих совпадений от AI\n")
+        
+        return validated
     
     def _get_remaining_columns(
         self,
@@ -302,7 +428,6 @@ class AIComparator:
             messages=[{"role": "user", "content": prompt}],
             temperature=AI_TEMPERATURE,
         )
-        
         return response.choices[0].message.content
     
     def _parse_response(self, response_text: str) -> Dict:
@@ -313,8 +438,8 @@ class AIComparator:
         except json.JSONDecodeError:
             pass
         
-        # 2. Ищем блоки кода `````` или ``````
-        json_code_block = re.search(r'``````', response_text, re.DOTALL)
+        # 2. Ищем блоки кода ```json``` или ```
+        json_code_block = re.search(r'```(?:json)?\s*({.*?})\s*```', response_text, re.DOTALL)
         if json_code_block:
             try:
                 return json.loads(json_code_block.group(1))
@@ -377,7 +502,7 @@ class AIComparator:
         # СНАЧАЛА проверяем точное совпадение с нормализацией
         for allowed in allowed_values:
             if normalize(allowed) == value_normalized:
-                print(f"    [normalize] Точное совпадение: '{value}' → '{allowed}'")
+                print(f"   [normalize] Точное совпадение: '{value}' → '{allowed}'")
                 return allowed
         
         # Проверяем частичное совпадение (одно слово содержится в другом)
@@ -387,11 +512,11 @@ class AIComparator:
             
             # Если все слова из value есть в allowed
             if value_words.issubset(allowed_words):
-                print(f"    [normalize] Частичное совпадение: '{value}' → '{allowed}'")
+                print(f"   [normalize] Частичное совпадение: '{value}' → '{allowed}'")
                 return allowed
         
         # Если не нашли - спрашиваем AI
-        print(f"    [AI] Отправляю запрос для '{value}'...")
+        print(f"   [AI] Отправляю запрос для '{value}'...")
         
         # Форматируем список для промпта
         allowed_values_formatted = "\n".join(f"- {v}" for v in allowed_values)
@@ -421,9 +546,9 @@ class AIComparator:
                 return None
             
             return None
-            
+        
         except Exception as e:
-            print(f"    [ERROR] Ошибка AI: {e}")
+            print(f"   [ERROR] Ошибка AI: {e}")
             return None
     
     def _add_mandatory_matches(

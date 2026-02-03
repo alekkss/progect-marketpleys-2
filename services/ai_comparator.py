@@ -160,6 +160,9 @@ class AIComparator:
         # НОВОЕ: Добавляем исключенные столбцы в результат
         result = self._add_excluded_to_result(result, excluded_1, excluded_2, excluded_3)
         
+        # НОВОЕ: Удаляем дубли и пересечения между тройными и парными
+        result = self._deduplicate_matches(result)
+        
         print("\n[+] Итоговые результаты получены от AI")
         return result
     
@@ -400,6 +403,126 @@ class AIComparator:
         }
         
         return merged
+    
+    def _deduplicate_matches(self, result: Dict) -> Dict:
+        """
+        Удаляет дубли и пересечения между тройными и парными сопоставлениями.
+        
+        Правила:
+        1. Если столбец уже есть в тройном сопоставлении — удаляем его из парных
+        2. Если столбец повторяется в нескольких парных — оставляем только первое вхождение
+        
+        Args:
+            result: словарь с результатами сравнения от AI
+        
+        Returns:
+            Очищенный словарь без дублей и пересечений
+        """
+        # === ШАГ 1: Собираем все столбцы из тройных сопоставлений ===
+        triple_columns_1 = set()  # WB столбцы в тройных
+        triple_columns_2 = set()  # Ozon столбцы в тройных
+        triple_columns_3 = set()  # Яндекс столбцы в тройных
+        
+        for match in result.get('matches_all_three', []):
+            col_1 = match.get('column_1')
+            col_2 = match.get('column_2')
+            col_3 = match.get('column_3')
+            
+            if col_1:
+                triple_columns_1.add(col_1)
+            if col_2:
+                triple_columns_2.add(col_2)
+            if col_3:
+                triple_columns_3.add(col_3)
+        
+        print(f"\n[DEDUPE] Столбцов в тройных: WB={len(triple_columns_1)}, Ozon={len(triple_columns_2)}, Яндекс={len(triple_columns_3)}")
+        
+        # === ШАГ 2: Функция очистки парных сопоставлений ===
+        def clean_pair_matches(
+            matches: List[Dict],
+            col_key_1: str,
+            col_key_2: str,
+            used_cols_1: set,
+            used_cols_2: set,
+            pair_name: str
+        ) -> List[Dict]:
+            """
+            Очищает список парных сопоставлений:
+            - Удаляет если хотя бы один столбец уже в тройных
+            - Удаляет дубли (каждый столбец только в одном сопоставлении)
+            """
+            cleaned = []
+            seen_cols_1 = set()  # Уже использованные столбцы первого маркетплейса
+            seen_cols_2 = set()  # Уже использованные столбцы второго маркетплейса
+            
+            removed_triple = 0
+            removed_duplicate = 0
+            
+            for match in matches:
+                col1 = match.get(col_key_1)
+                col2 = match.get(col_key_2)
+                
+                # Проверка 1: столбец уже в тройных?
+                if col1 in used_cols_1 or col2 in used_cols_2:
+                    removed_triple += 1
+                    continue
+                
+                # Проверка 2: столбец уже использован в этой группе парных (дубль)?
+                if col1 in seen_cols_1 or col2 in seen_cols_2:
+                    removed_duplicate += 1
+                    continue
+                
+                # Всё ок — добавляем и отмечаем как использованные
+                cleaned.append(match)
+                if col1:
+                    seen_cols_1.add(col1)
+                if col2:
+                    seen_cols_2.add(col2)
+            
+            if removed_triple > 0 or removed_duplicate > 0:
+                print(f"[DEDUPE] {pair_name}: удалено {removed_triple} (есть в тройных) + {removed_duplicate} (дубли), осталось {len(cleaned)}")
+            
+            return cleaned
+        
+        # === ШАГ 3: Очищаем каждую группу парных ===
+        original_1_2 = len(result.get('matches_1_2', []))
+        original_1_3 = len(result.get('matches_1_3', []))
+        original_2_3 = len(result.get('matches_2_3', []))
+        
+        result['matches_1_2'] = clean_pair_matches(
+            result.get('matches_1_2', []),
+            'column_1', 'column_2',
+            triple_columns_1, triple_columns_2,
+            'WB+Ozon'
+        )
+        
+        result['matches_1_3'] = clean_pair_matches(
+            result.get('matches_1_3', []),
+            'column_1', 'column_3',
+            triple_columns_1, triple_columns_3,
+            'WB+Яндекс'
+        )
+        
+        result['matches_2_3'] = clean_pair_matches(
+            result.get('matches_2_3', []),
+            'column_2', 'column_3',
+            triple_columns_2, triple_columns_3,
+            'Ozon+Яндекс'
+        )
+        
+        # === ШАГ 4: Итоговая статистика ===
+        total_removed = (
+            (original_1_2 - len(result['matches_1_2'])) +
+            (original_1_3 - len(result['matches_1_3'])) +
+            (original_2_3 - len(result['matches_2_3']))
+        )
+        
+        if total_removed > 0:
+            print(f"[DEDUPE] ✅ Итого удалено из парных: {total_removed}")
+        else:
+            print(f"[DEDUPE] ✅ Дубликатов не найдено")
+        
+        return result
     
     def _build_prompt(
         self,

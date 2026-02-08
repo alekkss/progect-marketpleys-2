@@ -955,13 +955,14 @@ async def add_new_match_start(message: types.Message, state: FSMContext):
     await state.set_state(SchemaStates.selecting_wb_column)
     await message.answer(
         f"Шаг 1/3: Выбери столбец WB\n\n"
-        f"Введи название или номер (1-{len(wb_columns)}):",
+        f"Введи название или номер (1-{len(wb_columns)})\n"
+        f"💡 Введи NA чтобы пропустить этот маркетплейс",
         reply_markup=get_cancel_keyboard()
     )
 
 
 async def wb_column_selected(message: types.Message, state: FSMContext):
-    """Столбец WB выбран"""
+    """Столбец WB выбран (или NA для пропуска)"""
     if message.text == "❌ Отмена":
         await edit_schema_start(message, state)
         return
@@ -970,38 +971,47 @@ async def wb_column_selected(message: types.Message, state: FSMContext):
     available_columns = data.get('available_columns', {})
     wb_columns = available_columns.get('wildberries', [])
     
-    # Валидация выбора
-    wb_value = None
     user_input = message.text.strip()
     
-    try:
-        col_number = int(user_input)
-        if 1 <= col_number <= len(wb_columns):
-            wb_value = wb_columns[col_number - 1]
-    except ValueError:
-        if user_input in wb_columns:
-            wb_value = user_input
-        else:
-            user_lower = user_input.lower()
-            for col in wb_columns:
-                if col.lower() == user_lower:
-                    wb_value = col
-                    break
-    
-    if not wb_value:
-        await message.answer(
-            f"❌ Столбец '{user_input}' не найден!\n\n"
-            f"Введи точное название или номер из списка."
-        )
-        return
-    
-    # Сохраняем выбор
-    await state.update_data(new_match_wb=wb_value)
+    # Проверка на NA (пропуск WB)
+    if user_input.upper() == 'NA':
+        wb_value = None
+        await state.update_data(new_match_wb=None)
+        display_wb = "⏭ WB: пропущен (NA)"
+    else:
+        # Валидация выбора
+        wb_value = None
+        
+        try:
+            col_number = int(user_input)
+            if 1 <= col_number <= len(wb_columns):
+                wb_value = wb_columns[col_number - 1]
+        except ValueError:
+            if user_input in wb_columns:
+                wb_value = user_input
+            else:
+                user_lower = user_input.lower()
+                for col in wb_columns:
+                    if col.lower() == user_lower:
+                        wb_value = col
+                        break
+        
+        if not wb_value:
+            await message.answer(
+                f"❌ Столбец '{user_input}' не найден!\n\n"
+                f"Введи точное название или номер из списка.\n"
+                f"💡 Или введи NA чтобы пропустить WB"
+            )
+            return
+        
+        # Сохраняем выбор
+        await state.update_data(new_match_wb=wb_value)
+        display_wb = f"✅ WB: {wb_value}"
     
     # Переходим к Ozon
     ozon_columns = available_columns.get('ozon', [])
     
-    text = f"✅ WB: {wb_value}\n\n"
+    text = f"{display_wb}\n\n"
     text += f"📋 Доступные столбцы Ozon ({len(ozon_columns)}):\n\n"
     for i, col in enumerate(ozon_columns, 1):
         text += f"{i}. {col}\n"
@@ -1015,13 +1025,14 @@ async def wb_column_selected(message: types.Message, state: FSMContext):
     await state.set_state(SchemaStates.selecting_ozon_column)
     await message.answer(
         f"Шаг 2/3: Выбери столбец Ozon\n\n"
-        f"Введи название или номер (1-{len(ozon_columns)}):",
+        f"Введи название или номер (1-{len(ozon_columns)})\n"
+        f"💡 Введи NA чтобы пропустить этот маркетплейс",
         reply_markup=get_cancel_keyboard()
     )
 
 
 async def ozon_column_selected(message: types.Message, state: FSMContext):
-    """Столбец Ozon выбран"""
+    """Столбец Ozon выбран (или NA для пропуска)"""
     if message.text == "❌ Отмена":
         await edit_schema_start(message, state)
         return
@@ -1029,40 +1040,53 @@ async def ozon_column_selected(message: types.Message, state: FSMContext):
     data = await state.get_data()
     available_columns = data.get('available_columns', {})
     ozon_columns = available_columns.get('ozon', [])
+    wb_value = data.get('new_match_wb')  # Может быть None если пропущен
     
-    # Валидация выбора
-    ozon_value = None
     user_input = message.text.strip()
     
-    try:
-        col_number = int(user_input)
-        if 1 <= col_number <= len(ozon_columns):
-            ozon_value = ozon_columns[col_number - 1]
-    except ValueError:
-        if user_input in ozon_columns:
-            ozon_value = user_input
-        else:
-            user_lower = user_input.lower()
-            for col in ozon_columns:
-                if col.lower() == user_lower:
-                    ozon_value = col
-                    break
-    
-    if not ozon_value:
-        await message.answer(
-            f"❌ Столбец '{user_input}' не найден!\n\n"
-            f"Введи точное название или номер из списка."
-        )
-        return
-    
-    # Сохраняем выбор
-    await state.update_data(new_match_ozon=ozon_value)
+    # Проверка на NA (пропуск Ozon)
+    if user_input.upper() == 'NA':
+        ozon_value = None
+        await state.update_data(new_match_ozon=None)
+        display_ozon = "⏭ Ozon: пропущен (NA)"
+    else:
+        # Валидация выбора
+        ozon_value = None
+        
+        try:
+            col_number = int(user_input)
+            if 1 <= col_number <= len(ozon_columns):
+                ozon_value = ozon_columns[col_number - 1]
+        except ValueError:
+            if user_input in ozon_columns:
+                ozon_value = user_input
+            else:
+                user_lower = user_input.lower()
+                for col in ozon_columns:
+                    if col.lower() == user_lower:
+                        ozon_value = col
+                        break
+        
+        if not ozon_value:
+            await message.answer(
+                f"❌ Столбец '{user_input}' не найден!\n\n"
+                f"Введи точное название или номер из списка.\n"
+                f"💡 Или введи NA чтобы пропустить Ozon"
+            )
+            return
+        
+        # Сохраняем выбор
+        await state.update_data(new_match_ozon=ozon_value)
+        display_ozon = f"✅ Ozon: {ozon_value}"
     
     # Переходим к Яндекс
     yandex_columns = available_columns.get('yandex', [])
     
-    text = f"✅ WB: {data.get('new_match_wb')}\n"
-    text += f"✅ Ozon: {ozon_value}\n\n"
+    # Формируем отображение с учётом NA
+    display_wb = f"✅ WB: {wb_value}" if wb_value else "⏭ WB: пропущен (NA)"
+    
+    text = f"{display_wb}\n"
+    text += f"{display_ozon}\n\n"
     text += f"📋 Доступные столбцы Яндекс ({len(yandex_columns)}):\n\n"
     for i, col in enumerate(yandex_columns, 1):
         text += f"{i}. {col}\n"
@@ -1073,16 +1097,26 @@ async def ozon_column_selected(message: types.Message, state: FSMContext):
     if text:
         await message.answer(text)
     
+    # Определяем нужна ли подсказка про NA
+    # Если уже 2 маркетплейса пропущены - Яндекс обязателен
+    skipped_count = (0 if wb_value else 1) + (0 if ozon_value else 1)
+    
+    if skipped_count >= 2:
+        hint = "⚠️ Яндекс обязателен (уже пропущено 2 маркетплейса)"
+    else:
+        hint = "💡 Введи NA чтобы пропустить этот маркетплейс"
+    
     await state.set_state(SchemaStates.selecting_yandex_column)
     await message.answer(
         f"Шаг 3/3: Выбери столбец Яндекс\n\n"
-        f"Введи название или номер (1-{len(yandex_columns)}):",
+        f"Введи название или номер (1-{len(yandex_columns)})\n"
+        f"{hint}",
         reply_markup=get_cancel_keyboard()
     )
 
 
 async def yandex_column_selected(message: types.Message, state: FSMContext):
-    """Столбец Яндекс выбран, сохраняем сопоставление (без затирания других групп)"""
+    """Столбец Яндекс выбран (или NA), сохраняем сопоставление в нужную группу"""
     if message.text == "❌ Отмена":
         await edit_schema_start(message, state)
         return
@@ -1090,52 +1124,99 @@ async def yandex_column_selected(message: types.Message, state: FSMContext):
     data = await state.get_data()
     available_columns = data.get('available_columns', {})
     yandex_columns = available_columns.get('yandex', [])
-
-    # Валидация выбора
-    yandex_value = None
-    user_input = message.text.strip()
-
-    try:
-        col_number = int(user_input)
-        if 1 <= col_number <= len(yandex_columns):
-            yandex_value = yandex_columns[col_number - 1]
-    except ValueError:
-        if user_input in yandex_columns:
-            yandex_value = user_input
-        else:
-            user_lower = user_input.lower()
-            for col in yandex_columns:
-                if col.lower() == user_lower:
-                    yandex_value = col
-                    break
-
-    if not yandex_value:
-        await message.answer(
-            f"❌ Столбец '{user_input}' не найден!\n\n"
-            f"Введи точное название или номер из списка."
-        )
-        return
-
-    # Собираем новое сопоставление
+    
+    # Получаем ранее выбранные значения (могут быть None если NA)
     wb_value = data.get('new_match_wb')
     ozon_value = data.get('new_match_ozon')
+    
+    user_input = message.text.strip()
 
-    if not wb_value or not ozon_value:
+    # Проверка на NA (пропуск Яндекс)
+    if user_input.upper() == 'NA':
+        yandex_value = None
+    else:
+        # Валидация выбора
+        yandex_value = None
+
+        try:
+            col_number = int(user_input)
+            if 1 <= col_number <= len(yandex_columns):
+                yandex_value = yandex_columns[col_number - 1]
+        except ValueError:
+            if user_input in yandex_columns:
+                yandex_value = user_input
+            else:
+                user_lower = user_input.lower()
+                for col in yandex_columns:
+                    if col.lower() == user_lower:
+                        yandex_value = col
+                        break
+
+        if not yandex_value:
+            # Проверяем, можно ли вообще ввести NA
+            filled_count = (1 if wb_value else 0) + (1 if ozon_value else 0)
+            if filled_count >= 2:
+                hint = "\n💡 Или введи NA чтобы пропустить Яндекс"
+            else:
+                hint = "\n⚠️ Яндекс обязателен (нужно минимум 2 маркетплейса)"
+            
+            await message.answer(
+                f"❌ Столбец '{user_input}' не найден!\n\n"
+                f"Введи точное название или номер из списка.{hint}"
+            )
+            return
+
+    # === ПРОВЕРКА: минимум 2 маркетплейса должны быть заполнены ===
+    filled_count = (1 if wb_value else 0) + (1 if ozon_value else 0) + (1 if yandex_value else 0)
+    
+    if filled_count < 2:
         await message.answer(
-            "❌ Не удалось восстановить выбранные столбцы WB/Ozon.\n"
+            "❌ Сопоставление должно содержать минимум 2 маркетплейса!\n\n"
+            f"Сейчас заполнено: {filled_count}\n"
             "Попробуй начать добавление заново.",
             reply_markup=get_filter_matches_keyboard()
         )
         await state.set_state(SchemaStates.choosing_edit_action)
         return
 
+    # === ОПРЕДЕЛЯЕМ ТИП СОПОСТАВЛЕНИЯ ===
+    if wb_value and ozon_value and yandex_value:
+        match_type = 'triple'
+        group_key = 'matches_all_three'
+        type_display = "🎯 Тройное"
+    elif wb_value and ozon_value and not yandex_value:
+        match_type = 'pair_1_2'
+        group_key = 'matches_1_2'
+        type_display = "🔗 Парное (WB + Ozon)"
+    elif wb_value and not ozon_value and yandex_value:
+        match_type = 'pair_1_3'
+        group_key = 'matches_1_3'
+        type_display = "🔗 Парное (WB + Яндекс)"
+    elif not wb_value and ozon_value and yandex_value:
+        match_type = 'pair_2_3'
+        group_key = 'matches_2_3'
+        type_display = "🔗 Парное (Ozon + Яндекс)"
+    else:
+        await message.answer(
+            "❌ Неизвестная комбинация маркетплейсов. Попробуй заново.",
+            reply_markup=get_filter_matches_keyboard()
+        )
+        await state.set_state(SchemaStates.choosing_edit_action)
+        return
+
+    # === ФОРМИРУЕМ СОПОСТАВЛЕНИЕ ===
     new_match = {
-        'column_1': wb_value,
-        'column_2': ozon_value,
-        'column_3': yandex_value,
         'confidence': 1.0,  # Ручное сопоставление = 100%
         'description': 'Добавлено вручную'
     }
+    
+    # Добавляем только заполненные столбцы
+    if wb_value:
+        new_match['column_1'] = wb_value
+    if ozon_value:
+        new_match['column_2'] = ozon_value
+    if yandex_value:
+        new_match['column_3'] = yandex_value
 
     schema_id = data.get('edit_schema_id')
     schema_name = data.get('edit_schema_name')
@@ -1147,34 +1228,63 @@ async def yandex_column_selected(message: types.Message, state: FSMContext):
         await edit_schema_start(message, state)
         return
 
-    # Берём полную структуру сопоставлений (чтобы ничего не затереть)
+    # Берём полную структуру сопоставлений
     matches_data = data.get('edit_matches_data') or {}
     matches_all_three = matches_data.get('matches_all_three', [])
     matches_1_2 = matches_data.get('matches_1_2', [])
     matches_1_3 = matches_data.get('matches_1_3', [])
     matches_2_3 = matches_data.get('matches_2_3', [])
 
-    # Проверка на дубликат (по тройным)
-    is_duplicate = any(
-        m.get('column_1') == wb_value and
-        m.get('column_2') == ozon_value and
-        m.get('column_3') == yandex_value
-        for m in matches_all_three
-    )
+    # === ПРОВЕРКА НА ДУБЛИКАТ (во всех группах) ===
+    def check_duplicate(matches_list, col1_key, col2_key, val1, val2):
+        """Проверяет наличие дубликата в списке"""
+        for m in matches_list:
+            if m.get(col1_key) == val1 and m.get(col2_key) == val2:
+                return True
+        return False
+    
+    is_duplicate = False
+    
+    if match_type == 'triple':
+        is_duplicate = any(
+            m.get('column_1') == wb_value and
+            m.get('column_2') == ozon_value and
+            m.get('column_3') == yandex_value
+            for m in matches_all_three
+        )
+    elif match_type == 'pair_1_2':
+        is_duplicate = check_duplicate(matches_1_2, 'column_1', 'column_2', wb_value, ozon_value)
+    elif match_type == 'pair_1_3':
+        is_duplicate = check_duplicate(matches_1_3, 'column_1', 'column_3', wb_value, yandex_value)
+    elif match_type == 'pair_2_3':
+        is_duplicate = check_duplicate(matches_2_3, 'column_2', 'column_3', ozon_value, yandex_value)
 
     if is_duplicate:
+        display_wb = f"WB: {wb_value}" if wb_value else "WB: N/A"
+        display_ozon = f"Ozon: {ozon_value}" if ozon_value else "Ozon: N/A"
+        display_yandex = f"Яндекс: {yandex_value}" if yandex_value else "Яндекс: N/A"
+        
         await message.answer(
-            "⚠️ Такое сопоставление уже существует!\n\n"
-            f"WB: {wb_value}\n"
-            f"Ozon: {ozon_value}\n"
-            f"Яндекс: {yandex_value}",
+            f"⚠️ Такое сопоставление уже существует!\n\n"
+            f"{display_wb}\n"
+            f"{display_ozon}\n"
+            f"{display_yandex}",
             reply_markup=get_filter_matches_keyboard()
         )
         await state.set_state(SchemaStates.choosing_edit_action)
         return
 
-    # Добавляем в ТРОЙНЫЕ (и сохраняем ПОЛНУЮ структуру)
-    matches_all_three.append(new_match)
+    # === ДОБАВЛЯЕМ В НУЖНУЮ ГРУППУ ===
+    if match_type == 'triple':
+        matches_all_three.append(new_match)
+    elif match_type == 'pair_1_2':
+        matches_1_2.append(new_match)
+    elif match_type == 'pair_1_3':
+        matches_1_3.append(new_match)
+    elif match_type == 'pair_2_3':
+        matches_2_3.append(new_match)
+
+    # Сохраняем полную структуру
     matches_data['matches_all_three'] = matches_all_three
     matches_data['matches_1_2'] = matches_1_2
     matches_data['matches_1_3'] = matches_1_3
@@ -1182,16 +1292,16 @@ async def yandex_column_selected(message: types.Message, state: FSMContext):
 
     db.save_schema_matches(schema_id, matches_data)
 
-    # Также обновим edit_all_matches в state, чтобы UI/нумерация не рассинхронизировались
+    # Обновляем edit_all_matches в state
     all_matches = data.get('edit_all_matches', [])
-    all_matches.append({'type': 'triple', 'data': new_match})
+    all_matches.append({'type': match_type, 'data': new_match})
 
     await state.update_data(
         edit_matches_data=matches_data,
         edit_all_matches=all_matches
     )
 
-    # Очищаем временные загруженные файлы пользователя (как у тебя было)
+    # Очищаем временные файлы
     user_id = message.from_user.id
     if user_id in user_schemas:
         user_schemas[user_id] = {}
@@ -1205,13 +1315,19 @@ async def yandex_column_selected(message: types.Message, state: FSMContext):
         len(matches_data.get('matches_2_3', []))
     )
 
+    # Формируем сообщение
+    display_wb = f"🔹 WB: {wb_value}" if wb_value else "⏭ WB: N/A"
+    display_ozon = f"🔸 Ozon: {ozon_value}" if ozon_value else "⏭ Ozon: N/A"
+    display_yandex = f"🔹 Яндекс: {yandex_value}" if yandex_value else "⏭ Яндекс: N/A"
+
     text = "✅ Новое сопоставление добавлено!\n\n"
     text += f"📋 Схема: {schema_name}\n"
-    text += f"📊 Всего сопоставлений: {total_count}\n\n"
+    text += f"📊 Всего сопоставлений: {total_count}\n"
+    text += f"🏷 Тип: {type_display}\n\n"
     text += "Добавлено:\n"
-    text += f"🔹 WB: {wb_value}\n"
-    text += f"🔸 Ozon: {ozon_value}\n"
-    text += f"🔹 Яндекс: {yandex_value}"
+    text += f"{display_wb}\n"
+    text += f"{display_ozon}\n"
+    text += f"{display_yandex}"
 
     await message.answer(text)
     await edit_schema_start(message, state)

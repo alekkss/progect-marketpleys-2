@@ -439,7 +439,6 @@ class DataSynchronizer:
         self.original_column_names = {}
         # ДОБАВЬТЕ ЭТУ СТРОКУ:
         self.ai_validation_log = []  # Логи AI-сопоставлений
-        self.ai_cache = {}
         logger.info("Инициализация DataSynchronizer")
         logger.debug(f"AI comparator передан: {ai_comparator is not None}")
     
@@ -1289,23 +1288,6 @@ class DataSynchronizer:
         
         value_str = str(value).strip()
         
-        # === МАППИНГ ЧИСЛИТЕЛЬНЫХ ===
-        WORD_TO_NUMBER = {
-            'ноль': '0', 'нуль': '0',
-            'один': '1', 'одна': '1', 'одно': '1',
-            'два': '2', 'две': '2',
-            'три': '3',
-            'четыре': '4',
-            'пять': '5',
-            'шесть': '6',
-            'семь': '7',
-            'восемь': '8',
-            'девять': '9',
-            'десять': '10',
-            'одиннадцать': '11',
-            'двенадцать': '12',
-        }
-        
         # Функция нормализации
         def normalize(text: str) -> str:
             """Нормализует текст: нижний регистр, ё→е"""
@@ -1343,21 +1325,7 @@ class DataSynchronizer:
                 log_match(value_str, allowed, 'Нормализация (регистр/ё-е)')
                 return allowed
         
-        # 3. НОВОЕ: Проверяем числительные ("два" → "2")
-        if value_normalized in WORD_TO_NUMBER:
-            number_value = WORD_TO_NUMBER[value_normalized]
-            if number_value in allowed_values:
-                logger.info(f"[_validate_with_ai] Числительное: '{value_str}' → '{number_value}'")
-                log_match(value_str, number_value, 'Маппинг числительных')
-                return number_value
-            # Проверяем также с нормализацией allowed_values
-            for allowed in allowed_values:
-                if normalize(allowed) == number_value or extract_number(allowed) == number_value:
-                    logger.info(f"[_validate_with_ai] Числительное (fuzzy): '{value_str}' → '{allowed}'")
-                    log_match(value_str, allowed, 'Маппинг числительных')
-                    return allowed
-        
-        # 4. Извлекаем число если это числовое поле
+        # 3. Извлекаем число если это числовое поле
         number = extract_number(value_str)
         if number:
             # Проверяем точное совпадение числа
@@ -1373,7 +1341,7 @@ class DataSynchronizer:
                     log_match(value_str, allowed, 'Извлечение числа')
                     return allowed
         
-        # 5. Проверяем частичное совпадение (по словам)
+        # 4. Проверяем частичное совпадение (по словам)
         value_words = set(value_normalized.split())
         for allowed in allowed_values:
             allowed_words = set(normalize(allowed).split())
@@ -1384,23 +1352,9 @@ class DataSynchronizer:
                 log_match(value_str, allowed, 'Частичное совпадение (слова)')
                 return allowed
         
-        # 6. НОВОЕ: Проверяем кэш перед AI запросом
-        cache_key = (value_str, column_name)
-        if cache_key in self.ai_cache:
-            cached_result = self.ai_cache[cache_key]
-            if cached_result:
-                logger.info(f"📦 [CACHE] Найдено в кэше: '{value_str}' → '{cached_result}'")
-                log_match(value_str, cached_result, 'Кэш AI')
-            else:
-                logger.info(f"📦 [CACHE] Найдено в кэше: '{value_str}' → НЕТ СОВПАДЕНИЯ")
-            return cached_result
-        
-        # 7. Спрашиваем AI (и сохраняем в кэш)
+        # 5. Спрашиваем AI (без кэша!)
         logger.info(f"🤖 [AI] Проверяю '{value_str}' для столбца '{column_name}'...")
-        matched_value = self.ai_comparator.match_value_with_list(value_str, allowed_values, column_name=column_name)
-        
-        # Сохраняем в кэш (даже если None)
-        self.ai_cache[cache_key] = matched_value
+        matched_value = self.ai_comparator.match_value_with_list(value_str, allowed_values, column_name=column_name)  # ← ДОБАВИТЬ!)
         
         if matched_value:
             logger.info(f"✅ [AI] Найдено: '{value_str}' → '{matched_value}'")

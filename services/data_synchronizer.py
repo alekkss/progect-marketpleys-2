@@ -8,7 +8,10 @@ from openpyxl.utils import get_column_letter, column_index_from_string
 from typing import Dict, List, Tuple, Optional
 from utils.excel_reader import ExcelReader
 from utils.excel_writer import ExcelWriter
-from config.config import FILE_CONFIGS, is_excluded_column
+from config.config import (
+    FILE_CONFIGS, is_excluded_column,
+    WB_DIMENSION_PATTERNS, ALL_DIMENSION_COLUMN_NAMES,
+)
 from services.ai_comparator import AIComparator
 from utils.logger_config import setup_logger
 import sys
@@ -22,11 +25,12 @@ class DimensionsSynchronizer:
     """Синхронизация композитных габаритов (Длина/Ширина/Высота)"""
 
     # Маппинг столбцов для каждого маркетплейса
+    # Для WB используются паттерны — реальное имя определяется динамически
     DIMENSIONS_MAPPING = {
         'wildberries': {
-            'length': 'Длина упаковки (целое число)',
-            'width': 'Ширина упаковки (целое число)',
-            'height': 'Высота упаковки (целое число)',
+            'length_patterns': WB_DIMENSION_PATTERNS['length'],
+            'width_patterns': WB_DIMENSION_PATTERNS['width'],
+            'height_patterns': WB_DIMENSION_PATTERNS['height'],
             'unit': 'cm'
         },
         'ozon': {
@@ -40,6 +44,53 @@ class DimensionsSynchronizer:
             'unit': 'cm'
         }
     }
+
+    @classmethod
+    def _resolve_wb_columns(cls, df_wb: pd.DataFrame) -> Optional[Dict[str, str]]:
+        """
+        Динамически определяет реальные названия столбцов габаритов WB.
+
+        Разные категории товаров на Wildberries используют разные названия:
+        - «Длина упаковки (целое число)» (например, Кроссовки)
+        - «Длина упаковки» (например, Куртки)
+
+        Метод перебирает паттерны из конфигурации и возвращает первое
+        найденное совпадение для каждого измерения.
+
+        Args:
+            df_wb: DataFrame с данными Wildberries
+
+        Returns:
+            Словарь {'length': '...', 'width': '...', 'height': '...'} или None
+        """
+        wb_map = cls.DIMENSIONS_MAPPING['wildberries']
+        resolved = {}
+
+        for dim_key in ('length', 'width', 'height'):
+            patterns = wb_map[f'{dim_key}_patterns']
+            found = False
+
+            for pattern in patterns:
+                if pattern in df_wb.columns:
+                    resolved[dim_key] = pattern
+                    found = True
+                    logger.info(
+                        f"   ✅ WB столбец '{dim_key}' найден как '{pattern}'"
+                    )
+                    break
+
+            if not found:
+                logger.warning(
+                    f"   ❌ WB столбец '{dim_key}' не найден! "
+                    f"Проверенные варианты: {patterns}"
+                )
+                logger.info(
+                    f"   Доступные столбцы (первые 15): "
+                    f"{list(df_wb.columns)[:15]}"
+                )
+                return None
+
+        return resolved
 
     @staticmethod
     def parse_composite_dimensions(value: str) -> Optional[Dict[str, float]]:
@@ -93,7 +144,8 @@ class DimensionsSynchronizer:
     @classmethod
     def sync_dimensions(cls, dfs: Dict[str, pd.DataFrame]) -> int:
         """
-        Синхронизирует габариты между всеми маркетплейсами
+        Синхронизирует габариты между всеми маркетплейсами.
+        Динамически определяет названия столбцов WB через паттерны.
         """
         logger.info("=" * 80)
         logger.info("🔧 НАЧАЛО СИНХРОНИЗАЦИИ ГАБАРИТОВ (DimensionsSynchronizer)")
@@ -112,6 +164,24 @@ class DimensionsSynchronizer:
         yandex_dimensions = {}
         wb_dimensions = {}
         ozon_dimensions = {}
+
+        # ==================== ДИНАМИЧЕСКОЕ ОПРЕДЕЛЕНИЕ СТОЛБЦОВ WB ====================
+        resolved_wb_dims = None
+        if 'wildberries' in dfs:
+            logger.info("\n🔍 Определяю названия столбцов габаритов WB...")
+            resolved_wb_dims = cls._resolve_wb_columns(dfs['wildberries'])
+            if resolved_wb_dims:
+                logger.info(
+                    f"   📋 Найдены столбцы WB: "
+                    f"length='{resolved_wb_dims['length']}', "
+                    f"width='{resolved_wb_dims['width']}', "
+                    f"height='{resolved_wb_dims['height']}'"
+                )
+            else:
+                logger.error("   ⛔ Не удалось определить столбцы габаритов WB!")
+
+        # Сохраняем resolved_wb_dims в атрибут класса для использования в DataSynchronizer
+        cls._resolved_wb_dims = resolved_wb_dims
 
         # ==================== ЭТАП 1: ЧТЕНИЕ ДАННЫХ ИЗ ЯНДЕКС ====================
         logger.info("\n📖 ЭТАП 1: Чтение габаритов из Яндекс (композитный формат)")
@@ -156,46 +226,35 @@ class DimensionsSynchronizer:
         
         if 'wildberries' not in dfs:
             logger.warning("   ❌ DataFrame 'wildberries' отсутствует!")
+        elif not resolved_wb_dims:
+            logger.error("   ⛔ Пропускаю WB — столбцы габаритов не определены")
         else:
-            wb_map = cls.DIMENSIONS_MAPPING['wildberries']
             df_wb = dfs['wildberries']
+            rows_with_dimensions = 0
             
-            missing_cols = []
-            for col in [wb_map['length'], wb_map['width'], wb_map['height']]:
-                if col not in df_wb.columns:
-                    missing_cols.append(col)
-                    logger.warning(f"   ❌ Столбец '{col}' не найден!")
-                else:
-                    logger.info(f"   ✅ Столбец '{col}' найден")
-            
-            if missing_cols:
-                logger.error(f"   ⛔ Пропускаю WB из-за отсутствия столбцов: {missing_cols}")
-            else:
-                rows_with_dimensions = 0
+            for idx, row in df_wb.iterrows():
+                article = row.get(article_cols['wildberries'])
                 
-                for idx, row in df_wb.iterrows():
-                    article = row.get(article_cols['wildberries'])
-                    
-                    if pd.notna(article) and str(article).strip():
-                        article_str = str(article).strip()
-                        length = row.get(wb_map['length'])
-                        width = row.get(wb_map['width'])
-                        height = row.get(wb_map['height'])
+                if pd.notna(article) and str(article).strip():
+                    article_str = str(article).strip()
+                    length = row.get(resolved_wb_dims['length'])
+                    width = row.get(resolved_wb_dims['width'])
+                    height = row.get(resolved_wb_dims['height'])
 
-                        if all(pd.notna(v) and str(v).strip() for v in [length, width, height]):
-                            try:
-                                wb_dimensions[article_str] = {
-                                    'length': float(length),
-                                    'width': float(width),
-                                    'height': float(height)
-                                }
-                                rows_with_dimensions += 1
-                                if rows_with_dimensions <= 3:
-                                    logger.info(f"   ✓ WB [{article_str}]: {length}/{width}/{height} см")
-                            except ValueError:
-                                pass
-                
-                logger.info(f"   📊 Итого WB: {rows_with_dimensions} артикулов с полными габаритами")
+                    if all(pd.notna(v) and str(v).strip() for v in [length, width, height]):
+                        try:
+                            wb_dimensions[article_str] = {
+                                'length': float(length),
+                                'width': float(width),
+                                'height': float(height)
+                            }
+                            rows_with_dimensions += 1
+                            if rows_with_dimensions <= 3:
+                                logger.info(f"   ✓ WB [{article_str}]: {length}/{width}/{height} см")
+                        except ValueError:
+                            pass
+            
+            logger.info(f"   📊 Итого WB: {rows_with_dimensions} артикулов с полными габаритами")
 
         # ==================== ЭТАП 3: ЧТЕНИЕ ДАННЫХ ИЗ OZON ====================
         logger.info("\n📖 ЭТАП 3: Чтение габаритов из Ozon (раздельные столбцы, мм)")
@@ -257,16 +316,16 @@ class DimensionsSynchronizer:
         
         for article, dimensions in yandex_dimensions.items():
             # Синхронизация в WB
-            if 'wildberries' in dfs:
+            if 'wildberries' in dfs and resolved_wb_dims:
                 df_wb = dfs['wildberries']
-                wb_map = cls.DIMENSIONS_MAPPING['wildberries']
 
                 mask = df_wb[article_cols['wildberries']].astype(str).str.strip() == article
                 
                 if mask.any():
                     idx = df_wb[mask].index[0]
 
-                    for dim_key, col_name in [('length', wb_map['length']), ('width', wb_map['width']), ('height', wb_map['height'])]:
+                    for dim_key in ('length', 'width', 'height'):
+                        col_name = resolved_wb_dims[dim_key]
                         current_val = df_wb.at[idx, col_name]
                         if pd.isna(current_val) or not str(current_val).strip():
                             df_wb.at[idx, col_name] = dimensions[dim_key]
@@ -386,16 +445,16 @@ class DimensionsSynchronizer:
                         ozon_skipped_yandex += 1
 
             # В WB
-            if 'wildberries' in dfs:
+            if 'wildberries' in dfs and resolved_wb_dims:
                 df_wb = dfs['wildberries']
-                wb_map = cls.DIMENSIONS_MAPPING['wildberries']
 
                 mask = df_wb[article_cols['wildberries']].astype(str).str.strip() == article
                 
                 if mask.any():
                     idx = df_wb[mask].index[0]
 
-                    for dim_key, col_name in [('length', wb_map['length']), ('width', wb_map['width']), ('height', wb_map['height'])]:
+                    for dim_key in ('length', 'width', 'height'):
+                        col_name = resolved_wb_dims[dim_key]
                         current_val = df_wb.at[idx, col_name]
                         if pd.isna(current_val) or not str(current_val).strip():
                             df_wb.at[idx, col_name] = dimensions[dim_key]
@@ -956,28 +1015,13 @@ class DataSynchronizer:
                 skipped_count += 1
                 continue
 
-            # ⭐ НОВОЕ: Пропускаем габариты - они обрабатываются через DimensionsSynchronizer
-            dimensions_columns = {
-                'Длина упаковки (целое число)',
-                'Ширина упаковки (целое число)', 
-                'Высота упаковки (целое число)',
-                'Длина упаковки, мм*',
-                'Ширина упаковки, мм*',
-                'Высота упаковки, мм*',
-                'Габариты с упаковкой, см'
-            }
-
-            if col_wb in dimensions_columns or col_ozon in dimensions_columns or col_yandex in dimensions_columns:
+            # Пропускаем габариты — они обрабатываются через DimensionsSynchronizer
+            if (col_wb in ALL_DIMENSION_COLUMN_NAMES or
+                col_ozon in ALL_DIMENSION_COLUMN_NAMES or
+                col_yandex in ALL_DIMENSION_COLUMN_NAMES):
                 skipped_count += 1
                 logger.info(f"⏭️ Пропущено (габариты): {col_wb} ↔ {col_ozon} ↔ {col_yandex}")
                 continue
-            
-            # ⭐ ДОБАВЬ ЭТУ ПРОВЕРКУ:
-            # Пропускаем габариты - они обрабатываются через DimensionsSynchronizer
-            # if col_yandex == "Габариты с упаковкой, см":
-            #     skipped_count += 1
-            #     logger.info(f"⏭️  Пропущено (габариты): {col_wb} ↔ {col_ozon} ↔ {col_yandex}")
-            #     continue
             
             # Проверяем, что столбцы существуют
             if (col_wb not in dfs['wildberries'].columns or
@@ -1032,18 +1076,8 @@ class DataSynchronizer:
                     skipped_count += 1
                     continue
 
-                # ⭐ НОВОЕ: Пропускаем габариты
-                dimensions_columns = {
-                    'Длина упаковки (целое число)',
-                    'Ширина упаковки (целое число)',
-                    'Высота упаковки (целое число)',
-                    'Длина упаковки, мм*',
-                    'Ширина упаковки, мм*',
-                    'Высота упаковки, мм*',
-                    'Габариты с упаковкой, см'
-                }
-
-                if col1 in dimensions_columns or col2 in dimensions_columns:
+                # Пропускаем габариты — они обрабатываются через DimensionsSynchronizer
+                if col1 in ALL_DIMENSION_COLUMN_NAMES or col2 in ALL_DIMENSION_COLUMN_NAMES:
                     skipped_count += 1
                     logger.info(f"⏭️ Пропущено (габариты): {mp1}:{col1} ↔ {mp2}:{col2}")
                     continue
@@ -1091,6 +1125,9 @@ class DataSynchronizer:
         
         # Получаем все уникальные артикулы
         all_articles = set(wb_data.keys()) | set(ozon_data.keys()) | set(yandex_data.keys())
+        
+        # Получаем resolved WB dimensions для формирования композитных габаритов
+        resolved_wb_dims = getattr(DimensionsSynchronizer, '_resolved_wb_dims', None)
         
         for article in all_articles:
             if not article:  # Пропускаем пустые артикулы
@@ -1215,12 +1252,12 @@ class DataSynchronizer:
                     if col_yandex == "Габариты с упаковкой, см":
                         # Формируем композитное значение из трёх измерений
                         # Определяем источник (WB или Ozon)
-                        if source_unit == unit_wb and article in wb_data:
-                            # Источник - WB
+                        if source_unit == unit_wb and article in wb_data and resolved_wb_dims:
+                            # Источник - WB (используем динамические имена столбцов)
                             wb_row = dfs['wildberries'][dfs['wildberries'][self.article_columns['wildberries']].astype(str).str.strip() == article].iloc[0]
-                            length = wb_row.get('Длина упаковки (целое число)', None)
-                            width = wb_row.get('Ширина упаковки (целое число)', None)
-                            height = wb_row.get('Высота упаковки (целое число)', None)
+                            length = wb_row.get(resolved_wb_dims['length'], None)
+                            width = wb_row.get(resolved_wb_dims['width'], None)
+                            height = wb_row.get(resolved_wb_dims['height'], None)
                             
                             if all(pd.notna(v) for v in [length, width, height]):
                                 composite = DimensionsSynchronizer.format_composite_dimensions(
@@ -1354,7 +1391,7 @@ class DataSynchronizer:
         
         # 5. Спрашиваем AI (без кэша!)
         logger.info(f"🤖 [AI] Проверяю '{value_str}' для столбца '{column_name}'...")
-        matched_value = self.ai_comparator.match_value_with_list(value_str, allowed_values, column_name=column_name)  # ← ДОБАВИТЬ!)
+        matched_value = self.ai_comparator.match_value_with_list(value_str, allowed_values, column_name=column_name)
         
         if matched_value:
             logger.info(f"✅ [AI] Найдено: '{value_str}' → '{matched_value}'")
@@ -1469,7 +1506,7 @@ class DataSynchronizer:
                     series = dfs[mp1][col1]
                     if isinstance(series, pd.DataFrame):
                         series = series.iloc[:, 0]
-                    col_dtype = series.dtype  # ✅
+                    col_dtype = series.dtype
                     converted_value = self._convert_value(val2, unit2, unit1)
                     
                     final_value = self._validate_multiple_values(converted_value, mp1, col1)
@@ -1498,7 +1535,7 @@ class DataSynchronizer:
                     series = dfs[mp2][col2]
                     if isinstance(series, pd.DataFrame):
                         series = series.iloc[:, 0]
-                    col_dtype = series.dtype  # ✅
+                    col_dtype = series.dtype
                     converted_value = self._convert_value(val1, unit1, unit2)
                     
                     final_value = self._validate_multiple_values(converted_value, mp2, col2)
@@ -1555,7 +1592,7 @@ class DataSynchronizer:
             'article': article,
             'column': column,
             'new_value': str(new_value),
-            'source_marketplace': source_marketplace  # ← ДОБАВЛЕНО
+            'source_marketplace': source_marketplace
         })
     
     def _postprocess_wb_dimensions(self, dfs: Dict[str, pd.DataFrame]) -> int:
@@ -1571,11 +1608,15 @@ class DataSynchronizer:
         converted_count = 0
         df_wb = dfs['wildberries']
         
-        # Столбцы габаритов WB
+        # Используем динамически определённые столбцы вместо хардкода
+        resolved_wb_dims = getattr(DimensionsSynchronizer, '_resolved_wb_dims', None)
+        if not resolved_wb_dims:
+            return 0
+        
         wb_dimension_columns = [
-            'Длина упаковки (целое число)',
-            'Ширина упаковки (целое число)',
-            'Высота упаковки (целое число)'
+            resolved_wb_dims['length'],
+            resolved_wb_dims['width'],
+            resolved_wb_dims['height'],
         ]
         
         # Проверяем наличие столбцов
@@ -1698,7 +1739,7 @@ class DataSynchronizer:
                         return values
                         
                     except Exception as e:
-                        print(f"      [!] Не удалось извлечь список из диапазона {formula}: {e}")
+                        print(f"      [!] Не удалось извлечить список из диапазона {formula}: {e}")
                         return []
         
         return []

@@ -31,15 +31,24 @@ def _patch_data_validation() -> None:
     Проблема: файлы Ozon содержат data validation с форматом sqref,
     который openpyxl не может распарсить, что вызывает TypeError.
     Решение: перехватываем ошибку и устанавливаем пустой диапазон.
+
+    Важно: нельзя подставлять None вместо sqref — MultiCellRange(None)
+    вызовет set(None), что даёт TypeError. Используем MultiCellRange()
+    (пустой объект) как безопасную замену.
     """
     original_init = DataValidation.__init__
 
-    def _safe_init(self, *args, **kwargs):
+    def _safe_init(self, *args, **kwargs) -> None:
         """Безопасная инициализация DataValidation с обработкой ошибок sqref."""
         sqref = kwargs.get('sqref', None)
-        if sqref is not None:
+
+        # Если sqref=None пришёл из XML — сразу заменяем на пустой диапазон,
+        # иначе MultiCellRange(None) упадёт с TypeError: 'NoneType' is not iterable
+        if sqref is None and 'sqref' in kwargs:
+            kwargs['sqref'] = MultiCellRange()
+        elif sqref is not None:
             try:
-                # Пробуем преобразовать sqref заранее
+                # Пробуем преобразовать sqref заранее, чтобы отловить некорректные значения
                 if not isinstance(sqref, MultiCellRange):
                     MultiCellRange(sqref)
             except (TypeError, ValueError):
@@ -47,7 +56,8 @@ def _patch_data_validation() -> None:
                     f"Некорректный sqref в data validation: {sqref!r}. "
                     f"Заменяем на пустой диапазон."
                 )
-                kwargs['sqref'] = None
+                kwargs['sqref'] = MultiCellRange()
+
         try:
             original_init(self, *args, **kwargs)
         except TypeError as e:
@@ -55,7 +65,7 @@ def _patch_data_validation() -> None:
                 f"Ошибка инициализации DataValidation: {e}. "
                 f"Создаём без sqref."
             )
-            kwargs['sqref'] = None
+            kwargs['sqref'] = MultiCellRange()
             original_init(self, *args, **kwargs)
 
     DataValidation.__init__ = _safe_init

@@ -477,7 +477,23 @@ class DimensionsSynchronizer:
 class DataSynchronizer:
     """Класс для синхронизации данных между тремя маркетплейсами"""
     
-    def __init__(self, comparison_result: Dict, ai_comparator=None):
+    def __init__(
+        self,
+        comparison_result: Dict,
+        ai_comparator=None,
+        xml_offer_data: Optional[List[Dict]] = None,
+        xml_categories: Optional[Dict[str, str]] = None,
+    ):
+        """
+        Инициализация DataSynchronizer.
+
+        Args:
+            comparison_result: словарь сопоставлений из схемы
+            ai_comparator: экземпляр AIComparator для валидации
+            xml_offer_data: список словарей с данными офферов из XML
+                            (ключи с префиксами [XML] и [XML param])
+            xml_categories: словарь {category_id: category_name} из XML
+        """
         self.comparison_result = comparison_result
         self.article_columns = {
             'wildberries': 'Артикул продавца',
@@ -491,15 +507,21 @@ class DataSynchronizer:
         }
         self.original_file_paths = {}
         self.ai_comparator = ai_comparator
-        
-        
-        # ДОБАВЬТЕ: Кэш validation для каждого столбца
-        self.column_validations = {}  # {marketplace: {column_name: [allowed_values]}}
+
+        # МВМ: данные из XML каталога
+        self.xml_offer_data = xml_offer_data or []
+        self.xml_categories = xml_categories or {}
+        self.xml_article_map: Dict[str, Dict] = {}
+
+        # Кэш validation для каждого столбца
+        self.column_validations = {}
         self.original_column_names = {}
-        # ДОБАВЬТЕ ЭТУ СТРОКУ:
-        self.ai_validation_log = []  # Логи AI-сопоставлений
+        self.ai_validation_log = []
+
         logger.info("Инициализация DataSynchronizer")
         logger.debug(f"AI comparator передан: {ai_comparator is not None}")
+        if self.xml_offer_data:
+            logger.info(f"XML данные: {len(self.xml_offer_data)} офферов")
     
     def _align_articles(self, dfs: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
         """
@@ -712,33 +734,55 @@ class DataSynchronizer:
         output_paths: Dict[str, str] = None,
         report_path: str = None
     ) -> Tuple[Dict[str, pd.DataFrame], Dict]:
-        logger.info("="*60)
+        """
+        Основной метод синхронизации данных между маркетплейсами.
+
+        Порядок:
+            1. Загрузка DataFrame из Excel
+            2. Выравнивание артикулов
+            3. Синхронизация габаритов (DimensionsSynchronizer)
+            4. Синхронизация остальных столбцов между МП
+            5. [МВМ] Заполнение из XML каталога
+            6. Сохранение результатов
+        """
+        logger.info("=" * 60)
         logger.info("СИНХРОНИЗАЦИЯ ДАННЫХ МЕЖДУ МАРКЕТПЛЕЙСАМИ")
-        logger.info("="*60)
+        logger.info("=" * 60)
 
         # 1. Загружаем данные из всех трех файлов
         dfs = self._load_all_dataframes(file_paths)
-        
+
         # 2. Выравниваем артикулы
         dfs = self._align_articles(dfs)
 
-        # 3. 🆕 СИНХРОНИЗАЦИЯ ГАБАРИТОВ (ПЕРЕД остальными столбцами!)
+        # 3. Синхронизация габаритов (ПЕРЕД остальными столбцами!)
         dimensions_synced = DimensionsSynchronizer.sync_dimensions(dfs)
 
-        # 4. Синхронизируем ОСТАЛЬНЫЕ данные
-        logger.info("\n" + "="*60)
+        # 4. Синхронизируем ОСТАЛЬНЫЕ данные между МП
+        logger.info("\n" + "=" * 60)
         logger.info("📝 СИНХРОНИЗАЦИЯ ОСТАЛЬНЫХ СТОЛБЦОВ")
-        logger.info("="*60)
+        logger.info("=" * 60)
         synced_dfs = self._sync_all_matches(dfs)
 
-        # 5. Сохраняем результаты
+        # 5. [МВМ] Заполнение из XML каталога
+        if self.xml_offer_data:
+            logger.info("\n" + "=" * 60)
+            logger.info("📦 ЗАПОЛНЕНИЕ ИЗ XML КАТАЛОГА")
+            logger.info("=" * 60)
+            self._build_xml_article_map()
+            xml_filled = self._sync_from_xml(synced_dfs)
+            logger.info(f"✅ Из XML заполнено: {xml_filled} ячеек")
+        else:
+            logger.info("\n[i] XML данные отсутствуют — пропускаю заполнение из каталога")
+
+        # 6. Сохраняем результаты
         if output_paths:
             self._save_results(synced_dfs, output_paths)
 
-        logger.info("\n" + "="*60)
+        logger.info("\n" + "=" * 60)
         logger.info("✅ СИНХРОНИЗАЦИЯ ЗАВЕРШЕНА!")
-        logger.info("="*60)
-        
+        logger.info("=" * 60)
+
         return synced_dfs, self.changes_log
         
     
@@ -1993,3 +2037,201 @@ class DataSynchronizer:
             print(f"  🤖 AI-сопоставлений: {stats['ai_matched']}")
             print(f"  ⚠ Конфликтов: {stats['validation_conflicts']}")
         print(f"{'='*60}")
+    
+    def _build_xml_article_map(self) -> None:
+        """
+        Строит индекс XML-офферов по артикулу (vendorCode).
+
+        Ключ — значение [XML] vendorCode (артикул продавца).
+        Значение — словарь всех полей оффера.
+
+        Это позволяет быстро находить XML-данные по артикулу товара
+        при синхронизации с МП-файлами.
+        """
+        self.xml_article_map = {}
+
+        for offer in self.xml_offer_data:
+            # Основной ключ — vendorCode (артикул продавца)
+            vendor_code = offer.get('[XML] vendorCode', '').strip()
+            if vendor_code:
+                self.xml_article_map[vendor_code] = offer
+
+        logger.info(
+            f"📦 XML индекс: {len(self.xml_article_map)} офферов "
+            f"с артикулами (из {len(self.xml_offer_data)} всего)"
+        )
+
+        # Показываем первые 3 для отладки
+        for i, (article, data) in enumerate(self.xml_article_map.items()):
+            if i >= 3:
+                break
+            fields_count = len(data)
+            logger.debug(f"   [{article}]: {fields_count} полей")
+
+    def _sync_from_xml(self, dfs: Dict[str, pd.DataFrame]) -> int:
+        """
+        Заполняет пустые ячейки в МП-файлах данными из XML каталога.
+
+        Логика:
+            1. Проходит по всем сопоставлениям, содержащим column_4 (XML)
+            2. Для каждого артикула в МП ищет соответствующий XML-оффер
+            3. Если ячейка МП пустая, а в XML есть значение — заполняет
+
+        Поддерживает все типы МВМ-сопоставлений:
+            - matches_all_four (4 источника)
+            - matches_triple_*_4 (тройные с XML)
+            - matches_pair_*_4 (парные с XML)
+
+        Args:
+            dfs: словарь DataFrame маркетплейсов
+
+        Returns:
+            Количество заполненных ячеек
+        """
+        if not self.xml_article_map:
+            logger.info("   XML индекс пуст — нечего заполнять")
+            return 0
+
+        filled_count = 0
+
+        # Группы, содержащие column_4 (XML)
+        xml_groups = [
+            'matches_all_four',
+            'matches_triple_1_2_4',
+            'matches_triple_1_3_4',
+            'matches_triple_2_3_4',
+            'matches_pair_1_4',
+            'matches_pair_2_4',
+            'matches_pair_3_4',
+        ]
+
+        # Маппинг column_key → (marketplace, article_column)
+        mp_info = {
+            'column_1': ('wildberries', self.article_columns['wildberries']),
+            'column_2': ('ozon', self.article_columns['ozon']),
+            'column_3': ('yandex', self.article_columns['yandex']),
+        }
+
+        for group_key in xml_groups:
+            matches = self.comparison_result.get(group_key, [])
+            if not matches:
+                continue
+
+            logger.info(f"\n📦 Обработка группы '{group_key}': {len(matches)} сопоставлений")
+
+            for match in matches:
+                xml_field = match.get('column_4')
+                if not xml_field:
+                    continue
+
+                # Определяем какие МП-столбцы участвуют
+                mp_columns = {}
+                for col_key, (mp_name, article_col) in mp_info.items():
+                    mp_col_name = match.get(col_key)
+                    if mp_col_name and mp_name in dfs:
+                        if mp_col_name in dfs[mp_name].columns:
+                            mp_columns[col_key] = {
+                                'marketplace': mp_name,
+                                'column_name': mp_col_name,
+                                'article_column': article_col,
+                            }
+
+                if not mp_columns:
+                    continue
+
+                # Для каждого МП-столбца заполняем из XML
+                for col_key, info in mp_columns.items():
+                    mp_name = info['marketplace']
+                    col_name = info['column_name']
+                    article_col = info['article_column']
+                    df = dfs[mp_name]
+
+                    if article_col not in df.columns:
+                        continue
+
+                    filled_in_match = 0
+
+                    for idx, row in df.iterrows():
+                        article = row.get(article_col)
+
+                        if pd.isna(article) or not str(article).strip():
+                            continue
+
+                        article_str = str(article).strip()
+
+                        # Проверяем: ячейка МП пустая?
+                        current_value = row.get(col_name)
+                        if isinstance(current_value, pd.Series):
+                            current_value = current_value.iloc[0] if not current_value.empty else None
+
+                        if pd.notna(current_value) and str(current_value).strip():
+                            continue  # Уже заполнено — не перезаписываем
+
+                        # Ищем артикул в XML
+                        xml_offer = self.xml_article_map.get(article_str)
+                        if not xml_offer:
+                            continue
+
+                        # Получаем значение из XML
+                        xml_value = xml_offer.get(xml_field, '')
+                        if not xml_value or not str(xml_value).strip():
+                            continue
+
+                        xml_value_str = str(xml_value).strip()
+
+                        # Определяем единицы измерения и конвертируем
+                        source_unit = self._detect_unit(xml_field)
+                        target_unit = self._detect_unit(col_name)
+                        converted_value = self._convert_value(
+                            xml_value_str, source_unit, target_unit
+                        )
+
+                        # Валидация через AI (если есть validation list)
+                        final_value = self._validate_multiple_values(
+                            converted_value, mp_name, col_name
+                        )
+
+                        if final_value:
+                            value_to_set = final_value
+                        elif not self.column_validations.get(mp_name, {}).get(col_name):
+                            # Нет validation — записываем как есть
+                            value_to_set = converted_value
+                        else:
+                            # Есть validation, но не прошло — пропускаем
+                            logger.warning(
+                                f"⚠️ [{mp_name.upper()}] XML→МП пропущено: "
+                                f"'{converted_value}' для '{col_name}' (не прошло validation)"
+                            )
+                            continue
+
+                        # Проверяем тип столбца
+                        series = df[col_name]
+                        if isinstance(series, pd.DataFrame):
+                            series = series.iloc[:, 0]
+
+                        if pd.api.types.is_numeric_dtype(series.dtype):
+                            value_to_set = pd.to_numeric(value_to_set, errors='coerce')
+
+                        try:
+                            df.at[idx, col_name] = value_to_set
+                            filled_count += 1
+                            filled_in_match += 1
+
+                            self._log_change(
+                                mp_name, article_str, col_name,
+                                value_to_set, source_marketplace='xml'
+                            )
+                        except Exception as e:
+                            logger.error(
+                                f"Ошибка записи XML→{mp_name}: "
+                                f"артикул={article_str}, столбец={col_name}: {e}"
+                            )
+
+                    if filled_in_match > 0:
+                        logger.info(
+                            f"   ✓ {xml_field} → {info['marketplace']}:'{col_name}': "
+                            f"заполнено {filled_in_match} ячеек"
+                        )
+
+        logger.info(f"\n📦 Итого из XML заполнено: {filled_count} ячеек")
+        return filled_count

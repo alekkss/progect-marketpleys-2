@@ -1,11 +1,19 @@
 """
-Обработчики редактирования схем (просмотр и изменение сопоставлений)
+Обработчики редактирования схем (просмотр и изменение сопоставлений).
+
+Поддерживает два типа схем:
+    - standard (3 МП): WB + Ozon + Яндекс
+    - mvm (3 МП + XML): WB + Ozon + Яндекс + XML каталог
+
+Принцип Open/Closed: МВМ-логика добавлена через проверку schema_type,
+существующая логика стандартных схем не модифицирована.
 """
 
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+import logging
 from aiogram import types, F
 from aiogram.types import ReplyKeyboardRemove
 from aiogram.fsm.context import FSMContext
@@ -15,10 +23,13 @@ from bot.keyboards import (
     get_schema_edit_keyboard,
     get_cancel_keyboard,
     get_edit_column_keyboard,
+    get_edit_column_keyboard_mvm,
     get_back_to_edit_keyboard,
     get_schema_list_keyboard,
     get_edit_match_menu_keyboard,
-    get_filter_matches_keyboard
+    get_filter_matches_keyboard,
+    get_filter_matches_mvm_keyboard,
+    get_mvm_waiting_xml_keyboard,
 )
 
 from bot.storage import user_schemas, db
@@ -26,8 +37,326 @@ from bot.utils import download_file
 from bot.handlers.common import cmd_start
 from config.config import FILE_CONFIGS
 from utils.excel_reader import ExcelReader
+from utils.xml_reader import XmlReader
 from bot.security import AccessManager
 
+logger = logging.getLogger('schema_edit')
+
+
+# =====================================================================
+#  КОНСТАНТЫ: группы сопоставлений для стандартных и МВМ-схем
+# =====================================================================
+
+# Стандартная схема (3 МП)
+STANDARD_MATCH_GROUPS = [
+    ('matches_all_three', 'triple', '🎯 Тройные сопоставления',
+     ['column_1', 'column_2', 'column_3']),
+    ('matches_1_2', 'pair_1_2', '🔗 Парные (WB + Ozon)',
+     ['column_1', 'column_2']),
+    ('matches_1_3', 'pair_1_3', '🔗 Парные (WB + Яндекс)',
+     ['column_1', 'column_3']),
+    ('matches_2_3', 'pair_2_3', '🔗 Парные (Ozon + Яндекс)',
+     ['column_2', 'column_3']),
+]
+
+# МВМ-схема (3 МП + XML)
+MVM_MATCH_GROUPS = [
+    ('matches_all_four', 'quad', '🎯 Четверные (WB+Ozon+Яндекс+XML)',
+     ['column_1', 'column_2', 'column_3', 'column_4']),
+    ('matches_triple_1_2_3', 'triple_1_2_3', '🔷 Тройные (WB+Ozon+Яндекс)',
+     ['column_1', 'column_2', 'column_3']),
+    ('matches_triple_1_2_4', 'triple_1_2_4', '🔷 Тройные (WB+Ozon+XML)',
+     ['column_1', 'column_2', 'column_4']),
+    ('matches_triple_1_3_4', 'triple_1_3_4', '🔷 Тройные (WB+Яндекс+XML)',
+     ['column_1', 'column_3', 'column_4']),
+    ('matches_triple_2_3_4', 'triple_2_3_4', '🔷 Тройные (Ozon+Яндекс+XML)',
+     ['column_2', 'column_3', 'column_4']),
+    ('matches_pair_1_2', 'pair_1_2', '🔗 Парные (WB+Ozon)',
+     ['column_1', 'column_2']),
+    ('matches_pair_1_3', 'pair_1_3', '🔗 Парные (WB+Яндекс)',
+     ['column_1', 'column_3']),
+    ('matches_pair_1_4', 'pair_1_4', '🔗 Парные (WB+XML)',
+     ['column_1', 'column_4']),
+    ('matches_pair_2_3', 'pair_2_3', '🔗 Парные (Ozon+Яндекс)',
+     ['column_2', 'column_3']),
+    ('matches_pair_2_4', 'pair_2_4', '🔗 Парные (Ozon+XML)',
+     ['column_2', 'column_4']),
+    ('matches_pair_3_4', 'pair_3_4', '🔗 Парные (Яндекс+XML)',
+     ['column_3', 'column_4']),
+]
+
+# Маппинг column_key → отображаемое имя маркетплейса
+COLUMN_DISPLAY_NAMES = {
+    'column_1': 'WB',
+    'column_2': 'Ozon',
+    'column_3': 'Яндекс',
+    'column_4': 'XML',
+}
+
+ALL_COLUMN_KEYS = ['column_1', 'column_2', 'column_3', 'column_4']
+
+
+# =====================================================================
+#  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# =====================================================================
+
+def _get_match_groups(schema_type: str) -> list:
+    """Возвращает список групп сопоставлений для данного типа схемы."""
+    if schema_type == 'mvm':
+        return MVM_MATCH_GROUPS
+    return STANDARD_MATCH_GROUPS
+
+
+def _build_all_matches_list(matches_data: dict, schema_type: str) -> list:
+    """
+    Собирает единый список сопоставлений из всех групп.
+
+    Каждый элемент: {'type': внутренний_тип, 'data': словарь_сопоставления}
+    Порядок соответствует порядку групп в STANDARD/MVM_MATCH_GROUPS.
+    """
+    groups = _get_match_groups(schema_type)
+    all_matches = []
+    for group_key, match_type, _, _ in groups:
+        for match in matches_data.get(group_key, []):
+            all_matches.append({'type': match_type, 'data': match})
+    return all_matches
+
+
+def _count_by_type(all_matches: list, match_type: str) -> int:
+    """Считает количество сопоставлений заданного типа."""
+    return sum(1 for m in all_matches if m['type'] == match_type)
+
+
+def _get_group_key(match_type: str, schema_type: str) -> str:
+    """Получить ключ БД (group_key) для внутреннего типа сопоставления."""
+    groups = _get_match_groups(schema_type)
+    for group_key, mt, _, _ in groups:
+        if mt == match_type:
+            return group_key
+    # Fallback для стандартных ключей (обратная совместимость)
+    fallback = {
+        'triple': 'matches_all_three',
+        'pair_1_2': 'matches_1_2',
+        'pair_1_3': 'matches_1_3',
+        'pair_2_3': 'matches_2_3',
+    }
+    return fallback.get(match_type, 'matches_all_three')
+
+
+def _format_type(match_type: str, schema_type: str) -> str:
+    """Форматировать внутренний тип для отображения пользователю."""
+    groups = _get_match_groups(schema_type)
+    for _, mt, display_name, _ in groups:
+        if mt == match_type:
+            return display_name
+    return 'Неизвестно'
+
+
+def _get_column_keys_for_type(match_type: str, schema_type: str) -> list:
+    """Возвращает список column_key, участвующих в данном типе сопоставления."""
+    groups = _get_match_groups(schema_type)
+    for _, mt, _, col_keys in groups:
+        if mt == match_type:
+            return col_keys
+    return ['column_1', 'column_2', 'column_3']
+
+
+def _determine_new_match_type(match_data: dict, schema_type: str) -> str | None:
+    """
+    Определяет новый тип сопоставления по заполненным столбцам.
+
+    Args:
+        match_data: словарь сопоставления с column_1..column_4
+        schema_type: 'standard' или 'mvm'
+
+    Returns:
+        Внутренний тип или None если меньше 2 столбцов заполнено
+    """
+    filled = set()
+    for ck in ALL_COLUMN_KEYS:
+        if match_data.get(ck):
+            filled.add(ck)
+
+    if schema_type == 'mvm':
+        return _determine_mvm_type(filled)
+    return _determine_standard_type(filled)
+
+
+def _determine_standard_type(filled: set) -> str | None:
+    """Определяет тип для стандартной схемы (3 МП)."""
+    c1 = 'column_1' in filled
+    c2 = 'column_2' in filled
+    c3 = 'column_3' in filled
+    count = sum([c1, c2, c3])
+
+    if count < 2:
+        return None
+    if count == 3:
+        return 'triple'
+    if c1 and c2:
+        return 'pair_1_2'
+    if c1 and c3:
+        return 'pair_1_3'
+    if c2 and c3:
+        return 'pair_2_3'
+    return None
+
+
+def _determine_mvm_type(filled: set) -> str | None:
+    """Определяет тип для МВМ-схемы (3 МП + XML)."""
+    c1 = 'column_1' in filled
+    c2 = 'column_2' in filled
+    c3 = 'column_3' in filled
+    c4 = 'column_4' in filled
+    count = sum([c1, c2, c3, c4])
+
+    if count < 2:
+        return None
+
+    # Четверное
+    if count == 4:
+        return 'quad'
+
+    # Тройные
+    if count == 3:
+        if c1 and c2 and c3:
+            return 'triple_1_2_3'
+        if c1 and c2 and c4:
+            return 'triple_1_2_4'
+        if c1 and c3 and c4:
+            return 'triple_1_3_4'
+        if c2 and c3 and c4:
+            return 'triple_2_3_4'
+
+    # Парные
+    if c1 and c2:
+        return 'pair_1_2'
+    if c1 and c3:
+        return 'pair_1_3'
+    if c1 and c4:
+        return 'pair_1_4'
+    if c2 and c3:
+        return 'pair_2_3'
+    if c2 and c4:
+        return 'pair_2_4'
+    if c3 and c4:
+        return 'pair_3_4'
+
+    return None
+
+
+def _format_match_line(match_data: dict, schema_type: str) -> str:
+    """Форматирует одну строку сопоставления для отображения."""
+    parts = []
+    keys = ALL_COLUMN_KEYS if schema_type == 'mvm' else ['column_1', 'column_2', 'column_3']
+    for ck in keys:
+        val = match_data.get(ck, '')
+        if not val:
+            val = 'N/A'
+        parts.append(val)
+    return ' | '.join(parts)
+
+
+def _format_match_detail(match_data: dict, match_type: str, schema_type: str) -> str:
+    """Форматирует детальное отображение сопоставления."""
+    labels = {
+        'column_1': '🔹 WB',
+        'column_2': '🔸 Ozon',
+        'column_3': '🔹 Яндекс',
+        'column_4': '📦 XML',
+    }
+
+    keys = ALL_COLUMN_KEYS if schema_type == 'mvm' else ['column_1', 'column_2', 'column_3']
+
+    # Определяем какие столбцы должны быть заполнены для этого типа
+    active_keys = set(_get_column_keys_for_type(match_type, schema_type))
+
+    lines = []
+    for ck in keys:
+        label = labels.get(ck, ck)
+        val = match_data.get(ck, '')
+        if not val and ck not in active_keys:
+            val = 'N/A'
+            label = f"❌ {COLUMN_DISPLAY_NAMES.get(ck, ck)}"
+        elif not val:
+            val = 'N/A'
+        lines.append(f"{label}: {val}")
+
+    confidence = match_data.get('confidence', 0)
+    lines.append(f"📈 Уверенность: {confidence:.0%}")
+
+    description = match_data.get('description', '')
+    if description:
+        lines.append(f"💬 {description}")
+
+    return '\n'.join(lines)
+
+
+def _get_stats_text(all_matches: list, schema_type: str) -> str:
+    """Формирует текст статистики по типам сопоставлений."""
+    groups = _get_match_groups(schema_type)
+    lines = []
+    for _, match_type, display_name, _ in groups:
+        count = _count_by_type(all_matches, match_type)
+        if count > 0:
+            lines.append(f"{display_name}: {count}")
+    return '\n'.join(lines)
+
+
+def _get_edit_keyboard(schema_type: str):
+    """Возвращает клавиатуру выбора столбца для редактирования."""
+    if schema_type == 'mvm':
+        return get_edit_column_keyboard_mvm()
+    return get_edit_column_keyboard()
+
+
+def _get_filter_keyboard(schema_type: str):
+    """Возвращает клавиатуру фильтрации."""
+    if schema_type == 'mvm':
+        return get_filter_matches_mvm_keyboard()
+    return get_filter_matches_keyboard()
+
+
+async def _send_long_text(message: types.Message, text: str, max_length: int = 3500):
+    """Отправляет длинный текст, разбивая на части по границам строк."""
+    if len(text) <= max_length:
+        await message.answer(text)
+        return
+
+    current_pos = 0
+    while current_pos < len(text):
+        end_pos = current_pos + max_length
+        if end_pos < len(text):
+            last_newline = text.rfind('\n', current_pos, end_pos)
+            if last_newline > current_pos:
+                end_pos = last_newline + 1
+        chunk = text[current_pos:end_pos]
+        await message.answer(chunk)
+        current_pos = end_pos
+
+
+def _find_index_in_group(all_matches: list, match_index: int, match_type: str) -> int:
+    """
+    Находит позиционный индекс сопоставления внутри его группы.
+
+    Args:
+        all_matches: полный список сопоставлений
+        match_index: глобальный индекс в all_matches
+        match_type: тип сопоставления
+
+    Returns:
+        Индекс внутри группы (0-based)
+    """
+    index_in_group = 0
+    for i in range(match_index):
+        if all_matches[i]['type'] == match_type:
+            index_in_group += 1
+    return index_in_group
+
+
+# =====================================================================
+#  ПРОСМОТР СОПОСТАВЛЕНИЙ
+# =====================================================================
 
 async def edit_schema_start(message: types.Message, state: FSMContext):
     """Меню редактирования схемы"""
@@ -38,66 +367,53 @@ async def edit_schema_start(message: types.Message, state: FSMContext):
     )
 
 
-# ===== ПРОСМОТР СОПОСТАВЛЕНИЙ =====
-
 async def view_matches_start(message: types.Message, state: FSMContext):
     """Выбор схемы для просмотра"""
     user_id = message.from_user.id
-    
-    # Проверяем права - админы/редакторы видят все схемы
+
     can_see_all = AccessManager.can_see_all_schemas(user_id)
     schemas = db.get_user_schemas(user_id, all_schemas=can_see_all)
-    
+
     if not schemas:
         await message.answer("❌ У тебя нет схем!")
         return
-    
+
     keyboard = get_schema_list_keyboard(schemas)
     if not keyboard:
         await message.answer("❌ У тебя нет валидных схем!")
         return
-    
+
     await state.set_state(SchemaStates.selecting_schema_to_view)
     await message.answer("Выбери схему для просмотра:", reply_markup=keyboard)
 
 
 async def show_schema_matches(message: types.Message, state: FSMContext):
-    """Отображение сопоставлений выбранной схемы"""
+    """Отображение сопоставлений выбранной схемы (стандартная + МВМ)"""
     if message.text == "❌ Отмена":
         await edit_schema_start(message, state)
         return
-    
+
     user_id = message.from_user.id
     schema_name = message.text
-    
-    # Проверяем права
+
     can_see_all = AccessManager.can_see_all_schemas(user_id)
     if can_see_all:
-        # Админы/редакторы - глобальный поиск
         schema = db.get_schema_by_name_global(schema_name)
     else:
-        # Обычные пользователи - только свои
         schema = db.get_schema(user_id, schema_name)
-    
+
     if not schema:
         await message.answer("❌ Схема не найдена")
         return
-    
+
     schema_id = schema['id']
     schema_name = schema['name']
-    
-    # Получаем сопоставления
+    schema_type = db.get_schema_type(schema_id)
+
     matches_data = db.get_schema_matches(schema_id)
-    
-    # Извлекаем все типы сопоставлений
-    matches_all_three = matches_data.get('matches_all_three', [])
-    matches_1_2 = matches_data.get('matches_1_2', [])  # WB + Ozon
-    matches_1_3 = matches_data.get('matches_1_3', [])  # WB + Яндекс
-    matches_2_3 = matches_data.get('matches_2_3', [])  # Ozon + Яндекс
-    
-    # Проверяем, есть ли хоть какие-то сопоставления
-    total_matches = len(matches_all_three) + len(matches_1_2) + len(matches_1_3) + len(matches_2_3)
-    
+    all_matches = _build_all_matches_list(matches_data, schema_type)
+    total_matches = len(all_matches)
+
     if total_matches == 0:
         await state.clear()
         await message.answer(
@@ -106,141 +422,59 @@ async def show_schema_matches(message: types.Message, state: FSMContext):
             reply_markup=get_back_to_edit_keyboard()
         )
         return
-    
-    # Формируем красивый вывод
+
+    # Формируем вывод
     text_parts = []
-    
-    # Заголовок
-    text_parts.append(f"📋 Схема: {schema_name}\n")
+    type_label = "МВМ " if schema_type == 'mvm' else ""
+    text_parts.append(f"📋 {type_label}Схема: {schema_name}\n")
     text_parts.append(f"📊 Всего сопоставлений: {total_matches}\n\n")
     text_parts.append("─" * 40 + "\n\n")
-    
-    # ===== ТРОЙНЫЕ СОПОСТАВЛЕНИЯ =====
-    if matches_all_three:
-        text_parts.append(f"🎯 Тройные сопоставления: {len(matches_all_three)}\n\n")
-        
-        for i, match in enumerate(matches_all_three, 1):
-            wb_col = match.get('column_1', '—')
-            ozon_col = match.get('column_2', '—')
-            yandex_col = match.get('column_3', '—')
-            confidence = match.get('confidence', 0)
-            description = match.get('description', '')
-            
-            text_parts.append(f"#{i}\n")
-            text_parts.append(f"🔹 WB: {wb_col}\n")
-            text_parts.append(f"🔸 Ozon: {ozon_col}\n")
-            text_parts.append(f"🔹 Яндекс: {yandex_col}\n")
-            text_parts.append(f"📈 Уверенность: {confidence:.0%}\n")
-            if description:
-                text_parts.append(f"💬 {description}\n")
-            text_parts.append("\n")
-    
-    # ===== ПАРНЫЕ СОПОСТАВЛЕНИЯ: WB + OZON =====
-    if matches_1_2:
+
+    groups = _get_match_groups(schema_type)
+
+    for group_key, match_type, display_name, col_keys in groups:
+        group_matches = [m for m in all_matches if m['type'] == match_type]
+        if not group_matches:
+            continue
+
+        text_parts.append(f"{display_name}: {len(group_matches)}\n\n")
+
+        for match_obj in group_matches:
+            global_idx = all_matches.index(match_obj) + 1
+            match = match_obj['data']
+            text_parts.append(f"#{global_idx}\n")
+            text_parts.append(_format_match_detail(match, match_type, schema_type))
+            text_parts.append("\n\n")
+
         text_parts.append("─" * 40 + "\n\n")
-        text_parts.append(f"🔗 Парные сопоставления (WB + Ozon): {len(matches_1_2)}\n\n")
-        
-        for i, match in enumerate(matches_1_2, 1):
-            wb_col = match.get('column_1', '—')
-            ozon_col = match.get('column_2', '—')
-            confidence = match.get('confidence', 0)
-            description = match.get('description', '')
-            
-            text_parts.append(f"#{i}\n")
-            text_parts.append(f"🔹 WB: {wb_col}\n")
-            text_parts.append(f"🔸 Ozon: {ozon_col}\n")
-            text_parts.append(f"❌ Яндекс: N/A\n")
-            text_parts.append(f"📈 Уверенность: {confidence:.0%}\n")
-            if description:
-                text_parts.append(f"💬 {description}\n")
-            text_parts.append("\n")
-    
-    # ===== ПАРНЫЕ СОПОСТАВЛЕНИЯ: WB + ЯНДЕКС =====
-    if matches_1_3:
-        text_parts.append("─" * 40 + "\n\n")
-        text_parts.append(f"🔗 Парные сопоставления (WB + Яндекс): {len(matches_1_3)}\n\n")
-        
-        for i, match in enumerate(matches_1_3, 1):
-            wb_col = match.get('column_1', '—')
-            yandex_col = match.get('column_3', '—')
-            confidence = match.get('confidence', 0)
-            description = match.get('description', '')
-            
-            text_parts.append(f"#{i}\n")
-            text_parts.append(f"🔹 WB: {wb_col}\n")
-            text_parts.append(f"❌ Ozon: N/A\n")
-            text_parts.append(f"🔹 Яндекс: {yandex_col}\n")
-            text_parts.append(f"📈 Уверенность: {confidence:.0%}\n")
-            if description:
-                text_parts.append(f"💬 {description}\n")
-            text_parts.append("\n")
-    
-    # ===== ПАРНЫЕ СОПОСТАВЛЕНИЯ: OZON + ЯНДЕКС =====
-    if matches_2_3:
-        text_parts.append("─" * 40 + "\n\n")
-        text_parts.append(f"🔗 Парные сопоставления (Ozon + Яндекс): {len(matches_2_3)}\n\n")
-        
-        for i, match in enumerate(matches_2_3, 1):
-            ozon_col = match.get('column_2', '—')
-            yandex_col = match.get('column_3', '—')
-            confidence = match.get('confidence', 0)
-            description = match.get('description', '')
-            
-            text_parts.append(f"#{i}\n")
-            text_parts.append(f"❌ WB: N/A\n")
-            text_parts.append(f"🔸 Ozon: {ozon_col}\n")
-            text_parts.append(f"🔹 Яндекс: {yandex_col}\n")
-            text_parts.append(f"📈 Уверенность: {confidence:.0%}\n")
-            if description:
-                text_parts.append(f"💬 {description}\n")
-            text_parts.append("\n")
-    
-    # Объединяем весь текст
+
     full_text = ''.join(text_parts)
-    
-    # Разбиваем на части если слишком длинное (лимит Telegram 4096 символов)
-    max_length = 3500
-    if len(full_text) <= max_length:
-        await message.answer(full_text)
-    else:
-        # Разбиваем на части
-        current_pos = 0
-        while current_pos < len(full_text):
-            # Ищем последний перенос строки перед лимитом
-            end_pos = current_pos + max_length
-            if end_pos < len(full_text):
-                # Ищем последний \n перед лимитом
-                last_newline = full_text.rfind('\n', current_pos, end_pos)
-                if last_newline > current_pos:
-                    end_pos = last_newline + 1
-            
-            chunk = full_text[current_pos:end_pos]
-            await message.answer(chunk)
-            current_pos = end_pos
-    
+    await _send_long_text(message, full_text)
+
     await state.clear()
     await message.answer("✅ Просмотр завершен", reply_markup=get_back_to_edit_keyboard())
 
 
-# ===== ИЗМЕНЕНИЕ СОПОСТАВЛЕНИЙ =====
+# =====================================================================
+#  ВЫБОР СХЕМЫ ДЛЯ РЕДАКТИРОВАНИЯ + ЗАГРУЗКА ФАЙЛОВ
+# =====================================================================
 
 async def edit_match_start(message: types.Message, state: FSMContext):
     """Выбор схемы для редактирования"""
     user_id = message.from_user.id
-    
-    # Проверяем права - админы/редакторы видят все схемы
+
     can_see_all = AccessManager.can_see_all_schemas(user_id)
     schemas = db.get_user_schemas(user_id, all_schemas=can_see_all)
-    
+
     if not schemas:
         await message.answer("❌ У тебя нет схем!")
         return
-    
+
     keyboard = get_schema_list_keyboard(schemas)
     if not keyboard:
         await message.answer("❌ У тебя нет валидных схем!")
         return
-    
+
     await state.set_state(SchemaStates.selecting_schema_to_edit)
     await message.answer("Выбери схему для редактирования:", reply_markup=keyboard)
 
@@ -250,38 +484,28 @@ async def schema_selected_for_edit(message: types.Message, state: FSMContext):
     if message.text == "❌ Отмена":
         await edit_schema_start(message, state)
         return
-    
+
     user_id = message.from_user.id
     schema_name = message.text
-    
-    # Проверяем права
+
     can_see_all = AccessManager.can_see_all_schemas(user_id)
     if can_see_all:
-        # Админы/редакторы - глобальный поиск
         schema = db.get_schema_by_name_global(schema_name)
     else:
-        # Обычные пользователи - только свои
         schema = db.get_schema(user_id, schema_name)
-    
+
     if not schema:
         await message.answer("❌ Схема не найдена")
         return
-    
+
     schema_id = schema['id']
     schema_name = schema['name']
-    
-    # Получаем ВСЕ сопоставления (тройные + парные)
+    schema_type = db.get_schema_type(schema_id)
+
     matches_data = db.get_schema_matches(schema_id)
-    
-    # Извлекаем все типы
-    matches_all_three = matches_data.get('matches_all_three', [])
-    matches_1_2 = matches_data.get('matches_1_2', [])  # WB + Ozon
-    matches_1_3 = matches_data.get('matches_1_3', [])  # WB + Яндекс
-    matches_2_3 = matches_data.get('matches_2_3', [])  # Ozon + Яндекс
-    
-    # Подсчитываем общее количество
-    total_matches = len(matches_all_three) + len(matches_1_2) + len(matches_1_3) + len(matches_2_3)
-    
+    all_matches = _build_all_matches_list(matches_data, schema_type)
+    total_matches = len(all_matches)
+
     if total_matches == 0:
         await state.clear()
         await message.answer(
@@ -290,131 +514,204 @@ async def schema_selected_for_edit(message: types.Message, state: FSMContext):
         )
         await edit_schema_start(message, state)
         return
-    
-    # Создаем единый список с метками типа для удобной работы
-    # Формат: {'type': 'triple'/'pair_1_2'/'pair_1_3'/'pair_2_3', 'data': {...}}
-    all_matches = []
-    
-    for match in matches_all_three:
-        all_matches.append({'type': 'triple', 'data': match})
-    
-    for match in matches_1_2:
-        all_matches.append({'type': 'pair_1_2', 'data': match})
-    
-    for match in matches_1_3:
-        all_matches.append({'type': 'pair_1_3', 'data': match})
-    
-    for match in matches_2_3:
-        all_matches.append({'type': 'pair_2_3', 'data': match})
-    
+
     # Сохраняем в state
     await state.update_data(
         edit_schema_id=schema_id,
         edit_schema_name=schema_name,
-        edit_all_matches=all_matches,  # Единый список с типами
-        edit_matches_data=matches_data  # Оригинальные данные для сохранения
+        edit_schema_type=schema_type,
+        edit_all_matches=all_matches,
+        edit_matches_data=matches_data,
     )
-    
-    # Запрашиваем загрузку файлов для валидации
+
     user_schemas[user_id] = {}
     await state.update_data(files_processed=False)
-    
+
+    # Формируем текст статистики
+    stats_text = _get_stats_text(all_matches, schema_type)
+    type_label = "МВМ " if schema_type == 'mvm' else ""
+
+    files_hint = (
+        "📤 Загрузи 3 файла Excel (wb, ozon, yandex)"
+        if schema_type == 'standard'
+        else "📤 Загрузи 3 файла Excel (wb, ozon, yandex)\nЗатем — XML файл каталога"
+    )
+
     await message.answer(
-        f"📋 Схема '{schema_name}' выбрана\n\n"
+        f"📋 {type_label}Схема '{schema_name}' выбрана\n\n"
         f"📊 Всего сопоставлений: {total_matches}\n"
-        f"  • Тройные: {len(matches_all_three)}\n"
-        f"  • Парные (WB+Ozon): {len(matches_1_2)}\n"
-        f"  • Парные (WB+Яндекс): {len(matches_1_3)}\n"
-        f"  • Парные (Ozon+Яндекс): {len(matches_2_3)}\n\n"
-        "📤 Для валидации столбцов загрузи 3 актуальных файла Excel\n"
-        "(wb, ozon, yandex)",
+        f"{stats_text}\n\n"
+        f"{files_hint}",
         reply_markup=ReplyKeyboardRemove()
     )
     await state.set_state(SchemaStates.waiting_edit_files)
 
 
 async def handle_edit_validation_file(message: types.Message, state: FSMContext, bot):
-    """Загрузка файлов для валидации при редактировании"""
+    """Загрузка файлов МП для валидации при редактировании"""
     user_id = message.from_user.id
-    
+
     if user_id not in user_schemas:
         user_schemas[user_id] = {}
-    
-    # НОВОЕ: Проверяем, не обработали ли мы уже все файлы
+
     data = await state.get_data()
     if data.get('files_processed'):
-        return  # Уже обработали, игнорируем дубликаты
-    
+        return
+
     file_path, file_name, marketplace = await download_file(bot, message, user_id)
-    
+
     if not marketplace:
         await message.answer("❌ Переименуй файл (добавь wb/ozon/yandex)")
         return
-    
+
     if marketplace in user_schemas[user_id]:
         await message.answer(f"⚠️ {marketplace.upper()} уже загружен")
         return
-    
+
     user_schemas[user_id][marketplace] = file_path
     await message.answer(f"✅ {marketplace.upper()} ({len(user_schemas[user_id])}/3)")
-    
-    # ВАЖНО: Проверяем ровно == 3 и ЕЩЁ РАЗ проверяем флаг
+
     if len(user_schemas[user_id]) == 3:
-        # КРИТИЧНО: Сразу устанавливаем флаг ДО любой обработки
         data = await state.get_data()
         if data.get('files_processed'):
-            return  # Другой обработчик уже начал обработку
-        
+            return
+
         await state.update_data(files_processed=True)
-        
-        # Читаем столбцы из файлов
+
+        # Читаем столбцы из МП-файлов
         try:
             reader = ExcelReader()
             available_columns = {}
-            
-            for marketplace, file_path in user_schemas[user_id].items():
-                config = FILE_CONFIGS[marketplace]
-                available_columns[marketplace] = reader.get_column_names(
-                    file_path,
-                    config['sheet_name'],
-                    config['header_row']
+
+            for mp, fp in user_schemas[user_id].items():
+                config = FILE_CONFIGS[mp]
+                available_columns[mp] = reader.get_column_names(
+                    fp, config['sheet_name'], config['header_row']
                 )
-            
-            # Сохраняем доступные столбцы
+
             await state.update_data(available_columns=available_columns)
-            
-            # Показываем список сопоставлений
-            data = await state.get_data()  # Перечитываем data
-            all_matches = data.get('edit_all_matches', [])
-            schema_name = data.get('edit_schema_name')
-            
-            # Показываем статистику и меню фильтра
-            triple_count = len([m for m in all_matches if m['type'] == 'triple'])
-            pair_1_2_count = len([m for m in all_matches if m['type'] == 'pair_1_2'])
-            pair_1_3_count = len([m for m in all_matches if m['type'] == 'pair_1_3'])
-            pair_2_3_count = len([m for m in all_matches if m['type'] == 'pair_2_3'])
-            
-            text = f"✅ Файлы загружены!\n\n"
-            text += f"📋 Схема: {schema_name}\n"
-            text += f"📊 Всего сопоставлений: {len(all_matches)}\n\n"
-            text += f"🎯 Тройные: {triple_count}\n"
-            text += f"🔗 Парные (WB+Ozon): {pair_1_2_count}\n"
-            text += f"🔗 Парные (WB+Яндекс): {pair_1_3_count}\n"
-            text += f"🔗 Парные (Ozon+Яндекс): {pair_2_3_count}\n\n"
-            text += "Выбери тип для просмотра или начни редактирование:"
-            
-            await state.set_state(SchemaStates.choosing_edit_action)
-            await message.answer(text, reply_markup=get_filter_matches_keyboard())
-            
+
+            schema_type = data.get('edit_schema_type', 'standard')
+
+            if schema_type == 'mvm':
+                # Для МВМ — запрашиваем ещё XML файл
+                await state.set_state(SchemaStates.waiting_edit_xml_file)
+                await message.answer(
+                    "✅ 3 файла МП загружены!\n\n"
+                    "📎 Теперь отправь XML файл каталога:",
+                    reply_markup=get_mvm_waiting_xml_keyboard()
+                )
+            else:
+                # Стандартная схема — сразу показываем меню
+                await _show_edit_menu(message, state)
+
         except Exception as e:
             await message.answer(f"❌ Ошибка чтения файлов: {str(e)}")
             await edit_schema_start(message, state)
 
 
+async def handle_edit_xml_file(message: types.Message, state: FSMContext, bot):
+    """Загрузка XML файла при редактировании МВМ-схемы"""
+    if not message.document:
+        if message.text == "❌ Отмена":
+            user_id = message.from_user.id
+            if user_id in user_schemas:
+                user_schemas[user_id] = {}
+            await state.clear()
+            await edit_schema_start(message, state)
+            return
+        await message.answer("📎 Отправь XML файл как документ или нажми ❌ Отмена")
+        return
+
+    user_id = message.from_user.id
+    file_name = message.document.file_name or ""
+
+    if not file_name.lower().endswith('.xml'):
+        await message.answer("❌ Нужен файл с расширением .xml")
+        return
+
+    # Скачиваем XML
+    file = await bot.get_file(message.document.file_id)
+    downloads_dir = Path("downloads") / str(user_id)
+    downloads_dir.mkdir(parents=True, exist_ok=True)
+    xml_path = str(downloads_dir / file_name)
+    await bot.download_file(file.file_path, xml_path)
+
+    # Валидируем XML
+    try:
+        xml_reader = XmlReader()
+        offer_count = xml_reader.get_offer_count(xml_path)
+        if offer_count == 0:
+            await message.answer(
+                "❌ XML файл не содержит офферов (<offer>).\n"
+                "Проверь файл и отправь заново:"
+            )
+            return
+
+        xml_fields = xml_reader.get_field_names(xml_path)
+    except ValueError as e:
+        await message.answer(f"❌ Ошибка чтения XML: {e}")
+        return
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+        logger.error(f"Ошибка чтения XML при редактировании: {e}", exc_info=True)
+        return
+
+    # Сохраняем XML-поля в available_columns
+    data = await state.get_data()
+    available_columns = data.get('available_columns', {})
+    available_columns['xml'] = xml_fields
+    await state.update_data(
+        available_columns=available_columns,
+        edit_xml_file_path=xml_path
+    )
+
+    await message.answer(
+        f"✅ XML файл загружен!\n"
+        f"📦 Офферов: {offer_count}, полей: {len(xml_fields)}"
+    )
+
+    await _show_edit_menu(message, state)
+
+
+async def handle_edit_xml_text(message: types.Message, state: FSMContext):
+    """Обработка текста в состоянии ожидания XML при редактировании"""
+    if message.text == "❌ Отмена":
+        user_id = message.from_user.id
+        if user_id in user_schemas:
+            user_schemas[user_id] = {}
+        await state.clear()
+        await edit_schema_start(message, state)
+    else:
+        await message.answer("📎 Отправь XML файл как документ или нажми ❌ Отмена")
+
+
+async def _show_edit_menu(message: types.Message, state: FSMContext):
+    """Показывает меню фильтрации/редактирования после загрузки всех файлов."""
+    data = await state.get_data()
+    all_matches = data.get('edit_all_matches', [])
+    schema_name = data.get('edit_schema_name')
+    schema_type = data.get('edit_schema_type', 'standard')
+
+    stats_text = _get_stats_text(all_matches, schema_type)
+
+    text = f"✅ Файлы загружены!\n\n"
+    text += f"📋 Схема: {schema_name}\n"
+    text += f"📊 Всего сопоставлений: {len(all_matches)}\n\n"
+    text += f"{stats_text}\n\n"
+    text += "Выбери тип для просмотра или начни редактирование:"
+
+    await state.set_state(SchemaStates.choosing_edit_action)
+    await message.answer(text, reply_markup=_get_filter_keyboard(schema_type))
+
+
+# =====================================================================
+#  ФИЛЬТРАЦИЯ И ВЫБОР ДЕЙСТВИЯ
+# =====================================================================
+
 async def edit_action_selected(message: types.Message, state: FSMContext):
     """Обработка действия после загрузки файлов (фильтры / редактирование / добавление)"""
     if message.text == "❌ Отмена":
-        # Очистка временных загруженных файлов для пользователя
         user_id = message.from_user.id
         if user_id in user_schemas:
             user_schemas[user_id] = {}
@@ -424,27 +721,28 @@ async def edit_action_selected(message: types.Message, state: FSMContext):
     data = await state.get_data()
     all_matches = data.get('edit_all_matches', [])
     schema_name = data.get('edit_schema_name')
+    schema_type = data.get('edit_schema_type', 'standard')
 
-    # --- НОВОЕ: добавление сопоставления ---
+    # --- Добавление ---
     if message.text == "➕ Добавить сопоставление":
         available_columns = data.get('available_columns')
         if not available_columns:
-            # Это защита от некорректного состояния (если кнопку нажали без загрузки файлов)
             await message.answer(
-                "⚠️ Чтобы добавить сопоставление, сначала загрузи 3 файла для валидации (wb/ozon/yandex).",
-                reply_markup=get_filter_matches_keyboard()
+                "⚠️ Сначала загрузи файлы для валидации.",
+                reply_markup=_get_filter_keyboard(schema_type)
             )
             return
-
         await add_new_match_start(message, state)
         return
 
-    # --- Редактирование существующего ---
+    # --- Редактирование ---
     if message.text == "✏️ Редактировать сопоставление":
         if not all_matches:
-            await message.answer("⚠️ Нет сопоставлений для редактирования.", reply_markup=get_filter_matches_keyboard())
+            await message.answer(
+                "⚠️ Нет сопоставлений для редактирования.",
+                reply_markup=_get_filter_keyboard(schema_type)
+            )
             return
-
         await state.set_state(SchemaStates.entering_match_number)
         await message.answer(
             f"Введи номер сопоставления для редактирования (1-{len(all_matches)}):",
@@ -452,7 +750,7 @@ async def edit_action_selected(message: types.Message, state: FSMContext):
         )
         return
 
-    # --- Фильтры отображения ---
+    # --- Фильтры (только для стандартных схем, МВМ показывает всё) ---
     filter_type = None
     filter_name = None
 
@@ -472,143 +770,95 @@ async def edit_action_selected(message: types.Message, state: FSMContext):
         filter_type = None
         filter_name = "📋 Все сопоставления"
     else:
-        await message.answer("Выбери действие из меню.", reply_markup=get_filter_matches_keyboard())
-        return
-
-    # --- Фильтруем сопоставления ---
-    if filter_type:
-        filtered_matches = [m for m in all_matches if m.get('type') == filter_type]
-    else:
-        filtered_matches = all_matches
-
-    if not filtered_matches:
-        await message.answer(f"⚠️ {filter_name}: нет сопоставлений", reply_markup=get_filter_matches_keyboard())
+        await message.answer(
+            "Выбери действие из меню.",
+            reply_markup=_get_filter_keyboard(schema_type)
+        )
         return
 
     # --- Формируем список ---
     text = f"📋 Схема: {schema_name}\n"
     text += f"{filter_name}\n"
-    text += f"📊 Показано: {len(filtered_matches)}\n\n"
+
+    if filter_type:
+        shown_count = _count_by_type(all_matches, filter_type)
+    else:
+        shown_count = len(all_matches)
+    text += f"📊 Показано: {shown_count}\n\n"
+
+    # Заголовок колонок
+    if schema_type == 'mvm':
+        text += "WB | Ozon | Яндекс | XML\n"
+    else:
+        text += "WB | Ozon | Яндекс\n"
+    text += "─" * 40 + "\n"
 
     for i, match_obj in enumerate(all_matches):
-        # Важно: нумерация должна оставаться по исходному all_matches (для редактирования по номеру)
-        if filter_type and match_obj.get('type') != filter_type:
+        if filter_type and match_obj['type'] != filter_type:
             continue
+        match = match_obj['data']
+        line = _format_match_line(match, schema_type)
+        text += f"#{i + 1}: {line}\n"
 
-        match = match_obj.get('data', {})
-        match_type = match_obj.get('type')
+    await _send_long_text(message, text)
 
-        wb = match.get('column_1', '—')
-        ozon = match.get('column_2', '—')
-        yandex = match.get('column_3', '—')
-
-        # Для парных показываем N/A
-        if match_type == 'pair_1_2':
-            yandex = 'N/A'
-        elif match_type == 'pair_1_3':
-            ozon = 'N/A'
-        elif match_type == 'pair_2_3':
-            wb = 'N/A'
-
-        text += f"#{i + 1}: {wb} | {ozon} | {yandex}\n"
-
-    # --- Разбиваем на части (лимит Telegram) ---
-    max_length = 3500
-    if len(text) <= max_length:
-        await message.answer(text)
-    else:
-        parts = []
-        current_part = ""
-        for line in text.split('\n'):
-            if len(current_part) + len(line) + 1 <= max_length:
-                current_part += line + '\n'
-            else:
-                parts.append(current_part)
-                current_part = line + '\n'
-        if current_part:
-            parts.append(current_part)
-
-        for part in parts:
-            await message.answer(part)
-
-    # --- Возвращаемся к меню фильтра ---
     await message.answer(
         "Выбери другой тип или начни редактирование:",
-        reply_markup=get_filter_matches_keyboard()
+        reply_markup=_get_filter_keyboard(schema_type)
     )
 
 
+# =====================================================================
+#  РЕДАКТИРОВАНИЕ СУЩЕСТВУЮЩЕГО СОПОСТАВЛЕНИЯ
+# =====================================================================
+
 async def match_number_entered(message: types.Message, state: FSMContext):
-    """Номер введен, показываем детали"""
+    """Номер введен, показываем детали сопоставления"""
     if message.text == "❌ Отмена":
-        await edit_schema_start(message, state)
+        data = await state.get_data()
+        schema_type = data.get('edit_schema_type', 'standard')
+        await state.set_state(SchemaStates.choosing_edit_action)
+        await message.answer(
+            "Выбери действие:",
+            reply_markup=_get_filter_keyboard(schema_type)
+        )
         return
-    
-    # Проверяем что это число
+
     try:
         match_number = int(message.text.strip())
     except ValueError:
         await message.answer("❌ Введи число!")
         return
-    
+
     data = await state.get_data()
     all_matches = data.get('edit_all_matches', [])
-    
+    schema_type = data.get('edit_schema_type', 'standard')
+
     if match_number < 1 or match_number > len(all_matches):
         await message.answer(f"❌ Номер должен быть от 1 до {len(all_matches)}")
         return
-    
-    # Получаем выбранное сопоставление (индекс с 0)
+
     selected_match_obj = all_matches[match_number - 1]
     match_type = selected_match_obj['type']
     match_data = selected_match_obj['data']
-    
-    # Сохраняем номер и тип
+
     await state.update_data(
         edit_match_index=match_number - 1,
         edit_match_type=match_type,
-        edit_match_data=match_data
+        edit_match_data=match_data,
     )
-    
-    # Показываем текущее сопоставление в зависимости от типа
-    wb_col = match_data.get('column_1', '—')
-    ozon_col = match_data.get('column_2', '—')
-    yandex_col = match_data.get('column_3', '—')
-    confidence = match_data.get('confidence', 0)
-    description = match_data.get('description', '')
-    
-    # Определяем какие столбцы отсутствуют (N/A)
-    if match_type == 'pair_1_2':  # WB + Ozon, нет Яндекса
-        yandex_col = 'N/A'
-    elif match_type == 'pair_1_3':  # WB + Яндекс, нет Ozon
-        ozon_col = 'N/A'
-    elif match_type == 'pair_2_3':  # Ozon + Яндекс, нет WB
-        wb_col = 'N/A'
-    # Для 'triple' все столбцы уже есть
-    
-    # Формируем красивый вывод
+
+    # Отображаем детали
+    type_display = _format_type(match_type, schema_type)
+    detail = _format_match_detail(match_data, match_type, schema_type)
+
     text = f"📋 Сопоставление #{match_number}\n"
-    
-    # Указываем тип
-    if match_type == 'triple':
-        text += "🎯 Тип: Тройное\n\n"
-    elif match_type == 'pair_1_2':
-        text += "🔗 Тип: Парное (WB + Ozon)\n\n"
-    elif match_type == 'pair_1_3':
-        text += "🔗 Тип: Парное (WB + Яндекс)\n\n"
-    elif match_type == 'pair_2_3':
-        text += "🔗 Тип: Парное (Ozon + Яндекс)\n\n"
-    
-    text += f"🔹 WB: {wb_col}\n"
-    text += f"🔸 Ozon: {ozon_col}\n"
-    text += f"🔹 Яндекс: {yandex_col}\n"
-    text += f"📈 Уверенность: {confidence:.0%}\n"
-    if description:
-        text += f"💬 {description}\n"
-    
+    text += f"{type_display}\n\n"
+    text += detail
+
     await message.answer(text)
     await state.set_state(SchemaStates.selecting_column_to_edit)
-    await message.answer("Что хочешь изменить?", reply_markup=get_edit_column_keyboard())
+    await message.answer("Что хочешь изменить?", reply_markup=_get_edit_keyboard(schema_type))
 
 
 async def column_selected_for_edit(message: types.Message, state: FSMContext):
@@ -616,262 +866,223 @@ async def column_selected_for_edit(message: types.Message, state: FSMContext):
     if message.text == "❌ Отмена":
         await edit_schema_start(message, state)
         return
-    
+
     if message.text == "🗑 Удалить сопоставление":
         await delete_match_confirm(message, state)
         return
-    
-    # Определяем какой столбец редактируем
-    if message.text == "📝 Изменить WB столбец":
-        marketplace = 'wildberries'
-        column_key = 'column_1'
-        display_name = 'WB'
-    elif message.text == "📝 Изменить Ozon столбец":
-        marketplace = 'ozon'
-        column_key = 'column_2'
-        display_name = 'Ozon'
-    elif message.text == "📝 Изменить Яндекс столбец":
-        marketplace = 'yandex'
-        column_key = 'column_3'
-        display_name = 'Яндекс'
-    else:
+
+    data = await state.get_data()
+    schema_type = data.get('edit_schema_type', 'standard')
+
+    # Определяем какой столбец
+    column_map = {
+        "📝 Изменить WB столбец": ('wildberries', 'column_1', 'WB'),
+        "📝 Изменить Ozon столбец": ('ozon', 'column_2', 'Ozon'),
+        "📝 Изменить Яндекс столбец": ('yandex', 'column_3', 'Яндекс'),
+        "📝 Изменить XML поле": ('xml', 'column_4', 'XML'),
+    }
+
+    if message.text not in column_map:
         await message.answer("❌ Неизвестная команда")
         return
-    
-    data = await state.get_data()
+
+    marketplace, column_key, display_name = column_map[message.text]
+
+    # Проверяем что XML доступен только для МВМ
+    if column_key == 'column_4' and schema_type != 'mvm':
+        await message.answer("❌ XML доступен только для МВМ-схем")
+        return
+
     available_columns = data.get('available_columns', {})
     columns_list = available_columns.get(marketplace, [])
-    
+
     if not columns_list:
-        await message.answer("❌ Не удалось загрузить список столбцов")
+        await message.answer(f"❌ Не удалось загрузить список столбцов {display_name}")
         return
-    
+
     await state.update_data(
         edit_marketplace=marketplace,
         edit_column_key=column_key,
-        edit_display_name=display_name
+        edit_display_name=display_name,
     )
-    
-    # Показываем список доступных столбцов
+
+    # Показываем список
     text = f"📋 Доступные столбцы {display_name} ({len(columns_list)}):\n\n"
     for i, col in enumerate(columns_list, 1):
         text += f"{i}. {col}\n"
-        # Разбиваем на части
         if i % 30 == 0:
             await message.answer(text)
             text = ""
-    
+
     if text:
         await message.answer(text)
-    
+
     await message.answer(
-        f"Введи название столбца из списка выше или номер (1-{len(columns_list)}):",
+        f"Введи название столбца из списка или номер (1-{len(columns_list)}):\n"
+        f"💡 Введи NA чтобы удалить столбец из сопоставления",
         reply_markup=get_cancel_keyboard()
     )
     await state.set_state(SchemaStates.selecting_new_column_value)
 
 
 async def new_column_value_entered(message: types.Message, state: FSMContext):
-    """Новое значение введено, валидируем и сохраняем"""
+    """Новое значение введено — валидация, обновление типа, сохранение."""
     if message.text == "❌ Отмена":
         await edit_schema_start(message, state)
         return
-    
+
     user_input = message.text.strip()
-    
     if not user_input:
         await message.answer("❌ Название столбца не может быть пустым!")
         return
-    
+
     data = await state.get_data()
     marketplace = data.get('edit_marketplace')
+    column_key = data.get('edit_column_key')
+    display_name = data.get('edit_display_name')
+    schema_type = data.get('edit_schema_type', 'standard')
     available_columns = data.get('available_columns', {})
     columns_list = available_columns.get(marketplace, [])
-    
-    # НОВОЕ: Проверяем ввод "NA" для удаления столбца
+
+    # Проверяем NA
     if user_input.upper() == 'NA':
-        # Пользователь хочет удалить столбец (тройное → парное)
-        new_value = None  # Устанавливаем пустое значение
-    else:
-        # Валидация обычного значения
         new_value = None
-        
-        # Проверяем, может это номер
-        try:
-            col_number = int(user_input)
-            if 1 <= col_number <= len(columns_list):
-                new_value = columns_list[col_number - 1]
-        except ValueError:
-            # Не номер, ищем по точному совпадению
-            if user_input in columns_list:
-                new_value = user_input
-            else:
-                # Ищем похожее (case-insensitive)
-                user_lower = user_input.lower()
-                for col in columns_list:
-                    if col.lower() == user_lower:
-                        new_value = col
-                        break
-        
-        if not new_value:
+    else:
+        new_value = _resolve_column_input(user_input, columns_list)
+        if new_value is None:
             await message.answer(
-                f"❌ Столбец '{user_input}' не найден в шаблоне {data.get('edit_display_name')}!\n\n"
+                f"❌ Столбец '{user_input}' не найден в шаблоне {display_name}!\n\n"
                 f"Введи точное название или номер из списка.\n"
-                f"💡 Чтобы удалить столбец (тройное → парное), введи: NA"
+                f"💡 Чтобы удалить столбец, введи: NA"
             )
             return
-    
-    # Получаем данные для обновления
+
+    # Получаем данные
     schema_id = data.get('edit_schema_id')
     schema_name = data.get('edit_schema_name')
     all_matches = data.get('edit_all_matches', [])
     match_index = data.get('edit_match_index')
     match_type = data.get('edit_match_type')
-    column_key = data.get('edit_column_key')
-    display_name = data.get('edit_display_name')
     matches_data = data.get('edit_matches_data', {})
-    
-    # Получаем текущее сопоставление из all_matches
+
     current_match_obj = all_matches[match_index]
     current_match = current_match_obj['data']
-    
-    # Сохраняем старое значение для отчета
-    old_value = current_match.get(column_key, 'N/A')
-    if not old_value or old_value == '':
-        old_value = 'N/A'
-    
-    # Обновляем значение (может быть None для удаления)
+
+    old_value = current_match.get(column_key, '') or 'N/A'
+    display_new_value = new_value if new_value else 'N/A'
+
+    # Обновляем значение
     if new_value is None:
-        current_match[column_key] = ''  # Очищаем столбец
-        display_new_value = 'N/A'  # Для отображения
+        current_match[column_key] = ''
     else:
         current_match[column_key] = new_value
-        display_new_value = new_value
-    
-    # КРИТИЧНО: Определяем новый тип сопоставления
-    wb_exists = bool(current_match.get('column_1'))
-    ozon_exists = bool(current_match.get('column_2'))
-    yandex_exists = bool(current_match.get('column_3'))
-    
+
     # Определяем новый тип
-    new_type = None
-    if wb_exists and ozon_exists and yandex_exists:
-        new_type = 'triple'
-    elif wb_exists and ozon_exists and not yandex_exists:
-        new_type = 'pair_1_2'
-    elif wb_exists and not ozon_exists and yandex_exists:
-        new_type = 'pair_1_3'
-    elif not wb_exists and ozon_exists and yandex_exists:
-        new_type = 'pair_2_3'
-    else:
-        # Некорректное состояние (меньше 2 столбцов)
-        await message.answer("❌ Сопоставление должно содержать минимум 2 маркетплейса!")
+    new_type = _determine_new_match_type(current_match, schema_type)
+
+    if new_type is None:
+        # Откатываем
+        if new_value is None:
+            current_match[column_key] = old_value if old_value != 'N/A' else ''
+        await message.answer("❌ Сопоставление должно содержать минимум 2 источника!")
         return
-    
-    # Если тип изменился - нужно переместить между группами
+
+    # Перемещаем между группами если тип изменился
+    type_change_text = ""
     if new_type != match_type:
+        old_group_key = _get_group_key(match_type, schema_type)
+        new_group_key = _get_group_key(new_type, schema_type)
+
         # Удаляем из старой группы
-        old_group_key = _get_group_key(match_type)
         old_group = matches_data.get(old_group_key, [])
-        
-        # Находим индекс в старой группе
-        index_in_old_group = 0
-        for i in range(match_index):
-            if all_matches[i]['type'] == match_type:
-                index_in_old_group += 1
-        
-        # Удаляем из старой группы
-        if old_group_key in matches_data and index_in_old_group < len(matches_data[old_group_key]):
-            matches_data[old_group_key].pop(index_in_old_group)
-        
-        # Добавляем в новую группу
-        new_group_key = _get_group_key(new_type)
+        idx_in_group = _find_index_in_group(all_matches, match_index, match_type)
+        if idx_in_group < len(old_group):
+            old_group.pop(idx_in_group)
+        matches_data[old_group_key] = old_group
+
+        # Добавляем в новую
         if new_group_key not in matches_data:
             matches_data[new_group_key] = []
         matches_data[new_group_key].append(current_match)
-        
-        # Обновляем тип в all_matches
+
         current_match_obj['type'] = new_type
-        
-        type_changed = True
-        type_change_text = f"\n🔄 Тип изменен: {_format_type(match_type)} → {_format_type(new_type)}"
+
+        old_display = _format_type(match_type, schema_type)
+        new_display = _format_type(new_type, schema_type)
+        type_change_text = f"\n🔄 Тип изменен: {old_display} → {new_display}"
     else:
-        # Тип не изменился, просто обновляем в той же группе
-        group_key = _get_group_key(match_type)
+        # Обновляем в той же группе
+        group_key = _get_group_key(match_type, schema_type)
         group = matches_data.get(group_key, [])
-        
-        # Находим индекс в группе
-        index_in_group = 0
-        for i in range(match_index):
-            if all_matches[i]['type'] == match_type:
-                index_in_group += 1
-        
-        # Обновляем в группе
-        if group_key in matches_data and index_in_group < len(matches_data[group_key]):
-            matches_data[group_key][index_in_group] = current_match
-        
-        type_changed = False
-        type_change_text = ""
-    
-    # Сохраняем в БД
+        idx_in_group = _find_index_in_group(all_matches, match_index, match_type)
+        if idx_in_group < len(group):
+            group[idx_in_group] = current_match
+        matches_data[group_key] = group
+
+    # Сохраняем
     db.save_schema_matches(schema_id, matches_data)
-    
-    # Очищаем временные файлы
+
     user_id = message.from_user.id
     if user_id in user_schemas:
         user_schemas[user_id] = {}
-    
+
     await state.clear()
-    
+
     text = f"✅ Сопоставление обновлено!\n\n"
     text += f"📋 Схема: {schema_name}\n"
     text += f"📝 Столбец {display_name}:\n"
     text += f"  Было: {old_value}\n"
     text += f"  Стало: {display_new_value}"
     text += type_change_text
-    
+
     await message.answer(text)
-    
-    # Возвращаемся к меню редактирования
     await edit_schema_start(message, state)
 
 
-# Вспомогательные функции для работы с типами
-def _get_group_key(match_type: str) -> str:
-    """Получить ключ группы для типа сопоставления"""
-    type_to_key = {
-        'triple': 'matches_all_three',
-        'pair_1_2': 'matches_1_2',
-        'pair_1_3': 'matches_1_3',
-        'pair_2_3': 'matches_2_3'
-    }
-    return type_to_key.get(match_type, 'matches_all_three')
+def _resolve_column_input(user_input: str, columns_list: list) -> str | None:
+    """
+    Ищет столбец по номеру или названию (с нечётким регистром).
+
+    Returns:
+        Точное название столбца или None
+    """
+    # По номеру
+    try:
+        col_number = int(user_input)
+        if 1 <= col_number <= len(columns_list):
+            return columns_list[col_number - 1]
+    except ValueError:
+        pass
+
+    # Точное совпадение
+    if user_input in columns_list:
+        return user_input
+
+    # Case-insensitive
+    user_lower = user_input.lower()
+    for col in columns_list:
+        if col.lower() == user_lower:
+            return col
+
+    return None
 
 
-def _format_type(match_type: str) -> str:
-    """Форматировать тип для отображения"""
-    type_names = {
-        'triple': 'Тройное',
-        'pair_1_2': 'Парное (WB+Ozon)',
-        'pair_1_3': 'Парное (WB+Яндекс)',
-        'pair_2_3': 'Парное (Ozon+Яндекс)'
-    }
-    return type_names.get(match_type, 'Неизвестно')
-
+# =====================================================================
+#  УДАЛЕНИЕ СОПОСТАВЛЕНИЯ
+# =====================================================================
 
 async def delete_match_confirm(message: types.Message, state: FSMContext):
-    """Удаление сопоставления (без затирания других групп)"""
+    """Удаление сопоставления"""
     data = await state.get_data()
 
     schema_id = data.get('edit_schema_id')
     schema_name = data.get('edit_schema_name')
     match_index = data.get('edit_match_index')
     match_type = data.get('edit_match_type')
+    schema_type = data.get('edit_schema_type', 'standard')
 
     if schema_id is None or match_index is None or not match_type:
-        await message.answer(
-            "❌ Не удалось определить, какое сопоставление удалять. Попробуй выбрать сопоставление заново."
-        )
+        await message.answer("❌ Не удалось определить сопоставление. Попробуй заново.")
         await edit_schema_start(message, state)
         return
 
@@ -883,134 +1094,104 @@ async def delete_match_confirm(message: types.Message, state: FSMContext):
         await edit_schema_start(message, state)
         return
 
-    # Забираем удаляемый объект для красивого отчёта
     match_obj = all_matches[match_index]
     deleted_match = match_obj.get('data', {})
 
-    # Удаляем из all_matches (единый список)
+    # Удаляем из all_matches
     all_matches.pop(match_index)
 
-    # Удаляем из соответствующей группы в matches_data
-    group_key = _get_group_key(match_type)
+    # Удаляем из группы
+    group_key = _get_group_key(match_type, schema_type)
     group_list = matches_data.get(group_key, [])
-
-    # Найдём индекс в группе: считаем, сколько таких же типов было ДО match_index
-    index_in_group = 0
-    for i in range(match_index):
-        if all_matches[i].get('type') == match_type:
-            index_in_group += 1
-
-    if 0 <= index_in_group < len(group_list):
-        group_list.pop(index_in_group)
-
+    idx_in_group = _find_index_in_group(all_matches, match_index, match_type)
+    if 0 <= idx_in_group < len(group_list):
+        group_list.pop(idx_in_group)
     matches_data[group_key] = group_list
-
-    # Важно: не потерять остальные группы
-    for key in ('matches_all_three', 'matches_1_2', 'matches_1_3', 'matches_2_3'):
-        matches_data.setdefault(key, [])
 
     db.save_schema_matches(schema_id, matches_data)
 
     await state.update_data(
         edit_matches_data=matches_data,
-        edit_all_matches=all_matches
+        edit_all_matches=all_matches,
     )
 
     await state.clear()
 
+    # Формируем отчёт
     text = "✅ Сопоставление удалено!\n\n"
     text += f"📋 Схема: {schema_name}\n"
     text += "🗑 Удалено:\n"
-    text += f"  WB: {deleted_match.get('column_1', '—')}\n"
-    text += f"  Ozon: {deleted_match.get('column_2', '—')}\n"
-    text += f"  Яндекс: {deleted_match.get('column_3', '—')}"
+
+    labels = {'column_1': 'WB', 'column_2': 'Ozon', 'column_3': 'Яндекс', 'column_4': 'XML'}
+    keys = ALL_COLUMN_KEYS if schema_type == 'mvm' else ['column_1', 'column_2', 'column_3']
+    for ck in keys:
+        val = deleted_match.get(ck, '—')
+        text += f"  {labels[ck]}: {val}\n"
 
     await message.answer(text)
     await edit_schema_start(message, state)
 
 
-# ===== ДОБАВЛЕНИЕ НОВОГО СОПОСТАВЛЕНИЯ =====
+# =====================================================================
+#  ДОБАВЛЕНИЕ НОВОГО СОПОСТАВЛЕНИЯ
+# =====================================================================
 
 async def add_new_match_start(message: types.Message, state: FSMContext):
-    """Начало добавления нового сопоставления"""
+    """Начало добавления — шаг 1: WB"""
     data = await state.get_data()
     available_columns = data.get('available_columns', {})
-    
+
     wb_columns = available_columns.get('wildberries', [])
     if not wb_columns:
         await message.answer("❌ Не удалось загрузить столбцы WB")
         return
-    
-    # Показываем список доступных столбцов WB
+
     text = f"📋 Доступные столбцы WB ({len(wb_columns)}):\n\n"
     for i, col in enumerate(wb_columns, 1):
         text += f"{i}. {col}\n"
         if i % 30 == 0:
             await message.answer(text)
             text = ""
-    
     if text:
         await message.answer(text)
-    
+
     await state.set_state(SchemaStates.selecting_wb_column)
     await message.answer(
-        f"Шаг 1/3: Выбери столбец WB\n\n"
+        f"Шаг 1: Выбери столбец WB\n\n"
         f"Введи название или номер (1-{len(wb_columns)})\n"
-        f"💡 Введи NA чтобы пропустить этот маркетплейс",
+        f"💡 Введи NA чтобы пропустить",
         reply_markup=get_cancel_keyboard()
     )
 
 
 async def wb_column_selected(message: types.Message, state: FSMContext):
-    """Столбец WB выбран (или NA для пропуска)"""
+    """Столбец WB выбран — шаг 2: Ozon"""
     if message.text == "❌ Отмена":
         await edit_schema_start(message, state)
         return
-    
+
     data = await state.get_data()
     available_columns = data.get('available_columns', {})
     wb_columns = available_columns.get('wildberries', [])
-    
+
     user_input = message.text.strip()
-    
-    # Проверка на NA (пропуск WB)
+
     if user_input.upper() == 'NA':
-        wb_value = None
         await state.update_data(new_match_wb=None)
         display_wb = "⏭ WB: пропущен (NA)"
     else:
-        # Валидация выбора
-        wb_value = None
-        
-        try:
-            col_number = int(user_input)
-            if 1 <= col_number <= len(wb_columns):
-                wb_value = wb_columns[col_number - 1]
-        except ValueError:
-            if user_input in wb_columns:
-                wb_value = user_input
-            else:
-                user_lower = user_input.lower()
-                for col in wb_columns:
-                    if col.lower() == user_lower:
-                        wb_value = col
-                        break
-        
+        wb_value = _resolve_column_input(user_input, wb_columns)
         if not wb_value:
             await message.answer(
-                f"❌ Столбец '{user_input}' не найден!\n\n"
-                f"Введи точное название или номер из списка.\n"
+                f"❌ Столбец '{user_input}' не найден!\n"
                 f"💡 Или введи NA чтобы пропустить WB"
             )
             return
-        
-        # Сохраняем выбор
         await state.update_data(new_match_wb=wb_value)
         display_wb = f"✅ WB: {wb_value}"
-    
+
     # Переходим к Ozon
     ozon_columns = available_columns.get('ozon', [])
-    
     text = f"{display_wb}\n\n"
     text += f"📋 Доступные столбцы Ozon ({len(ozon_columns)}):\n\n"
     for i, col in enumerate(ozon_columns, 1):
@@ -1018,97 +1199,66 @@ async def wb_column_selected(message: types.Message, state: FSMContext):
         if i % 30 == 0:
             await message.answer(text)
             text = ""
-    
     if text:
         await message.answer(text)
-    
+
     await state.set_state(SchemaStates.selecting_ozon_column)
     await message.answer(
-        f"Шаг 2/3: Выбери столбец Ozon\n\n"
+        f"Шаг 2: Выбери столбец Ozon\n\n"
         f"Введи название или номер (1-{len(ozon_columns)})\n"
-        f"💡 Введи NA чтобы пропустить этот маркетплейс",
+        f"💡 Введи NA чтобы пропустить",
         reply_markup=get_cancel_keyboard()
     )
 
 
 async def ozon_column_selected(message: types.Message, state: FSMContext):
-    """Столбец Ozon выбран (или NA для пропуска)"""
+    """Столбец Ozon выбран — шаг 3: Яндекс"""
     if message.text == "❌ Отмена":
         await edit_schema_start(message, state)
         return
-    
+
     data = await state.get_data()
     available_columns = data.get('available_columns', {})
     ozon_columns = available_columns.get('ozon', [])
-    wb_value = data.get('new_match_wb')  # Может быть None если пропущен
-    
+    wb_value = data.get('new_match_wb')
+
     user_input = message.text.strip()
-    
-    # Проверка на NA (пропуск Ozon)
+
     if user_input.upper() == 'NA':
-        ozon_value = None
         await state.update_data(new_match_ozon=None)
         display_ozon = "⏭ Ozon: пропущен (NA)"
     else:
-        # Валидация выбора
-        ozon_value = None
-        
-        try:
-            col_number = int(user_input)
-            if 1 <= col_number <= len(ozon_columns):
-                ozon_value = ozon_columns[col_number - 1]
-        except ValueError:
-            if user_input in ozon_columns:
-                ozon_value = user_input
-            else:
-                user_lower = user_input.lower()
-                for col in ozon_columns:
-                    if col.lower() == user_lower:
-                        ozon_value = col
-                        break
-        
+        ozon_value = _resolve_column_input(user_input, ozon_columns)
         if not ozon_value:
             await message.answer(
-                f"❌ Столбец '{user_input}' не найден!\n\n"
-                f"Введи точное название или номер из списка.\n"
+                f"❌ Столбец '{user_input}' не найден!\n"
                 f"💡 Или введи NA чтобы пропустить Ozon"
             )
             return
-        
-        # Сохраняем выбор
         await state.update_data(new_match_ozon=ozon_value)
         display_ozon = f"✅ Ozon: {ozon_value}"
-    
+
     # Переходим к Яндекс
     yandex_columns = available_columns.get('yandex', [])
-    
-    # Формируем отображение с учётом NA
     display_wb = f"✅ WB: {wb_value}" if wb_value else "⏭ WB: пропущен (NA)"
-    
-    text = f"{display_wb}\n"
-    text += f"{display_ozon}\n\n"
+
+    text = f"{display_wb}\n{display_ozon}\n\n"
     text += f"📋 Доступные столбцы Яндекс ({len(yandex_columns)}):\n\n"
     for i, col in enumerate(yandex_columns, 1):
         text += f"{i}. {col}\n"
         if i % 30 == 0:
             await message.answer(text)
             text = ""
-    
     if text:
         await message.answer(text)
-    
-    # Определяем нужна ли подсказка про NA
-    # Если уже 2 маркетплейса пропущены - Яндекс обязателен
+
+    ozon_value = data.get('new_match_ozon') if user_input.upper() != 'NA' else None
     skipped_count = (0 if wb_value else 1) + (0 if ozon_value else 1)
-    
-    if skipped_count >= 2:
-        hint = "⚠️ Яндекс обязателен (уже пропущено 2 маркетплейса)"
-    else:
-        hint = "💡 Введи NA чтобы пропустить этот маркетплейс"
-    
+    hint = "⚠️ Яндекс обязателен (уже пропущено 2)" if skipped_count >= 2 else "💡 Введи NA чтобы пропустить"
+
     await state.set_state(SchemaStates.selecting_yandex_column)
     await message.answer(
-        f"Шаг 3/3: Выбери столбец Яндекс\n\n"
+        f"Шаг 3: Выбери столбец Яндекс\n\n"
         f"Введи название или номер (1-{len(yandex_columns)})\n"
         f"{hint}",
         reply_markup=get_cancel_keyboard()
@@ -1116,7 +1266,7 @@ async def ozon_column_selected(message: types.Message, state: FSMContext):
 
 
 async def yandex_column_selected(message: types.Message, state: FSMContext):
-    """Столбец Яндекс выбран (или NA), сохраняем сопоставление в нужную группу"""
+    """Столбец Яндекс выбран — для МВМ переходим к XML, для стандарта — сохраняем."""
     if message.text == "❌ Отмена":
         await edit_schema_start(message, state)
         return
@@ -1124,241 +1274,249 @@ async def yandex_column_selected(message: types.Message, state: FSMContext):
     data = await state.get_data()
     available_columns = data.get('available_columns', {})
     yandex_columns = available_columns.get('yandex', [])
-    
-    # Получаем ранее выбранные значения (могут быть None если NA)
+    schema_type = data.get('edit_schema_type', 'standard')
+
     wb_value = data.get('new_match_wb')
     ozon_value = data.get('new_match_ozon')
-    
+
     user_input = message.text.strip()
 
-    # Проверка на NA (пропуск Яндекс)
     if user_input.upper() == 'NA':
         yandex_value = None
     else:
-        # Валидация выбора
-        yandex_value = None
-
-        try:
-            col_number = int(user_input)
-            if 1 <= col_number <= len(yandex_columns):
-                yandex_value = yandex_columns[col_number - 1]
-        except ValueError:
-            if user_input in yandex_columns:
-                yandex_value = user_input
-            else:
-                user_lower = user_input.lower()
-                for col in yandex_columns:
-                    if col.lower() == user_lower:
-                        yandex_value = col
-                        break
-
+        yandex_value = _resolve_column_input(user_input, yandex_columns)
         if not yandex_value:
-            # Проверяем, можно ли вообще ввести NA
             filled_count = (1 if wb_value else 0) + (1 if ozon_value else 0)
-            if filled_count >= 2:
-                hint = "\n💡 Или введи NA чтобы пропустить Яндекс"
-            else:
-                hint = "\n⚠️ Яндекс обязателен (нужно минимум 2 маркетплейса)"
-            
+            hint = "\n💡 Или введи NA" if filled_count >= 2 else "\n⚠️ Яндекс обязателен (нужно минимум 2)"
+            await message.answer(f"❌ Столбец '{user_input}' не найден!{hint}")
+            return
+
+    await state.update_data(new_match_yandex=yandex_value)
+
+    # Для МВМ — добавляем шаг XML
+    if schema_type == 'mvm':
+        xml_columns = available_columns.get('xml', [])
+        if xml_columns:
+            # Показываем список XML-полей
+            display_wb = f"✅ WB: {wb_value}" if wb_value else "⏭ WB: N/A"
+            display_ozon = f"✅ Ozon: {ozon_value}" if ozon_value else "⏭ Ozon: N/A"
+            display_yandex = f"✅ Яндекс: {yandex_value}" if yandex_value else "⏭ Яндекс: N/A"
+
+            text = f"{display_wb}\n{display_ozon}\n{display_yandex}\n\n"
+            text += f"📋 Доступные поля XML ({len(xml_columns)}):\n\n"
+            for i, col in enumerate(xml_columns, 1):
+                text += f"{i}. {col}\n"
+                if i % 30 == 0:
+                    await message.answer(text)
+                    text = ""
+            if text:
+                await message.answer(text)
+
+            filled_count = (1 if wb_value else 0) + (1 if ozon_value else 0) + (1 if yandex_value else 0)
+            hint = "💡 Введи NA чтобы пропустить" if filled_count >= 2 else "⚠️ XML обязателен (нужно минимум 2)"
+
+            await state.set_state(SchemaStates.selecting_xml_column)
             await message.answer(
-                f"❌ Столбец '{user_input}' не найден!\n\n"
-                f"Введи точное название или номер из списка.{hint}"
+                f"Шаг 4: Выбери XML поле\n\n"
+                f"Введи название или номер (1-{len(xml_columns)})\n"
+                f"{hint}",
+                reply_markup=get_cancel_keyboard()
             )
             return
 
-    # === ПРОВЕРКА: минимум 2 маркетплейса должны быть заполнены ===
-    filled_count = (1 if wb_value else 0) + (1 if ozon_value else 0) + (1 if yandex_value else 0)
-    
-    if filled_count < 2:
-        await message.answer(
-            "❌ Сопоставление должно содержать минимум 2 маркетплейса!\n\n"
-            f"Сейчас заполнено: {filled_count}\n"
-            "Попробуй начать добавление заново.",
-            reply_markup=get_filter_matches_keyboard()
-        )
-        await state.set_state(SchemaStates.choosing_edit_action)
+    # Стандартная схема или МВМ без XML-полей — сохраняем сразу
+    await _finalize_new_match(message, state, xml_value=None)
+
+
+async def xml_column_selected(message: types.Message, state: FSMContext):
+    """XML-поле выбрано (шаг 4 для МВМ) — сохраняем."""
+    if message.text == "❌ Отмена":
+        await edit_schema_start(message, state)
         return
 
-    # === ОПРЕДЕЛЯЕМ ТИП СОПОСТАВЛЕНИЯ ===
-    if wb_value and ozon_value and yandex_value:
-        match_type = 'triple'
-        group_key = 'matches_all_three'
-        type_display = "🎯 Тройное"
-    elif wb_value and ozon_value and not yandex_value:
-        match_type = 'pair_1_2'
-        group_key = 'matches_1_2'
-        type_display = "🔗 Парное (WB + Ozon)"
-    elif wb_value and not ozon_value and yandex_value:
-        match_type = 'pair_1_3'
-        group_key = 'matches_1_3'
-        type_display = "🔗 Парное (WB + Яндекс)"
-    elif not wb_value and ozon_value and yandex_value:
-        match_type = 'pair_2_3'
-        group_key = 'matches_2_3'
-        type_display = "🔗 Парное (Ozon + Яндекс)"
+    data = await state.get_data()
+    available_columns = data.get('available_columns', {})
+    xml_columns = available_columns.get('xml', [])
+
+    user_input = message.text.strip()
+
+    if user_input.upper() == 'NA':
+        xml_value = None
     else:
-        await message.answer(
-            "❌ Неизвестная комбинация маркетплейсов. Попробуй заново.",
-            reply_markup=get_filter_matches_keyboard()
-        )
-        await state.set_state(SchemaStates.choosing_edit_action)
+        xml_value = _resolve_column_input(user_input, xml_columns)
+        if not xml_value:
+            wb_value = data.get('new_match_wb')
+            ozon_value = data.get('new_match_ozon')
+            yandex_value = data.get('new_match_yandex')
+            filled = (1 if wb_value else 0) + (1 if ozon_value else 0) + (1 if yandex_value else 0)
+            hint = "\n💡 Или введи NA" if filled >= 2 else "\n⚠️ XML обязателен"
+            await message.answer(f"❌ Поле '{user_input}' не найдено!{hint}")
+            return
+
+    await _finalize_new_match(message, state, xml_value=xml_value)
+
+
+async def _finalize_new_match(
+    message: types.Message,
+    state: FSMContext,
+    xml_value: str | None
+):
+    """
+    Финализация добавления нового сопоставления.
+
+    Общая для стандартных и МВМ-схем. Определяет тип, проверяет дубли, сохраняет.
+    """
+    data = await state.get_data()
+
+    wb_value = data.get('new_match_wb')
+    ozon_value = data.get('new_match_ozon')
+    yandex_value = data.get('new_match_yandex')
+    schema_id = data.get('edit_schema_id')
+    schema_name = data.get('edit_schema_name')
+    schema_type = data.get('edit_schema_type', 'standard')
+    matches_data = data.get('edit_matches_data') or {}
+    all_matches = data.get('edit_all_matches', [])
+
+    if not schema_id:
+        await message.answer("❌ Не удалось определить схему. Попробуй заново.")
+        await edit_schema_start(message, state)
         return
 
-    # === ФОРМИРУЕМ СОПОСТАВЛЕНИЕ ===
-    new_match = {
-        'confidence': 1.0,  # Ручное сопоставление = 100%
-        'description': 'Добавлено вручную'
-    }
-    
-    # Добавляем только заполненные столбцы
+    # Формируем сопоставление
+    new_match = {'confidence': 1.0, 'description': 'Добавлено вручную'}
     if wb_value:
         new_match['column_1'] = wb_value
     if ozon_value:
         new_match['column_2'] = ozon_value
     if yandex_value:
         new_match['column_3'] = yandex_value
+    if xml_value:
+        new_match['column_4'] = xml_value
 
-    schema_id = data.get('edit_schema_id')
-    schema_name = data.get('edit_schema_name')
-
-    if not schema_id:
+    # Определяем тип
+    new_type = _determine_new_match_type(new_match, schema_type)
+    if new_type is None:
         await message.answer(
-            "❌ Не удалось определить схему (schema_id). Попробуй выбрать схему заново."
-        )
-        await edit_schema_start(message, state)
-        return
-
-    # Берём полную структуру сопоставлений
-    matches_data = data.get('edit_matches_data') or {}
-    matches_all_three = matches_data.get('matches_all_three', [])
-    matches_1_2 = matches_data.get('matches_1_2', [])
-    matches_1_3 = matches_data.get('matches_1_3', [])
-    matches_2_3 = matches_data.get('matches_2_3', [])
-
-    # === ПРОВЕРКА НА ДУБЛИКАТ (во всех группах) ===
-    def check_duplicate(matches_list, col1_key, col2_key, val1, val2):
-        """Проверяет наличие дубликата в списке"""
-        for m in matches_list:
-            if m.get(col1_key) == val1 and m.get(col2_key) == val2:
-                return True
-        return False
-    
-    is_duplicate = False
-    
-    if match_type == 'triple':
-        is_duplicate = any(
-            m.get('column_1') == wb_value and
-            m.get('column_2') == ozon_value and
-            m.get('column_3') == yandex_value
-            for m in matches_all_three
-        )
-    elif match_type == 'pair_1_2':
-        is_duplicate = check_duplicate(matches_1_2, 'column_1', 'column_2', wb_value, ozon_value)
-    elif match_type == 'pair_1_3':
-        is_duplicate = check_duplicate(matches_1_3, 'column_1', 'column_3', wb_value, yandex_value)
-    elif match_type == 'pair_2_3':
-        is_duplicate = check_duplicate(matches_2_3, 'column_2', 'column_3', ozon_value, yandex_value)
-
-    if is_duplicate:
-        display_wb = f"WB: {wb_value}" if wb_value else "WB: N/A"
-        display_ozon = f"Ozon: {ozon_value}" if ozon_value else "Ozon: N/A"
-        display_yandex = f"Яндекс: {yandex_value}" if yandex_value else "Яндекс: N/A"
-        
-        await message.answer(
-            f"⚠️ Такое сопоставление уже существует!\n\n"
-            f"{display_wb}\n"
-            f"{display_ozon}\n"
-            f"{display_yandex}",
-            reply_markup=get_filter_matches_keyboard()
+            "❌ Сопоставление должно содержать минимум 2 источника!",
+            reply_markup=_get_filter_keyboard(schema_type)
         )
         await state.set_state(SchemaStates.choosing_edit_action)
         return
 
-    # === ДОБАВЛЯЕМ В НУЖНУЮ ГРУППУ ===
-    if match_type == 'triple':
-        matches_all_three.append(new_match)
-    elif match_type == 'pair_1_2':
-        matches_1_2.append(new_match)
-    elif match_type == 'pair_1_3':
-        matches_1_3.append(new_match)
-    elif match_type == 'pair_2_3':
-        matches_2_3.append(new_match)
+    group_key = _get_group_key(new_type, schema_type)
+    type_display = _format_type(new_type, schema_type)
 
-    # Сохраняем полную структуру
-    matches_data['matches_all_three'] = matches_all_three
-    matches_data['matches_1_2'] = matches_1_2
-    matches_data['matches_1_3'] = matches_1_3
-    matches_data['matches_2_3'] = matches_2_3
+    # Проверка на дубликат
+    existing_group = matches_data.get(group_key, [])
+    col_keys = _get_column_keys_for_type(new_type, schema_type)
+
+    is_duplicate = any(
+        all(m.get(ck) == new_match.get(ck) for ck in col_keys)
+        for m in existing_group
+    )
+
+    if is_duplicate:
+        lines = []
+        labels = {'column_1': 'WB', 'column_2': 'Ozon', 'column_3': 'Яндекс', 'column_4': 'XML'}
+        keys = ALL_COLUMN_KEYS if schema_type == 'mvm' else ['column_1', 'column_2', 'column_3']
+        for ck in keys:
+            val = new_match.get(ck, 'N/A')
+            lines.append(f"{labels[ck]}: {val}")
+
+        await message.answer(
+            f"⚠️ Такое сопоставление уже существует!\n\n" + "\n".join(lines),
+            reply_markup=_get_filter_keyboard(schema_type)
+        )
+        await state.set_state(SchemaStates.choosing_edit_action)
+        return
+
+    # Добавляем
+    if group_key not in matches_data:
+        matches_data[group_key] = []
+    matches_data[group_key].append(new_match)
 
     db.save_schema_matches(schema_id, matches_data)
 
-    # Обновляем edit_all_matches в state
-    all_matches = data.get('edit_all_matches', [])
-    all_matches.append({'type': match_type, 'data': new_match})
-
+    all_matches.append({'type': new_type, 'data': new_match})
     await state.update_data(
         edit_matches_data=matches_data,
-        edit_all_matches=all_matches
+        edit_all_matches=all_matches,
     )
 
-    # Очищаем временные файлы
     user_id = message.from_user.id
     if user_id in user_schemas:
         user_schemas[user_id] = {}
 
     await state.clear()
 
-    total_count = (
-        len(matches_data.get('matches_all_three', [])) +
-        len(matches_data.get('matches_1_2', [])) +
-        len(matches_data.get('matches_1_3', [])) +
-        len(matches_data.get('matches_2_3', []))
-    )
+    # Считаем итого
+    total_count = sum(len(matches_data.get(gk, [])) for gk, _, _, _ in _get_match_groups(schema_type))
 
-    # Формируем сообщение
-    display_wb = f"🔹 WB: {wb_value}" if wb_value else "⏭ WB: N/A"
-    display_ozon = f"🔸 Ozon: {ozon_value}" if ozon_value else "⏭ Ozon: N/A"
-    display_yandex = f"🔹 Яндекс: {yandex_value}" if yandex_value else "⏭ Яндекс: N/A"
+    labels = {'column_1': 'WB', 'column_2': 'Ozon', 'column_3': 'Яндекс', 'column_4': 'XML'}
+    keys = ALL_COLUMN_KEYS if schema_type == 'mvm' else ['column_1', 'column_2', 'column_3']
+
+    match_lines = []
+    for ck in keys:
+        val = new_match.get(ck)
+        icon = "✅" if val else "⏭"
+        display = val if val else "N/A"
+        match_lines.append(f"{icon} {labels[ck]}: {display}")
 
     text = "✅ Новое сопоставление добавлено!\n\n"
     text += f"📋 Схема: {schema_name}\n"
     text += f"📊 Всего сопоставлений: {total_count}\n"
     text += f"🏷 Тип: {type_display}\n\n"
     text += "Добавлено:\n"
-    text += f"{display_wb}\n"
-    text += f"{display_ozon}\n"
-    text += f"{display_yandex}"
+    text += "\n".join(match_lines)
 
     await message.answer(text)
     await edit_schema_start(message, state)
 
 
+# =====================================================================
+#  РЕГИСТРАЦИЯ ХЕНДЛЕРОВ
+# =====================================================================
+
 def register_schema_edit_handlers(dp, bot):
     """Регистрация обработчиков редактирования схем"""
     from functools import partial
-    
+
     dp.message.register(edit_schema_start, F.text == "✏️ Редактировать схему")
-    
+
     # Просмотр
     dp.message.register(view_matches_start, F.text == "👁 Просмотреть текущие сопоставления")
     dp.message.register(show_schema_matches, SchemaStates.selecting_schema_to_view)
-    
-    # Редактирование - выбор схемы
+
+    # Редактирование — выбор схемы
     dp.message.register(edit_match_start, F.text == "✏️ Изменить сопоставление")
     dp.message.register(schema_selected_for_edit, SchemaStates.selecting_schema_to_edit)
-    
-    # Загрузка файлов для валидации
-    dp.message.register(partial(handle_edit_validation_file, bot=bot), SchemaStates.waiting_edit_files, F.document)
-    
-    # ВАЖНО: Выбор действия ПОСЛЕ загрузки файлов (в специальном состоянии)
+
+    # Загрузка файлов МП для валидации
+    dp.message.register(
+        partial(handle_edit_validation_file, bot=bot),
+        SchemaStates.waiting_edit_files, F.document
+    )
+
+    # Загрузка XML при редактировании МВМ
+    dp.message.register(
+        partial(handle_edit_xml_file, bot=bot),
+        SchemaStates.waiting_edit_xml_file, F.document
+    )
+    dp.message.register(
+        handle_edit_xml_text,
+        SchemaStates.waiting_edit_xml_file, F.text
+    )
+
+    # Выбор действия после загрузки файлов
     dp.message.register(edit_action_selected, SchemaStates.choosing_edit_action)
-    
+
     # Изменение существующего сопоставления
     dp.message.register(match_number_entered, SchemaStates.entering_match_number)
     dp.message.register(column_selected_for_edit, SchemaStates.selecting_column_to_edit)
     dp.message.register(new_column_value_entered, SchemaStates.selecting_new_column_value)
-    
+
     # Добавление нового сопоставления
     dp.message.register(wb_column_selected, SchemaStates.selecting_wb_column)
     dp.message.register(ozon_column_selected, SchemaStates.selecting_ozon_column)
     dp.message.register(yandex_column_selected, SchemaStates.selecting_yandex_column)
+    dp.message.register(xml_column_selected, SchemaStates.selecting_xml_column)

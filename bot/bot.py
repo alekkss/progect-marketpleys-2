@@ -17,6 +17,7 @@ from utils.logger_config import setup_logger
 from bot.handlers.common import register_common_handlers
 from bot.handlers.upload import register_upload_handlers
 from bot.handlers.schema_create import register_schema_create_handlers
+from bot.handlers.schema_create_mvm import register_schema_create_mvm_handlers
 from bot.handlers.schema_edit import register_schema_edit_handlers
 from bot.handlers.schema_update import register_schema_update_handlers
 from bot.handlers.schema_delete import register_schema_delete_handlers
@@ -31,27 +32,28 @@ logging.basicConfig(level=logging.INFO)
 def create_bot():
     """
     Создание и настройка бота
-    
+
     Returns:
         tuple: (bot, dispatcher)
     """
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
-    
+
     # Регистрация middleware (ПЕРЕД handlers!)
     dp.message.middleware(AccessControlMiddleware())
     dp.callback_query.middleware(AccessControlMiddleware())
-    
+
     # Регистрация всех обработчиков (БЕЗ дубликатов)
     register_common_handlers(dp)
     register_access_management_handlers(dp)
     register_upload_handlers(dp, bot)
     register_schema_create_handlers(dp, bot)
+    register_schema_create_mvm_handlers(dp, bot)
     register_schema_edit_handlers(dp, bot)
     register_schema_update_handlers(dp, bot)
     register_schema_delete_handlers(dp)
     register_stats_handlers(dp)
-    
+
     return bot, dp
 
 

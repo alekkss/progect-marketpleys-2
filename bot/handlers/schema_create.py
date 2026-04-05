@@ -11,11 +11,12 @@ from aiogram import types, F
 from aiogram.types import ReplyKeyboardRemove
 from aiogram.fsm.context import FSMContext
 
-from bot.states import SchemaStates
+from bot.states import SchemaStates, SchemaMvmStates
 from bot.keyboards import (
     get_main_menu_keyboard,
     get_cancel_keyboard,
-    get_create_schema_keyboard
+    get_create_schema_keyboard,
+    get_schema_type_keyboard
 )
 from bot.storage import user_schemas, db
 from bot.utils import download_file
@@ -28,11 +29,46 @@ from bot.security import AccessManager
 
 
 async def create_schema_start(message: types.Message, state: FSMContext):
-    """Начало создания схемы"""
-    await state.set_state(SchemaStates.waiting_schema_name)
+    """Начало создания схемы — выбор типа"""
+    await state.set_state(SchemaMvmStates.choosing_schema_type)
     await message.answer(
-        "Введи название схемы:",
-        reply_markup=get_cancel_keyboard()
+        "Выбери тип схемы:\n\n"
+        "📊 **Загрузить 3 МП** — стандартная схема (WB + Ozon + Яндекс)\n"
+        "📦 **Создать схему МВМ** — расширенная (3 МП + XML каталог)",
+        reply_markup=get_schema_type_keyboard(),
+        parse_mode="Markdown"
+    )
+
+
+async def schema_type_chosen(message: types.Message, state: FSMContext):
+    """Обработка выбора типа схемы"""
+    if message.text == "❌ Отмена":
+        await schema_management(message, state)
+        return
+
+    if message.text == "📊 Загрузить 3 МП":
+        # Стандартный флоу — переходим к вводу имени схемы
+        await state.set_state(SchemaStates.waiting_schema_name)
+        await message.answer(
+            "Введи название схемы:",
+            reply_markup=get_cancel_keyboard()
+        )
+        return
+
+    if message.text == "📦 Создать схему МВМ":
+        # МВМ флоу — переходим к вводу имени в МВМ-сценарии
+        await state.set_state(SchemaMvmStates.waiting_schema_name)
+        await message.answer(
+            "📦 Создание схемы МВМ (3 МП + XML)\n\n"
+            "Введи название схемы:",
+            reply_markup=get_cancel_keyboard()
+        )
+        return
+
+    # Неизвестная кнопка
+    await message.answer(
+        "Выбери один из вариантов:",
+        reply_markup=get_schema_type_keyboard()
     )
 
 
@@ -206,7 +242,11 @@ def register_schema_create_handlers(dp, bot):
     """Регистрация обработчиков создания схем"""
     from functools import partial
     
+    # Выбор типа схемы (новый шаг)
     dp.message.register(create_schema_start, F.text == "➕ Создать схему")
+    dp.message.register(schema_type_chosen, SchemaMvmStates.choosing_schema_type)
+    
+    # Стандартный флоу (без изменений)
     dp.message.register(schema_name_entered, SchemaStates.waiting_schema_name)
     dp.message.register(partial(handle_schema_file, bot=bot), SchemaStates.waiting_schema_files, F.document)
     dp.message.register(finalize_schema_creation, F.text == "✅ Создать схему")

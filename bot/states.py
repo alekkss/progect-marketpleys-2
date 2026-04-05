@@ -45,6 +45,35 @@ class SchemaStates(StatesGroup):
     selecting_ozon_column = State()
     selecting_yandex_column = State()
 
+
+class SchemaMvmStates(StatesGroup):
+    """
+    Состояния для создания схемы МВМ (3 МП + XML файл).
+    
+    Сценарий:
+    1. Выбор типа схемы (стандартная / МВМ)
+    2. Ввод названия схемы
+    3. Загрузка 3 файлов маркетплейсов (WB, Ozon, Яндекс)
+    4. Загрузка XML файла каталога
+    5. AI-сопоставление 4 источников
+    6. Сохранение схемы
+    """
+    # Выбор типа создания схемы (общий для обоих сценариев)
+    choosing_schema_type = State()
+    
+    # Ввод названия
+    waiting_schema_name = State()
+    
+    # Загрузка 3 шаблонов МП
+    waiting_mp_files = State()
+    
+    # Загрузка XML файла
+    waiting_xml_file = State()
+    
+    # Финализация (AI-сопоставление и сохранение)
+    finalizing = State()
+
+
 class AccessManagementStates(StatesGroup):
     """Состояния для управления доступами"""
     
@@ -65,5 +94,3 @@ class AccessManagementStates(StatesGroup):
     confirming_whitelist_addition = State()
     selecting_user_to_remove = State()
     confirming_whitelist_removal = State()
-
-

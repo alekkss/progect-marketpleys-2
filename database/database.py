@@ -71,11 +71,49 @@ class Database:
             conn.rollback()
         finally:
             conn.close()
+
+    def migrate_add_schema_type(self):
+        """
+        Миграция: добавляет колонку schema_type в таблицу schemas.
+        
+        Значения:
+            'standard' — стандартная схема (3 МП)
+            'mvm' — схема МВМ (3 МП + XML)
+        
+        Существующие схемы получают значение 'standard' по умолчанию.
+        """
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            # Проверяем, есть ли уже колонка schema_type
+            cursor.execute("PRAGMA table_info(schemas)")
+            columns = [row[1] for row in cursor.fetchall()]
             
+            if 'schema_type' not in columns:
+                print("[MIGRATION] Добавление колонки 'schema_type' в таблицу schemas...")
+                
+                cursor.execute("""
+                    ALTER TABLE schemas 
+                    ADD COLUMN schema_type TEXT NOT NULL DEFAULT 'standard'
+                """)
+                
+                conn.commit()
+                print("[MIGRATION] ✅ Колонка 'schema_type' добавлена в schemas!")
+            else:
+                print("[MIGRATION] Колонка 'schema_type' уже существует, миграция не требуется.")
+        
+        except sqlite3.OperationalError as e:
+            print(f"[MIGRATION] ❌ Ошибка миграции schema_type: {e}")
+            conn.rollback()
+        finally:
+            conn.close()
+
     def __init__(self, db_path: str = "marketplace_sync.db"):
         self.db_path = db_path
         self.init_db()
         self.migrate_add_role_column()
+        self.migrate_add_schema_type()
     
     def get_connection(self):
         return sqlite3.connect(self.db_path)
@@ -343,16 +381,26 @@ class Database:
         
         return history
     
-    def create_schema(self, user_id: int, schema_name: str) -> int:
-        """Создает новую схему"""
+    def create_schema(self, user_id: int, schema_name: str, schema_type: str = 'standard') -> int:
+        """
+        Создает новую схему
+        
+        Args:
+            user_id: ID пользователя
+            schema_name: название схемы
+            schema_type: тип схемы ('standard' или 'mvm')
+        
+        Returns:
+            int: ID созданной схемы или None если уже существует
+        """
         conn = self.get_connection()
         cursor = conn.cursor()
         
         try:
             cursor.execute("""
-                INSERT INTO schemas (user_id, schema_name)
-                VALUES (?, ?)
-            """, (user_id, schema_name))
+                INSERT INTO schemas (user_id, schema_name, schema_type)
+                VALUES (?, ?, ?)
+            """, (user_id, schema_name, schema_type))
             
             schema_id = cursor.lastrowid
             conn.commit()
@@ -384,7 +432,8 @@ class Database:
                 SELECT 
                     s.id, s.schema_name, s.created_at, s.updated_at,
                     s.user_id, u.username, u.first_name,
-                    (SELECT COUNT(*) FROM schema_matches WHERE schema_id = s.id) as matches_count
+                    (SELECT COUNT(*) FROM schema_matches WHERE schema_id = s.id) as matches_count,
+                    s.schema_type
                 FROM schemas s
                 LEFT JOIN users u ON s.user_id = u.user_id
                 ORDER BY s.updated_at DESC
@@ -402,14 +451,16 @@ class Database:
                     'updated_at': row[3],
                     'owner_id': row[4],
                     'owner_name': owner_display,
-                    'matches_count': row[7]
+                    'matches_count': row[7],
+                    'schema_type': row[8] if row[8] else 'standard'
                 })
             return schemas
         else:
             # Только свои схемы (для всех пользователей, включая обычных)
             cursor.execute("""
                 SELECT id, schema_name, created_at, updated_at,
-                    (SELECT COUNT(*) FROM schema_matches WHERE schema_id = schemas.id) as matches_count
+                    (SELECT COUNT(*) FROM schema_matches WHERE schema_id = schemas.id) as matches_count,
+                    schema_type
                 FROM schemas
                 WHERE user_id = ?
                 ORDER BY updated_at DESC
@@ -424,7 +475,8 @@ class Database:
                     'name': row[1],
                     'created_at': row[2],
                     'updated_at': row[3],
-                    'matches_count': row[4]
+                    'matches_count': row[4],
+                    'schema_type': row[5] if row[5] else 'standard'
                 })
             return schemas
     
@@ -442,7 +494,7 @@ class Database:
         cursor = conn.cursor()
         
         cursor.execute("""
-            SELECT id, schema_name, user_id, created_at, updated_at
+            SELECT id, schema_name, user_id, created_at, updated_at, schema_type
             FROM schemas
             WHERE schema_name = ?
         """, (schema_name,))
@@ -456,7 +508,8 @@ class Database:
                 'name': row[1],
                 'owner_id': row[2],
                 'created_at': row[3],
-                'updated_at': row[4]
+                'updated_at': row[4],
+                'schema_type': row[5] if row[5] else 'standard'
             }
         
         return None
@@ -467,7 +520,7 @@ class Database:
         cursor = conn.cursor()
         
         cursor.execute("""
-            SELECT id, schema_name, created_at, updated_at
+            SELECT id, schema_name, created_at, updated_at, schema_type
             FROM schemas
             WHERE user_id = ? AND schema_name = ?
         """, (user_id, schema_name))
@@ -480,7 +533,8 @@ class Database:
                 'id': row[0],
                 'name': row[1],
                 'created_at': row[2],
-                'updated_at': row[3]
+                'updated_at': row[3],
+                'schema_type': row[4] if row[4] else 'standard'
             }
         return None
 
@@ -581,6 +635,27 @@ class Database:
             'only_in_second': [],
             'only_in_third': []
         }
+
+    def get_schema_type(self, schema_id: int) -> str:
+        """
+        Получает тип схемы по её ID.
+        
+        Args:
+            schema_id: ID схемы
+        
+        Returns:
+            str: 'standard' или 'mvm'
+        """
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT schema_type FROM schemas WHERE id = ?", (schema_id,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row and row[0]:
+            return row[0]
+        return 'standard'
 
     def update_schema_matches(self, schema_id: int, new_comparison_result: Dict):
         """Обновляет схему, добавляя новые совпадения"""
@@ -848,6 +923,3 @@ class Database:
             },
             'total_used': editor_count + user_count
         }
-
-
-

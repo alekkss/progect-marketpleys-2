@@ -1,7 +1,14 @@
 """
 Клавиатуры для бота
 """
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
+from aiogram.types import (
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardRemove,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
+from typing import List, Dict, Any, Set
 
 
 def get_main_menu_keyboard(show_access_management=False):
@@ -309,3 +316,91 @@ def get_filter_matches_mvm_keyboard():
         ],
         resize_keyboard=True
     )
+
+
+# ===== КЛАВИАТУРЫ ДЛЯ ВЫБОРА КАТЕГОРИЙ XML =====
+
+def get_category_search_keyboard():
+    """
+    Reply-клавиатура для этапа ввода поискового запроса по категориям.
+
+    Показывается после загрузки XML — пользователь вводит текст
+    для поиска категорий или нажимает отмену.
+    """
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="❌ Отмена")]
+        ],
+        resize_keyboard=True
+    )
+
+
+def get_category_selection_inline_keyboard(
+    categories: List[Dict[str, Any]],
+    selected_ids: Set[str],
+) -> InlineKeyboardMarkup:
+    """
+    Inline-клавиатура для множественного выбора категорий.
+
+    Каждая категория отображается как кнопка с toggle-состоянием:
+    ✅ — выбрана, пустой квадрат — не выбрана.
+    Показывает название категории и количество офферов.
+
+    В конце — кнопка подтверждения (активна только при выборе ≥1)
+    и кнопка повторного поиска.
+
+    Args:
+        categories: список категорий из XmlReader.search_categories()
+        selected_ids: множество уже выбранных category_id
+
+    Returns:
+        InlineKeyboardMarkup с toggle-кнопками
+    """
+    buttons: List[List[InlineKeyboardButton]] = []
+
+    for cat in categories:
+        cat_id = cat['id']
+        cat_name = cat['name']
+        offer_count = cat['offer_count']
+
+        # Toggle-иконка: выбрана или нет
+        is_selected = cat_id in selected_ids
+        icon = "✅" if is_selected else "⬜"
+
+        # Текст кнопки: иконка + название + количество офферов
+        button_text = f"{icon} {cat_name} ({offer_count} шт.)"
+
+        # callback_data: префикс cat_toggle: + id категории
+        buttons.append([
+            InlineKeyboardButton(
+                text=button_text,
+                callback_data=f"cat_toggle:{cat_id}",
+            )
+        ])
+
+    # Кнопка подтверждения выбора (только если что-то выбрано)
+    if selected_ids:
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"✅ Подтвердить выбор ({len(selected_ids)} кат.)",
+                callback_data="cat_confirm",
+            )
+        ])
+
+    # Кнопка повторного поиска
+    buttons.append([
+        InlineKeyboardButton(
+            text="🔍 Искать другую категорию",
+            callback_data="cat_search_again",
+        )
+    ])
+
+    # Кнопка отмены
+    buttons.append([
+        InlineKeyboardButton(
+            text="❌ Отмена",
+            callback_data="cat_cancel",
+        )
+    ])
+
+    return InlineKeyboardMarkup(inline_keyboard=buttons)

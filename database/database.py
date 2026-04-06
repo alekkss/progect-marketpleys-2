@@ -656,6 +656,42 @@ class Database:
         if row and row[0]:
             return row[0]
         return 'standard'
+    
+    def get_schema_category_ids(self, schema_id: int) -> list:
+        """
+        Извлекает список выбранных category_id из JSON схемы.
+
+        Категории хранятся в full_comparison_json под ключом
+        'selected_category_ids'. Если ключ отсутствует (старая схема
+        или стандартная) — возвращает пустой список.
+
+        Args:
+            schema_id: ID схемы
+
+        Returns:
+            Список строковых ID категорий, например ['16530', '16531']
+        """
+        conn = self.get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT full_comparison_json FROM schemas WHERE id = ?",
+            (schema_id,)
+        )
+        row = cursor.fetchone()
+        conn.close()
+
+        if not row or not row[0]:
+            return []
+
+        try:
+            data = json.loads(row[0])
+            category_ids = data.get('selected_category_ids', [])
+            if isinstance(category_ids, list):
+                return category_ids
+            return []
+        except (json.JSONDecodeError, TypeError):
+            return []
 
     def update_schema_matches(self, schema_id: int, new_comparison_result: Dict):
         """Обновляет схему, добавляя новые совпадения"""

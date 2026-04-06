@@ -1,5 +1,5 @@
 """
-Модуль для чтения данных из XML файлов каталога (МВидео/xway).
+Модуль для работы с данными из XML файлов каталога (МВидео/xway).
 
 Извлекает список полей офферов из XML: фиксированные теги (<vendor>, <barcode> и т.д.)
 и все уникальные <param name="..."> по всем офферам.
@@ -9,7 +9,7 @@
 
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 from collections import OrderedDict
 
 from utils.logger_config import setup_logger
@@ -244,3 +244,175 @@ class XmlReader:
             return len(root.findall('.//offer'))
         except (ET.ParseError, FileNotFoundError):
             return 0
+
+    @staticmethod
+    def search_categories(file_path: str, query: str) -> List[Dict[str, Any]]:
+        """
+        Ищет категории по текстовому запросу (нечёткий поиск по подстроке).
+
+        Поиск без учёта регистра. Для каждой найденной категории
+        подсчитывает количество офферов, принадлежащих ей.
+
+        Args:
+            file_path: путь к XML файлу
+            query: поисковый запрос (например, "Холодильник")
+
+        Returns:
+            Список словарей с информацией о найденных категориях:
+            [
+                {
+                    'id': '16530',
+                    'name': 'Холодильники двухкамерные',
+                    'parent_id': '16529',
+                    'offer_count': 42
+                },
+                ...
+            ]
+            Отсортирован по количеству офферов (убывание).
+        """
+        if not query or not query.strip():
+            return []
+
+        query_lower = query.strip().lower()
+
+        try:
+            tree = ET.parse(file_path)
+            root = tree.getroot()
+        except ET.ParseError as e:
+            logger.error(f"Ошибка парсинга XML при поиске категорий: {e}", exc_info=True)
+            return []
+
+        # Собираем все категории с parentId
+        all_categories: Dict[str, Dict[str, Any]] = {}
+        for cat in root.findall('.//category'):
+            cat_id = cat.get('id')
+            cat_name = cat.text
+            if cat_id and cat_name:
+                all_categories[cat_id] = {
+                    'id': cat_id,
+                    'name': cat_name.strip(),
+                    'parent_id': cat.get('parentId', ''),
+                    'offer_count': 0,
+                }
+
+        if not all_categories:
+            logger.warning("XML файл не содержит категорий")
+            return []
+
+        # Подсчитываем офферы для каждой категории
+        for offer in root.findall('.//offer'):
+            cat_id_el = offer.find('categoryId')
+            if cat_id_el is not None and cat_id_el.text:
+                cat_id = cat_id_el.text.strip()
+                if cat_id in all_categories:
+                    all_categories[cat_id]['offer_count'] += 1
+
+        # Фильтруем по запросу: ищем подстроку без учёта регистра
+        matched: List[Dict[str, Any]] = []
+        for cat_data in all_categories.values():
+            cat_name_lower = cat_data['name'].lower()
+            if query_lower in cat_name_lower:
+                matched.append(cat_data)
+
+        # Сортируем: сначала категории с офферами (по убыванию), потом без офферов
+        matched.sort(key=lambda c: c['offer_count'], reverse=True)
+
+        logger.info(
+            f"Поиск категорий по '{query}': найдено {len(matched)} "
+            f"из {len(all_categories)} всего"
+        )
+
+        return matched
+
+    @staticmethod
+    def get_offer_data_by_categories(
+        file_path: str,
+        category_ids: Set[str],
+    ) -> List[Dict[str, Any]]:
+        """
+        Извлекает данные только тех офферов, которые принадлежат указанным категориям.
+
+        Логика аналогична get_offer_data(), но с фильтрацией по categoryId.
+
+        Args:
+            file_path: путь к XML файлу
+            category_ids: множество ID категорий для фильтрации
+
+        Returns:
+            Список словарей с данными отфильтрованных офферов
+        """
+        if not category_ids:
+            logger.warning("Пустой набор категорий — возвращаю все офферы")
+            return XmlReader.get_offer_data(file_path)
+
+        file_p = Path(file_path)
+        logger.info(
+            f"Извлечение офферов из XML по категориям: {file_p.name}, "
+            f"категорий: {len(category_ids)}"
+        )
+
+        try:
+            tree = ET.parse(file_path)
+            root = tree.getroot()
+        except ET.ParseError as e:
+            logger.error(f"Ошибка парсинга XML: {e}", exc_info=True)
+            raise ValueError(f"Не удалось прочитать XML файл: {e}") from e
+
+        offers = root.findall('.//offer')
+        if not offers:
+            return []
+
+        multi_value_tags = {'picture', 'video'}
+        result: List[Dict[str, Any]] = []
+        skipped_count = 0
+
+        for offer in offers:
+            # Проверяем categoryId оффера
+            cat_id_el = offer.find('categoryId')
+            if cat_id_el is None or not cat_id_el.text:
+                skipped_count += 1
+                continue
+
+            offer_cat_id = cat_id_el.text.strip()
+            if offer_cat_id not in category_ids:
+                skipped_count += 1
+                continue
+
+            # Оффер принадлежит выбранной категории — извлекаем данные
+            offer_data: Dict[str, Any] = {}
+
+            offer_id = offer.get('id')
+            if offer_id:
+                offer_data['offer_id'] = offer_id
+
+            # Фиксированные теги
+            for tag_name in OFFER_FIXED_TAGS:
+                if tag_name in multi_value_tags:
+                    elements = offer.findall(tag_name)
+                    if elements:
+                        values = [
+                            el.text.strip()
+                            for el in elements
+                            if el.text and el.text.strip()
+                        ]
+                        if values:
+                            offer_data[f"[XML] {tag_name}"] = '; '.join(values)
+                else:
+                    element = offer.find(tag_name)
+                    if element is not None and element.text:
+                        offer_data[f"[XML] {tag_name}"] = element.text.strip()
+
+            # Param
+            for param in offer.findall('param'):
+                param_name = param.get('name')
+                if param_name and param.text:
+                    offer_data[f"[XML param] {param_name}"] = param.text.strip()
+
+            result.append(offer_data)
+
+        logger.info(
+            f"Отфильтровано офферов: {len(result)} из {len(offers)} "
+            f"(пропущено: {skipped_count})"
+        )
+
+        return result

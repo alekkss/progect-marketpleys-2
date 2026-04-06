@@ -483,6 +483,7 @@ class DataSynchronizer:
         ai_comparator=None,
         xml_offer_data: Optional[List[Dict]] = None,
         xml_categories: Optional[Dict[str, str]] = None,
+        selected_category_ids: Optional[List[str]] = None,
     ):
         """
         Инициализация DataSynchronizer.
@@ -512,6 +513,8 @@ class DataSynchronizer:
         self.xml_offer_data = xml_offer_data or []
         self.xml_categories = xml_categories or {}
         self.xml_article_map: Dict[str, Dict] = {}
+        # МВМ: фильтр по выбранным категориям XML
+        self.selected_category_ids: set = set(selected_category_ids) if selected_category_ids else set()
 
         # Кэш validation для каждого столбца
         self.column_validations = {}
@@ -522,6 +525,8 @@ class DataSynchronizer:
         logger.debug(f"AI comparator передан: {ai_comparator is not None}")
         if self.xml_offer_data:
             logger.info(f"XML данные: {len(self.xml_offer_data)} офферов")
+            if self.selected_category_ids:
+                logger.info(f"Фильтр по категориям: {len(self.selected_category_ids)} категорий")
     
     def _align_articles(self, dfs: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
         """
@@ -2045,12 +2050,21 @@ class DataSynchronizer:
         Ключ — значение [XML] vendorCode (артикул продавца).
         Значение — словарь всех полей оффера.
 
-        Это позволяет быстро находить XML-данные по артикулу товара
-        при синхронизации с МП-файлами.
+        Если заданы selected_category_ids — в индекс попадают только
+        офферы из выбранных категорий. Это обеспечивает фильтрацию
+        данных при обработке по МВМ-схеме.
         """
         self.xml_article_map = {}
+        skipped_by_category = 0
 
         for offer in self.xml_offer_data:
+            # Фильтрация по категориям (если заданы)
+            if self.selected_category_ids:
+                offer_cat_id = offer.get('[XML] categoryId', '').strip()
+                if offer_cat_id not in self.selected_category_ids:
+                    skipped_by_category += 1
+                    continue
+
             # Основной ключ — vendorCode (артикул продавца)
             vendor_code = offer.get('[XML] vendorCode', '').strip()
             if vendor_code:
@@ -2060,6 +2074,11 @@ class DataSynchronizer:
             f"📦 XML индекс: {len(self.xml_article_map)} офферов "
             f"с артикулами (из {len(self.xml_offer_data)} всего)"
         )
+
+        if skipped_by_category > 0:
+            logger.info(
+                f"   📂 Пропущено по фильтру категорий: {skipped_by_category} офферов"
+            )
 
         # Показываем первые 3 для отладки
         for i, (article, data) in enumerate(self.xml_article_map.items()):

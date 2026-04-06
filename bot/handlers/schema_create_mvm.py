@@ -5,8 +5,9 @@
     1. Ввод названия схемы
     2. Загрузка 3 файлов МП (WB, Ozon, Яндекс)
     3. Загрузка XML файла каталога
-    4. AI-сопоставление 4 источников
-    5. Сохранение схемы с типом 'mvm'
+    4. Поиск и выбор категорий товаров из XML
+    5. AI-сопоставление 4 источников
+    6. Сохранение схемы с типом 'mvm'
 
 Принцип Single Responsibility: только FSM-логика МВМ-потока.
 """
@@ -25,10 +26,12 @@ from bot.keyboards import (
     get_main_menu_keyboard,
     get_cancel_keyboard,
     get_mvm_create_schema_keyboard,
-    get_mvm_waiting_xml_keyboard
+    get_mvm_waiting_xml_keyboard,
+    get_category_search_keyboard,
+    get_category_selection_inline_keyboard,
 )
 from bot.storage import user_schemas, db
-from bot.utils import download_file
+from bot.utils import download_file, download_xml_from_telegram, download_file_by_url
 from bot.handlers.common import schema_management
 
 from config.config import FILE_CONFIGS
@@ -149,7 +152,7 @@ async def handle_mvm_mp_text(message: types.Message, state: FSMContext):
 # ===== ШАГ 3: ЗАГРУЗКА XML ФАЙЛА =====
 
 async def handle_mvm_xml_file(message: types.Message, state: FSMContext, bot):
-    """Обработка XML файла каталога — валидация и сохранение пути"""
+    """Обработка XML файла каталога — валидация и переход к выбору категорий"""
     user_id = message.from_user.id
 
     if not message.document:
@@ -166,14 +169,75 @@ async def handle_mvm_xml_file(message: types.Message, state: FSMContext, bot):
         )
         return
 
-    # Скачиваем файл
-    file = await bot.get_file(message.document.file_id)
-    downloads_dir = Path("downloads") / str(user_id)
-    downloads_dir.mkdir(parents=True, exist_ok=True)
-    xml_path = str(downloads_dir / file_name)
-    await bot.download_file(file.file_path, xml_path)
+    # Скачиваем файл через обёртку с обработкой ошибки большого файла
+    xml_path, error = await download_xml_from_telegram(bot, message, user_id)
 
-    # Валидируем XML — проверяем наличие офферов
+    if error == "file_too_big":
+        file_size_mb = round(message.document.file_size / (1024 * 1024), 1)
+        await message.answer(
+            f"⚠️ XML файл слишком большой ({file_size_mb} МБ).\n"
+            f"Telegram не позволяет скачивать файлы > 20 МБ.\n\n"
+            f"📎 Отправь прямую ссылку на XML файл\n"
+            f"(загрузи на Google Drive, Dropbox, Яндекс.Диск и скопируй прямую ссылку):\n\n"
+            f"Или нажми ❌ Отмена",
+            reply_markup=get_mvm_waiting_xml_keyboard()
+        )
+        return
+
+    if error:
+        await message.answer(f"❌ {error}\n\nОтправь файл заново:")
+        return
+
+    # Валидируем XML
+    await _validate_and_proceed_xml(message, state, xml_path)
+
+
+async def handle_mvm_xml_url(message: types.Message, state: FSMContext):
+    """Обработка URL-ссылки на XML файл (для файлов > 20 МБ)"""
+    text = message.text.strip()
+
+    # Проверяем что это похоже на URL
+    if not (text.startswith('http://') or text.startswith('https://')):
+        return False  # Не URL — пусть обработает другой хендлер
+
+    user_id = message.from_user.id
+
+    await message.answer("⏳ Скачиваю XML файл по ссылке...")
+
+    # Определяем имя файла из URL
+    from urllib.parse import urlparse, unquote
+    parsed = urlparse(text)
+    url_filename = unquote(Path(parsed.path).name) if parsed.path else "catalog.xml"
+    if not url_filename.lower().endswith('.xml'):
+        url_filename = "catalog.xml"
+
+    xml_path, error = await download_file_by_url(text, user_id, url_filename)
+
+    if error:
+        await message.answer(
+            f"❌ {error}\n\n"
+            "Проверь ссылку и отправь заново, "
+            "или отправь XML файл как документ:",
+            reply_markup=get_mvm_waiting_xml_keyboard()
+        )
+        return True  # Обработали как URL
+
+    # Валидируем XML
+    await _validate_and_proceed_xml(message, state, xml_path)
+    return True  # Обработали как URL
+
+
+async def _validate_and_proceed_xml(
+    message: types.Message,
+    state: FSMContext,
+    xml_path: str,
+):
+    """
+    Общая логика валидации XML и перехода к выбору категорий.
+
+    Вынесена в отдельную функцию, чтобы не дублировать код
+    между загрузкой через Telegram и загрузкой по URL.
+    """
     try:
         xml_reader = XmlReader()
         offer_count = xml_reader.get_offer_count(xml_path)
@@ -187,6 +251,9 @@ async def handle_mvm_xml_file(message: types.Message, state: FSMContext, bot):
 
         xml_fields = xml_reader.get_field_names(xml_path)
 
+        # Получаем количество категорий для информации
+        xml_categories = xml_reader.get_categories(xml_path)
+
     except ValueError as e:
         await message.answer(
             f"❌ Ошибка чтения XML: {e}\n\n"
@@ -198,25 +265,210 @@ async def handle_mvm_xml_file(message: types.Message, state: FSMContext, bot):
         logger.error(f"Ошибка чтения XML: {e}", exc_info=True)
         return
 
-    # Сохраняем путь к XML в FSM
-    await state.update_data(xml_file_path=xml_path)
+    # Сохраняем путь к XML и данные в FSM
+    await state.update_data(
+        xml_file_path=xml_path,
+        selected_category_ids=[],
+    )
 
-    # ИСПРАВЛЕНО: переключаем состояние на finalizing,
-    # чтобы кнопка "✅ Создать схему МВМ" обрабатывалась
-    # хендлером finalize_mvm_schema, а не handle_mvm_xml_text
-    await state.set_state(SchemaMvmStates.finalizing)
+    # Переходим к выбору категорий
+    await state.set_state(SchemaMvmStates.waiting_category_search)
 
     await message.answer(
         f"✅ XML файл загружен!\n\n"
         f"📦 Офферов: {offer_count}\n"
-        f"📋 Полей XML: {len(xml_fields)}\n\n"
-        "Нажми кнопку для запуска AI-сопоставления:",
-        reply_markup=get_mvm_create_schema_keyboard()
+        f"📋 Полей XML: {len(xml_fields)}\n"
+        f"📂 Категорий: {len(xml_categories)}\n\n"
+        "🔍 Введи название категории товаров из шаблонов МП\n"
+        "(например: Холодильник, Телевизор, Кроссовки):",
+        reply_markup=get_category_search_keyboard()
     )
 
 
 async def handle_mvm_xml_text(message: types.Message, state: FSMContext):
-    """Обработка текста в состоянии ожидания XML (отмена)"""
+    """Обработка текста в состоянии ожидания XML (отмена или URL)"""
+    if message.text == "❌ Отмена":
+        user_id = message.from_user.id
+        if user_id in user_schemas:
+            user_schemas[user_id] = {}
+        await state.clear()
+        await schema_management(message, state)
+        return
+
+    # Пробуем обработать как URL
+    text = message.text.strip()
+    if text.startswith('http://') or text.startswith('https://'):
+        await handle_mvm_xml_url(message, state)
+        return
+
+    await message.answer(
+        "📎 Отправь XML файл как документ,\n"
+        "прямую ссылку на файл (http://...),\n"
+        "или нажми ❌ Отмена"
+    )
+
+
+# ===== ШАГ 4: ПОИСК И ВЫБОР КАТЕГОРИЙ =====
+
+async def handle_category_search(message: types.Message, state: FSMContext):
+    """Обработка поискового запроса по категориям XML"""
+    if message.text == "❌ Отмена":
+        user_id = message.from_user.id
+        if user_id in user_schemas:
+            user_schemas[user_id] = {}
+        await state.clear()
+        await schema_management(message, state)
+        return
+
+    query = message.text.strip()
+    data = await state.get_data()
+    xml_file_path = data.get('xml_file_path')
+
+    if not xml_file_path:
+        await message.answer("❌ XML файл потерян. Начни заново.")
+        await state.clear()
+        return
+
+    # Поиск категорий по запросу
+    xml_reader = XmlReader()
+    found_categories = xml_reader.search_categories(xml_file_path, query)
+
+    if not found_categories:
+        await message.answer(
+            f"❌ По запросу '{query}' категорий не найдено.\n\n"
+            "Попробуй другой запрос\n"
+            "(например: часть слова, синоним, другой падеж):",
+            reply_markup=get_category_search_keyboard()
+        )
+        return
+
+    # Сохраняем найденные категории и текущий выбор в FSM
+    selected_ids = set(data.get('selected_category_ids', []))
+
+    await state.update_data(
+        found_categories=found_categories,
+    )
+
+    # Переходим в состояние выбора
+    await state.set_state(SchemaMvmStates.waiting_category_selection)
+
+    # Формируем текст с результатами
+    text = f"🔍 По запросу '{query}' найдено категорий: {len(found_categories)}\n\n"
+    text += "Нажми на категорию чтобы выбрать/снять выбор.\n"
+    text += "Можно выбрать несколько категорий:"
+
+    await message.answer(
+        text,
+        reply_markup=get_category_selection_inline_keyboard(
+            found_categories, selected_ids
+        )
+    )
+
+
+async def handle_category_toggle(callback: types.CallbackQuery, state: FSMContext):
+    """Обработка нажатия на inline-кнопку категории (toggle выбора)"""
+    cat_id = callback.data.split(":", 1)[1]
+
+    data = await state.get_data()
+    selected_ids = set(data.get('selected_category_ids', []))
+    found_categories = data.get('found_categories', [])
+
+    # Toggle: добавляем или убираем категорию
+    if cat_id in selected_ids:
+        selected_ids.discard(cat_id)
+    else:
+        selected_ids.add(cat_id)
+
+    # Сохраняем обновлённый выбор
+    await state.update_data(selected_category_ids=list(selected_ids))
+
+    # Обновляем inline-клавиатуру
+    await callback.message.edit_reply_markup(
+        reply_markup=get_category_selection_inline_keyboard(
+            found_categories, selected_ids
+        )
+    )
+
+    await callback.answer()
+
+
+async def handle_category_search_again(callback: types.CallbackQuery, state: FSMContext):
+    """Обработка нажатия 'Искать другую категорию' — возврат к поисковому вводу"""
+    await state.set_state(SchemaMvmStates.waiting_category_search)
+
+    data = await state.get_data()
+    selected_ids = set(data.get('selected_category_ids', []))
+
+    if selected_ids:
+        text = (
+            f"📂 Уже выбрано категорий: {len(selected_ids)}\n\n"
+            "🔍 Введи ещё один запрос для поиска дополнительных категорий:"
+        )
+    else:
+        text = "🔍 Введи название категории для поиска:"
+
+    await callback.message.answer(
+        text,
+        reply_markup=get_category_search_keyboard()
+    )
+    await callback.answer()
+
+
+async def handle_category_confirm(callback: types.CallbackQuery, state: FSMContext):
+    """Обработка подтверждения выбора категорий — переход к финализации"""
+    data = await state.get_data()
+    selected_ids = set(data.get('selected_category_ids', []))
+    xml_file_path = data.get('xml_file_path')
+
+    if not selected_ids:
+        await callback.answer("⚠️ Выбери хотя бы одну категорию!", show_alert=True)
+        return
+
+    # Подсчитываем офферов в выбранных категориях
+    xml_reader = XmlReader()
+    all_categories = xml_reader.get_categories(xml_file_path)
+
+    # Формируем сообщение с выбранными категориями
+    selected_names = []
+    for cat_id in selected_ids:
+        cat_name = all_categories.get(cat_id, f"ID:{cat_id}")
+        selected_names.append(f"• {cat_name} (ID: {cat_id})")
+
+    # Подсчитываем офферов по выбранным категориям
+    filtered_offers = xml_reader.get_offer_data_by_categories(
+        xml_file_path, selected_ids
+    )
+
+    await state.set_state(SchemaMvmStates.finalizing)
+
+    selected_text = "\n".join(selected_names)
+    await callback.message.answer(
+        f"✅ Выбрано категорий: {len(selected_ids)}\n\n"
+        f"{selected_text}\n\n"
+        f"📦 Офферов в выбранных категориях: {len(filtered_offers)}\n\n"
+        "Нажми кнопку для запуска AI-сопоставления:",
+        reply_markup=get_mvm_create_schema_keyboard()
+    )
+
+    await callback.answer()
+
+
+async def handle_category_cancel(callback: types.CallbackQuery, state: FSMContext):
+    """Обработка отмены выбора категорий"""
+    user_id = callback.from_user.id
+    if user_id in user_schemas:
+        user_schemas[user_id] = {}
+    await state.clear()
+
+    await callback.message.answer(
+        "❌ Создание МВМ-схемы отменено.",
+        reply_markup=get_main_menu_keyboard()
+    )
+    await callback.answer()
+
+
+async def handle_category_selection_text(message: types.Message, state: FSMContext):
+    """Обработка текста в состоянии выбора категорий (только отмена)"""
     if message.text == "❌ Отмена":
         user_id = message.from_user.id
         if user_id in user_schemas:
@@ -224,10 +476,13 @@ async def handle_mvm_xml_text(message: types.Message, state: FSMContext):
         await state.clear()
         await schema_management(message, state)
     else:
-        await message.answer("📎 Отправь XML файл как документ или нажми ❌ Отмена")
+        await message.answer(
+            "⬆️ Используй inline-кнопки выше для выбора категорий.\n"
+            "Или нажми ❌ Отмена."
+        )
 
 
-# ===== ШАГ 4: ФИНАЛИЗАЦИЯ (AI + СОХРАНЕНИЕ) =====
+# ===== ШАГ 5: ФИНАЛИЗАЦИЯ (AI + СОХРАНЕНИЕ) =====
 
 async def finalize_mvm_schema(message: types.Message, state: FSMContext):
     """Финализация создания МВМ-схемы: AI-сопоставление 4 источников и сохранение"""
@@ -257,6 +512,7 @@ async def finalize_mvm_schema(message: types.Message, state: FSMContext):
     data = await state.get_data()
     schema_name = data.get('schema_name')
     xml_file_path = data.get('xml_file_path')
+    selected_category_ids = data.get('selected_category_ids', [])
 
     if not schema_name:
         await message.answer("❌ Название схемы потеряно. Начни заново.")
@@ -264,6 +520,10 @@ async def finalize_mvm_schema(message: types.Message, state: FSMContext):
 
     if not xml_file_path:
         await message.answer("❌ XML файл не загружен. Начни заново.")
+        return
+
+    if not selected_category_ids:
+        await message.answer("❌ Категории не выбраны. Начни заново.")
         return
 
     await message.answer(
@@ -286,16 +546,21 @@ async def finalize_mvm_schema(message: types.Message, state: FSMContext):
                 config['header_row']
             )
 
-        # === Читаем поля из XML ===
+        # === Читаем поля из XML (только по выбранным категориям) ===
         xml_reader = XmlReader()
-        xml_fields = xml_reader.get_field_names(xml_file_path)
+        filtered_offers = xml_reader.get_offer_data_by_categories(
+            xml_file_path, set(selected_category_ids)
+        )
+
+        # Собираем уникальные поля из отфильтрованных офферов
+        xml_fields = _extract_fields_from_offers(filtered_offers)
 
         await message.answer(
             f"📊 Столбцы прочитаны:\n"
             f"• WB: {len(columns['wildberries'])}\n"
             f"• Ozon: {len(columns['ozon'])}\n"
             f"• Яндекс: {len(columns['yandex'])}\n"
-            f"• XML: {len(xml_fields)}\n\n"
+            f"• XML (по выбранным категориям): {len(xml_fields)}\n\n"
             "🤖 AI сопоставляет 4 источника..."
         )
 
@@ -308,6 +573,9 @@ async def finalize_mvm_schema(message: types.Message, state: FSMContext):
             xml_fields
         )
 
+        # === Сохраняем выбранные категории в результат ===
+        comparison_result['selected_category_ids'] = selected_category_ids
+
         # === Подсчёт статистики ===
         stats = _count_match_stats(comparison_result)
         total_saved = stats['total']
@@ -319,7 +587,7 @@ async def finalize_mvm_schema(message: types.Message, state: FSMContext):
             await message.answer("❌ Схема с таким названием уже существует!")
             return
 
-        # Сохраняем сопоставления (полный JSON)
+        # Сохраняем сопоставления (полный JSON, включая selected_category_ids)
         db.save_schema_matches(schema_id, comparison_result)
 
         # Очистка
@@ -327,7 +595,7 @@ async def finalize_mvm_schema(message: types.Message, state: FSMContext):
         await state.clear()
 
         # === Формируем итоговое сообщение ===
-        text = _build_result_message(schema_name, stats)
+        text = _build_result_message(schema_name, stats, selected_category_ids, xml_reader, xml_file_path)
         await message.answer(text, reply_markup=get_main_menu_keyboard())
 
     except Exception as e:
@@ -337,22 +605,35 @@ async def finalize_mvm_schema(message: types.Message, state: FSMContext):
 
 # ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
 
+def _extract_fields_from_offers(offers: list) -> list:
+    """
+    Извлекает уникальные имена полей из списка офферов.
+
+    Сохраняет порядок первого появления. Пропускает служебное поле offer_id.
+
+    Args:
+        offers: список словарей с данными офферов
+
+    Returns:
+        Список уникальных названий полей с префиксами [XML] / [XML param]
+    """
+    from collections import OrderedDict
+
+    seen: OrderedDict = OrderedDict()
+
+    for offer in offers:
+        for key in offer:
+            if key == 'offer_id':
+                continue
+            if key not in seen:
+                seen[key] = True
+
+    return list(seen.keys())
+
+
 def _count_match_stats(comparison_result: dict) -> dict:
     """
     Подсчитывает статистику по типам сопоставлений.
-
-    Ключи соответствуют тому, что возвращает AIComparator._merge_mvm_results:
-        matches_all_four         — WB + Ozon + Яндекс + XML
-        matches_triple_1_2_3     — WB + Ozon + Яндекс (без XML)
-        matches_triple_1_2_4     — WB + Ozon + XML
-        matches_triple_1_3_4     — WB + Яндекс + XML
-        matches_triple_2_3_4     — Ozon + Яндекс + XML
-        matches_pair_1_2         — WB + Ozon
-        matches_pair_1_3         — WB + Яндекс
-        matches_pair_2_3         — Ozon + Яндекс
-        matches_pair_1_4         — WB + XML
-        matches_pair_2_4         — Ozon + XML
-        matches_pair_3_4         — Яндекс + XML
 
     Args:
         comparison_result: результат AI-сопоставления
@@ -386,18 +667,40 @@ def _count_match_stats(comparison_result: dict) -> dict:
     return stats
 
 
-def _build_result_message(schema_name: str, stats: dict) -> str:
+def _build_result_message(
+    schema_name: str,
+    stats: dict,
+    selected_category_ids: list,
+    xml_reader: XmlReader,
+    xml_file_path: str,
+) -> str:
     """
     Формирует итоговое сообщение о созданной МВМ-схеме.
 
     Args:
         schema_name: название схемы
         stats: словарь статистики из _count_match_stats
+        selected_category_ids: список выбранных ID категорий
+        xml_reader: экземпляр XmlReader для получения имён категорий
+        xml_file_path: путь к XML файлу
 
     Returns:
         Текст сообщения для пользователя
     """
     text = f"✅ МВМ-схема '{schema_name}' создана!\n\n"
+
+    # Информация о выбранных категориях
+    all_categories = xml_reader.get_categories(xml_file_path)
+    cat_names = []
+    for cat_id in selected_category_ids:
+        cat_name = all_categories.get(cat_id, f"ID:{cat_id}")
+        cat_names.append(cat_name)
+
+    text += f"📂 Категории ({len(cat_names)}):\n"
+    for name in cat_names:
+        text += f"  • {name}\n"
+    text += "\n"
+
     text += f"📊 Всего сопоставлений: {stats['total']}\n\n"
 
     labels = {
@@ -455,16 +758,58 @@ def register_schema_create_mvm_handlers(dp, bot):
         F.document
     )
 
-    # Текст в состоянии ожидания XML (отмена)
+    # Текст в состоянии ожидания XML (отмена или URL)
     dp.message.register(
         handle_mvm_xml_text,
         SchemaMvmStates.waiting_xml_file,
         F.text
     )
 
-    # ИСПРАВЛЕНО: финализация привязана к состоянию finalizing,
-    # а не к глобальному F.text — иначе handle_mvm_xml_text
-    # перехватывал текст раньше
+    # === ВЫБОР КАТЕГОРИЙ ===
+
+    # Текстовый поиск категорий
+    dp.message.register(
+        handle_category_search,
+        SchemaMvmStates.waiting_category_search,
+        F.text
+    )
+
+    # Inline-кнопки: toggle выбора категории
+    dp.callback_query.register(
+        handle_category_toggle,
+        SchemaMvmStates.waiting_category_selection,
+        F.data.startswith("cat_toggle:")
+    )
+
+    # Inline-кнопка: подтверждение выбора
+    dp.callback_query.register(
+        handle_category_confirm,
+        SchemaMvmStates.waiting_category_selection,
+        F.data == "cat_confirm"
+    )
+
+    # Inline-кнопка: повторный поиск
+    dp.callback_query.register(
+        handle_category_search_again,
+        SchemaMvmStates.waiting_category_selection,
+        F.data == "cat_search_again"
+    )
+
+    # Inline-кнопка: отмена
+    dp.callback_query.register(
+        handle_category_cancel,
+        SchemaMvmStates.waiting_category_selection,
+        F.data == "cat_cancel"
+    )
+
+    # Текст в состоянии выбора категорий (подсказка использовать inline)
+    dp.message.register(
+        handle_category_selection_text,
+        SchemaMvmStates.waiting_category_selection,
+        F.text
+    )
+
+    # Финализация
     dp.message.register(
         finalize_mvm_schema,
         SchemaMvmStates.finalizing

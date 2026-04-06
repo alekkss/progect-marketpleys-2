@@ -29,7 +29,7 @@ from bot.keyboards import (
     get_mvm_waiting_xml_keyboard,
 )
 from bot.storage import user_files, db
-from bot.utils import download_file
+from bot.utils import download_file, download_xml_from_telegram, download_file_by_url
 from bot.handlers.common import cmd_start
 
 from config.config import FILE_CONFIGS
@@ -345,12 +345,40 @@ async def handle_mvm_upload_xml_file(message: types.Message, state: FSMContext, 
         await message.answer("❌ Нужен файл с расширением .xml")
         return
 
-    file = await bot.get_file(message.document.file_id)
-    downloads_dir = Path("downloads") / str(user_id)
-    downloads_dir.mkdir(parents=True, exist_ok=True)
-    xml_path = str(downloads_dir / file_name)
-    await bot.download_file(file.file_path, xml_path)
+    # Скачиваем через обёртку с обработкой ошибки большого файла
+    xml_path, error = await download_xml_from_telegram(bot, message, user_id)
 
+    if error == "file_too_big":
+        file_size_mb = round(message.document.file_size / (1024 * 1024), 1)
+        await message.answer(
+            f"⚠️ XML файл слишком большой ({file_size_mb} МБ).\n"
+            f"Telegram не позволяет скачивать файлы > 20 МБ.\n\n"
+            f"📎 Отправь прямую ссылку на XML файл\n"
+            f"(загрузи на Google Drive, Dropbox, Яндекс.Диск и скопируй прямую ссылку):\n\n"
+            f"Или нажми ❌ Отмена",
+            reply_markup=get_mvm_waiting_xml_keyboard()
+        )
+        return
+
+    if error:
+        await message.answer(f"❌ {error}\n\nОтправь файл заново:")
+        return
+
+    # Валидируем и сохраняем
+    await _validate_and_save_upload_xml(message, state, xml_path)
+
+
+async def _validate_and_save_upload_xml(
+    message: types.Message,
+    state: FSMContext,
+    xml_path: str,
+):
+    """
+    Общая логика валидации XML и перехода к обработке при загрузке МВМ.
+
+    Вынесена в отдельную функцию, чтобы не дублировать код
+    между загрузкой через Telegram и загрузкой по URL.
+    """
     try:
         xml_reader = XmlReader()
         offer_count = xml_reader.get_offer_count(xml_path)
@@ -375,7 +403,7 @@ async def handle_mvm_upload_xml_file(message: types.Message, state: FSMContext, 
 
 
 async def handle_mvm_upload_xml_text(message: types.Message, state: FSMContext):
-    """Текст в состоянии ожидания XML при загрузке МВМ"""
+    """Текст в состоянии ожидания XML при загрузке МВМ (отмена, обработка или URL)"""
     if message.text == "❌ Отмена":
         user_id = message.from_user.id
         if user_id in user_files:
@@ -385,7 +413,36 @@ async def handle_mvm_upload_xml_text(message: types.Message, state: FSMContext):
     elif message.text == "🚀 Обработать":
         await process_files_mvm(message, state, None)
     else:
-        await message.answer("📎 Отправь XML файл или нажми ❌ Отмена")
+        # Пробуем обработать как URL
+        text = message.text.strip()
+        if text.startswith('http://') or text.startswith('https://'):
+            user_id = message.from_user.id
+            await message.answer("⏳ Скачиваю XML файл по ссылке...")
+
+            from urllib.parse import urlparse, unquote
+            parsed = urlparse(text)
+            url_filename = unquote(Path(parsed.path).name) if parsed.path else "catalog.xml"
+            if not url_filename.lower().endswith('.xml'):
+                url_filename = "catalog.xml"
+
+            xml_path, error = await download_file_by_url(text, user_id, url_filename)
+
+            if error:
+                await message.answer(
+                    f"❌ {error}\n\n"
+                    "Проверь ссылку и отправь заново, "
+                    "или отправь XML файл как документ:",
+                    reply_markup=get_mvm_waiting_xml_keyboard()
+                )
+                return
+
+            await _validate_and_save_upload_xml(message, state, xml_path)
+        else:
+            await message.answer(
+                "📎 Отправь XML файл как документ,\n"
+                "прямую ссылку на файл (http://...),\n"
+                "или нажми ❌ Отмена"
+            )
 
 
 async def process_files_mvm(message: types.Message, state: FSMContext, bot):
@@ -455,12 +512,21 @@ async def process_files_mvm(message: types.Message, state: FSMContext, bot):
 
         report_path = f"{output_dir}/результат_{timestamp}.xlsx"
 
-        # Создаём DataSynchronizer с XML-данными
+        # Извлекаем выбранные категории из схемы
+        selected_category_ids = db.get_schema_category_ids(schema_id)
+
+        if selected_category_ids:
+            logger.info(
+                f"📂 Фильтр по категориям: {len(selected_category_ids)} категорий"
+            )
+
+        # Создаём DataSynchronizer с XML-данными и фильтром категорий
         synchronizer = DataSynchronizer(
             comparison_result,
             ai_comparator=comparator,
             xml_offer_data=xml_offer_data,
             xml_categories=xml_categories,
+            selected_category_ids=selected_category_ids,
         )
 
         synced_dfs, changes_log = synchronizer.synchronize_data(

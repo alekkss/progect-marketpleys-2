@@ -539,7 +539,10 @@ def register_upload_handlers(dp, bot):
         partial(handle_file, bot=bot),
         UploadStates.waiting_for_files, F.document
     )
-    dp.message.register(partial(process_files, bot=bot), F.text == "🚀 Обработать")
+    dp.message.register(
+        partial(process_files, bot=bot),
+        UploadStates.waiting_for_files, F.text == "🚀 Обработать"
+    )
 
     # МВМ-флоу: загрузка 3 МП
     dp.message.register(
@@ -555,6 +558,10 @@ def register_upload_handlers(dp, bot):
     dp.message.register(
         partial(handle_mvm_upload_xml_file, bot=bot),
         UploadMvmStates.waiting_for_xml_file, F.document
+    )
+    dp.message.register(
+        partial(process_files_mvm, bot=bot),
+        UploadMvmStates.waiting_for_xml_file, F.text == "🚀 Обработать"
     )
     dp.message.register(
         handle_mvm_upload_xml_text,

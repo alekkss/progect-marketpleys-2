@@ -201,6 +201,11 @@ async def handle_mvm_xml_file(message: types.Message, state: FSMContext, bot):
     # Сохраняем путь к XML в FSM
     await state.update_data(xml_file_path=xml_path)
 
+    # ИСПРАВЛЕНО: переключаем состояние на finalizing,
+    # чтобы кнопка "✅ Создать схему МВМ" обрабатывалась
+    # хендлером finalize_mvm_schema, а не handle_mvm_xml_text
+    await state.set_state(SchemaMvmStates.finalizing)
+
     await message.answer(
         f"✅ XML файл загружен!\n\n"
         f"📦 Офферов: {offer_count}\n"
@@ -227,6 +232,22 @@ async def handle_mvm_xml_text(message: types.Message, state: FSMContext):
 async def finalize_mvm_schema(message: types.Message, state: FSMContext):
     """Финализация создания МВМ-схемы: AI-сопоставление 4 источников и сохранение"""
     user_id = message.from_user.id
+
+    # Обработка отмены в состоянии финализации
+    if message.text == "❌ Отмена":
+        if user_id in user_schemas:
+            user_schemas[user_id] = {}
+        await state.clear()
+        await schema_management(message, state)
+        return
+
+    # Проверяем что нажата именно кнопка создания
+    if message.text != "✅ Создать схему МВМ":
+        await message.answer(
+            "Нажми кнопку '✅ Создать схему МВМ' для запуска или '❌ Отмена'",
+            reply_markup=get_mvm_create_schema_keyboard()
+        )
+        return
 
     # Проверяем наличие файлов МП
     if user_id not in user_schemas or len(user_schemas[user_id]) != 3:
@@ -279,7 +300,6 @@ async def finalize_mvm_schema(message: types.Message, state: FSMContext):
         )
 
         # === AI-сопоставление 4 источников ===
-        # ИСПРАВЛЕНО: правильное имя метода compare_columns_mvm
         comparator = AIComparator()
         comparison_result = comparator.compare_columns_mvm(
             columns['wildberries'],
@@ -340,7 +360,6 @@ def _count_match_stats(comparison_result: dict) -> dict:
     Returns:
         Словарь со счётчиками по каждому типу и общим итогом
     """
-    # ИСПРАВЛЕНО: ключи приведены к именованию из _merge_mvm_results
     match_keys = [
         'matches_all_four',
         'matches_triple_1_2_3',
@@ -381,7 +400,6 @@ def _build_result_message(schema_name: str, stats: dict) -> str:
     text = f"✅ МВМ-схема '{schema_name}' создана!\n\n"
     text += f"📊 Всего сопоставлений: {stats['total']}\n\n"
 
-    # ИСПРАВЛЕНО: ключи приведены к именованию из _merge_mvm_results
     labels = {
         'matches_all_four':         "🎯 Четверные (WB+Ozon+Яндекс+XML)",
         'matches_triple_1_2_3':     "🔷 Тройные (WB+Ozon+Яндекс)",
@@ -444,8 +462,10 @@ def register_schema_create_mvm_handlers(dp, bot):
         F.text
     )
 
-    # Финализация
+    # ИСПРАВЛЕНО: финализация привязана к состоянию finalizing,
+    # а не к глобальному F.text — иначе handle_mvm_xml_text
+    # перехватывал текст раньше
     dp.message.register(
         finalize_mvm_schema,
-        F.text == "✅ Создать схему МВМ"
+        SchemaMvmStates.finalizing
     )

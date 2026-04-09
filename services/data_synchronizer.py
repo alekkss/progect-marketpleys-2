@@ -11,6 +11,7 @@ from utils.excel_writer import ExcelWriter
 from config.config import (
     FILE_CONFIGS, is_excluded_column,
     WB_DIMENSION_PATTERNS, ALL_DIMENSION_COLUMN_NAMES,
+    XML_UNIT_MAPPING, ALL_WEIGHT_COLUMN_NAMES,
 )
 from services.ai_comparator import AIComparator
 from utils.logger_config import setup_logger
@@ -653,10 +654,15 @@ class DataSynchronizer:
     
     def _detect_unit(self, column_name: str) -> Optional[str]:
         """
-        Определяет единицу измерения из названия столбца
+        Определяет единицу измерения из названия столбца.
+        
+        Порядок проверки:
+            1. XML_UNIT_MAPPING — точное совпадение для XML-полей с префиксами
+            2. ALL_WEIGHT_COLUMN_NAMES — точное совпадение для весовых столбцов МП
+            3. Эвристика по ключевым словам в названии столбца
         
         Args:
-            column_name: название столбца
+            column_name: название столбца (МП или XML с префиксом)
         
         Returns:
             Единица измерения ('kg', 'g', 'mm', 'cm') или None
@@ -664,6 +670,19 @@ class DataSynchronizer:
         if not column_name:
             return None
         
+        # 1. Проверяем точный маппинг для XML-полей
+        if column_name in XML_UNIT_MAPPING:
+            unit = XML_UNIT_MAPPING[column_name]
+            logger.debug(f"   [unit] XML маппинг: '{column_name}' → {unit}")
+            return unit
+        
+        # 2. Проверяем точный маппинг для весовых столбцов МП
+        if column_name in ALL_WEIGHT_COLUMN_NAMES:
+            unit = ALL_WEIGHT_COLUMN_NAMES[column_name]
+            logger.debug(f"   [unit] Весовой маппинг: '{column_name}' → {unit}")
+            return unit
+        
+        # 3. Эвристика по ключевым словам
         column_lower = column_name.lower()
         
         # Определяем единицы веса

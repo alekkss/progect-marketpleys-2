@@ -562,6 +562,14 @@ class DataSynchronizer:
                 all_articles.update(articles.tolist())
                 logger.info(f"📊 {marketplace.upper()}: {len(articles)} артикулов")
         
+        # Добавляем артикулы из XML-индекса (если построен)
+        xml_articles_added = 0
+        if self.xml_article_map:
+            before_count = len(all_articles)
+            all_articles.update(self.xml_article_map.keys())
+            xml_articles_added = len(all_articles) - before_count
+            logger.info(f"📊 XML: {len(self.xml_article_map)} артикулов в индексе, {xml_articles_added} новых (отсутствуют в МП)")
+        
         logger.info(f"\n🔍 Всего уникальных артикулов: {len(all_articles)}")
         
         # Для каждого маркетплейса проверяем недостающие артикулы
@@ -776,10 +784,14 @@ class DataSynchronizer:
         # 1. Загружаем данные из всех трех файлов
         dfs = self._load_all_dataframes(file_paths)
 
-        # 2. Выравниваем артикулы
+        # 2. Строим XML-индекс ПЕРЕД выравниванием (чтобы XML-артикулы попали в МП)
+        if self.xml_offer_data:
+            self._build_xml_article_map()
+
+        # 3. Выравниваем артикулы (включая артикулы из XML)
         dfs = self._align_articles(dfs)
 
-        # 3. Синхронизация габаритов (ПЕРЕД остальными столбцами!)
+        # 4. Синхронизация габаритов (ПЕРЕД остальными столбцами!)
         dimensions_synced = DimensionsSynchronizer.sync_dimensions(dfs)
 
         # 4. Синхронизируем ОСТАЛЬНЫЕ данные между МП
@@ -788,14 +800,15 @@ class DataSynchronizer:
         logger.info("=" * 60)
         synced_dfs = self._sync_all_matches(dfs)
 
-        # 5. [МВМ] Заполнение из XML каталога
+        # 6. [МВМ] Заполнение из XML каталога
         if self.xml_offer_data:
             logger.info("\n" + "=" * 60)
             logger.info("📦 ЗАПОЛНЕНИЕ ИЗ XML КАТАЛОГА")
             logger.info("=" * 60)
-            self._build_xml_article_map()
             xml_filled = self._sync_from_xml(synced_dfs)
-            logger.info(f"✅ Из XML заполнено: {xml_filled} ячеек")
+            xml_dims_filled = self._sync_dimensions_from_xml(synced_dfs)
+            xml_total = xml_filled + xml_dims_filled
+            logger.info(f"✅ Из XML заполнено: {xml_filled} ячеек (данные) + {xml_dims_filled} ячеек (габариты) = {xml_total} итого")
         else:
             logger.info("\n[i] XML данные отсутствуют — пропускаю заполнение из каталога")
 
@@ -2161,6 +2174,11 @@ class DataSynchronizer:
                 xml_field = match.get('column_4')
                 if not xml_field:
                     continue
+                # Габариты обрабатываются отдельно через _sync_dimensions_from_xml
+                if xml_field == '[XML] dimensions':
+                    logger.debug(f"   ⏭️ Пропуск '{xml_field}' — обработка в _sync_dimensions_from_xml")
+                    continue
+            
 
                 # Определяем какие МП-столбцы участвуют
                 mp_columns = {}
@@ -2272,4 +2290,163 @@ class DataSynchronizer:
                         )
 
         logger.info(f"\n📦 Итого из XML заполнено: {filled_count} ячеек")
+        return filled_count
+    
+    def _sync_dimensions_from_xml(self, dfs: Dict[str, pd.DataFrame]) -> int:
+        """
+        Заполняет габариты МП из XML-поля [XML] dimensions.
+
+        XML хранит габариты в формате "длина/ширина/высота" в сантиметрах.
+        Метод парсит строку и записывает значения в соответствующие столбцы МП
+        с конвертацией единиц:
+            - WB: раздельные столбцы в см (как есть)
+            - Ozon: раздельные столбцы в мм (см * 10)
+            - Яндекс: композитный формат "длина/ширина/высота" в см
+
+        Логика аналогична DimensionsSynchronizer.sync_dimensions(),
+        но источник данных — XML каталог, а не другой маркетплейс.
+
+        Args:
+            dfs: словарь DataFrame маркетплейсов
+
+        Returns:
+            Количество заполненных ячеек
+        """
+        if not self.xml_article_map:
+            return 0
+
+        filled_count = 0
+
+        # Определяем столбцы габаритов для каждого МП
+        resolved_wb_dims = getattr(DimensionsSynchronizer, '_resolved_wb_dims', None)
+
+        ozon_dims = {
+            'length': 'Длина упаковки, мм*',
+            'width': 'Ширина упаковки, мм*',
+            'height': 'Высота упаковки, мм*',
+        }
+
+        yandex_composite_col = 'Габариты с упаковкой, см'
+
+        logger.info("\n📐 Заполнение габаритов из XML ([XML] dimensions)...")
+
+        for article, xml_offer in self.xml_article_map.items():
+            raw_dimensions = xml_offer.get('[XML] dimensions', '')
+            if not raw_dimensions or not str(raw_dimensions).strip():
+                continue
+
+            # Парсим строку "69.5/68.0/138.0"
+            parsed = DimensionsSynchronizer.parse_composite_dimensions(
+                str(raw_dimensions).strip()
+            )
+            if not parsed:
+                logger.warning(
+                    f"   ⚠️ Не удалось распарсить XML dimensions "
+                    f"для [{article}]: '{raw_dimensions}'"
+                )
+                continue
+
+            length_cm = parsed['length']
+            width_cm = parsed['width']
+            height_cm = parsed['height']
+
+            # === WB: раздельные столбцы в см ===
+            if 'wildberries' in dfs and resolved_wb_dims:
+                df_wb = dfs['wildberries']
+                article_col = self.article_columns['wildberries']
+
+                if article_col in df_wb.columns:
+                    mask = df_wb[article_col].astype(str).str.strip() == article
+                    if mask.any():
+                        idx = df_wb[mask].index[0]
+
+                        wb_mapping = {
+                            'length': length_cm,
+                            'width': width_cm,
+                            'height': height_cm,
+                        }
+
+                        for dim_key, value_cm in wb_mapping.items():
+                            col_name = resolved_wb_dims[dim_key]
+                            if col_name not in df_wb.columns:
+                                continue
+
+                            current = df_wb.at[idx, col_name]
+                            if pd.notna(current) and str(current).strip():
+                                continue  # Уже заполнено
+
+                            df_wb.at[idx, col_name] = value_cm
+                            filled_count += 1
+                            self._log_change(
+                                'wildberries', article, col_name,
+                                value_cm, source_marketplace='xml'
+                            )
+                            logger.debug(
+                                f"   [XML→WB] {article}: {col_name}={value_cm} см"
+                            )
+
+            # === Ozon: раздельные столбцы в мм (см * 10) ===
+            if 'ozon' in dfs:
+                df_ozon = dfs['ozon']
+                article_col = self.article_columns['ozon']
+
+                if article_col in df_ozon.columns:
+                    mask = df_ozon[article_col].astype(str).str.strip() == article
+                    if mask.any():
+                        idx = df_ozon[mask].index[0]
+
+                        ozon_mapping = {
+                            'length': length_cm,
+                            'width': width_cm,
+                            'height': height_cm,
+                        }
+
+                        for dim_key, value_cm in ozon_mapping.items():
+                            col_name = ozon_dims[dim_key]
+                            if col_name not in df_ozon.columns:
+                                continue
+
+                            current = df_ozon.at[idx, col_name]
+                            if pd.notna(current) and str(current).strip():
+                                continue  # Уже заполнено
+
+                            value_mm = int(DimensionsSynchronizer.cm_to_mm(value_cm))
+                            df_ozon.at[idx, col_name] = value_mm
+                            filled_count += 1
+                            self._log_change(
+                                'ozon', article, col_name,
+                                value_mm, source_marketplace='xml'
+                            )
+                            logger.debug(
+                                f"   [XML→Ozon] {article}: {col_name}={value_mm} мм"
+                            )
+
+            # === Яндекс: композитный формат "длина/ширина/высота" в см ===
+            if 'yandex' in dfs:
+                df_yandex = dfs['yandex']
+                article_col = self.article_columns['yandex']
+
+                if (article_col in df_yandex.columns and
+                        yandex_composite_col in df_yandex.columns):
+                    mask = df_yandex[article_col].astype(str).str.strip() == article
+                    if mask.any():
+                        idx = df_yandex[mask].index[0]
+
+                        current = df_yandex.at[idx, yandex_composite_col]
+                        if not (pd.notna(current) and str(current).strip()):
+                            # Ячейка пустая — заполняем из XML
+                            composite = DimensionsSynchronizer.format_composite_dimensions(
+                                length_cm, width_cm, height_cm
+                            )
+                            df_yandex.at[idx, yandex_composite_col] = composite
+                            filled_count += 1
+                            self._log_change(
+                                'yandex', article, yandex_composite_col,
+                                composite, source_marketplace='xml'
+                            )
+                            logger.debug(
+                                f"   [XML→Яндекс] {article}: {yandex_composite_col}={composite}"
+                            )
+
+        logger.info(f"   📐 Из XML габаритов заполнено: {filled_count} ячеек")
         return filled_count

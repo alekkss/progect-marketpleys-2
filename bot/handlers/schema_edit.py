@@ -317,6 +317,26 @@ def _get_filter_keyboard(schema_type: str):
     return get_filter_matches_keyboard()
 
 
+def _build_columns_text(display_name: str, columns_list: list) -> str:
+    """
+    Формирует полный нумерованный список столбцов в одну строку.
+
+    Заменяет паттерн с отправкой по 30 строк, который вызывал
+    Telegram Flood control. Результат отправляется через _send_long_text().
+
+    Args:
+        display_name: отображаемое имя источника (WB, Ozon, Яндекс, XML)
+        columns_list: список названий столбцов
+
+    Returns:
+        Готовый текст с заголовком и нумерованным списком
+    """
+    text = f"📋 Доступные столбцы {display_name} ({len(columns_list)}):\n\n"
+    for i, col in enumerate(columns_list, 1):
+        text += f"{i}. {col}\n"
+    return text
+
+
 async def _send_long_text(message: types.Message, text: str, max_length: int = 3500):
     """Отправляет длинный текст, разбивая на части по границам строк."""
     if len(text) <= max_length:
@@ -906,16 +926,9 @@ async def column_selected_for_edit(message: types.Message, state: FSMContext):
         edit_display_name=display_name,
     )
 
-    # Показываем список
-    text = f"📋 Доступные столбцы {display_name} ({len(columns_list)}):\n\n"
-    for i, col in enumerate(columns_list, 1):
-        text += f"{i}. {col}\n"
-        if i % 30 == 0:
-            await message.answer(text)
-            text = ""
-
-    if text:
-        await message.answer(text)
+    # Показываем список через _send_long_text (защита от Flood control)
+    columns_text = _build_columns_text(display_name, columns_list)
+    await _send_long_text(message, columns_text)
 
     await message.answer(
         f"Введи название столбца из списка или номер (1-{len(columns_list)}):\n"
@@ -1146,14 +1159,9 @@ async def add_new_match_start(message: types.Message, state: FSMContext):
         await message.answer("❌ Не удалось загрузить столбцы WB")
         return
 
-    text = f"📋 Доступные столбцы WB ({len(wb_columns)}):\n\n"
-    for i, col in enumerate(wb_columns, 1):
-        text += f"{i}. {col}\n"
-        if i % 30 == 0:
-            await message.answer(text)
-            text = ""
-    if text:
-        await message.answer(text)
+    # Показываем список через _send_long_text (защита от Flood control)
+    columns_text = _build_columns_text('WB', wb_columns)
+    await _send_long_text(message, columns_text)
 
     await state.set_state(SchemaStates.selecting_wb_column)
     await message.answer(
@@ -1192,15 +1200,11 @@ async def wb_column_selected(message: types.Message, state: FSMContext):
 
     # Переходим к Ozon
     ozon_columns = available_columns.get('ozon', [])
+
+    # Показываем статус WB + список Ozon через _send_long_text
     text = f"{display_wb}\n\n"
-    text += f"📋 Доступные столбцы Ozon ({len(ozon_columns)}):\n\n"
-    for i, col in enumerate(ozon_columns, 1):
-        text += f"{i}. {col}\n"
-        if i % 30 == 0:
-            await message.answer(text)
-            text = ""
-    if text:
-        await message.answer(text)
+    text += _build_columns_text('Ozon', ozon_columns)
+    await _send_long_text(message, text)
 
     await state.set_state(SchemaStates.selecting_ozon_column)
     await message.answer(
@@ -1242,15 +1246,10 @@ async def ozon_column_selected(message: types.Message, state: FSMContext):
     yandex_columns = available_columns.get('yandex', [])
     display_wb = f"✅ WB: {wb_value}" if wb_value else "⏭ WB: пропущен (NA)"
 
+    # Показываем статус WB + Ozon + список Яндекс через _send_long_text
     text = f"{display_wb}\n{display_ozon}\n\n"
-    text += f"📋 Доступные столбцы Яндекс ({len(yandex_columns)}):\n\n"
-    for i, col in enumerate(yandex_columns, 1):
-        text += f"{i}. {col}\n"
-        if i % 30 == 0:
-            await message.answer(text)
-            text = ""
-    if text:
-        await message.answer(text)
+    text += _build_columns_text('Яндекс', yandex_columns)
+    await _send_long_text(message, text)
 
     ozon_value = data.get('new_match_ozon') if user_input.upper() != 'NA' else None
     skipped_count = (0 if wb_value else 1) + (0 if ozon_value else 1)
@@ -1297,20 +1296,14 @@ async def yandex_column_selected(message: types.Message, state: FSMContext):
     if schema_type == 'mvm':
         xml_columns = available_columns.get('xml', [])
         if xml_columns:
-            # Показываем список XML-полей
+            # Показываем статус МП + список XML через _send_long_text
             display_wb = f"✅ WB: {wb_value}" if wb_value else "⏭ WB: N/A"
             display_ozon = f"✅ Ozon: {ozon_value}" if ozon_value else "⏭ Ozon: N/A"
             display_yandex = f"✅ Яндекс: {yandex_value}" if yandex_value else "⏭ Яндекс: N/A"
 
             text = f"{display_wb}\n{display_ozon}\n{display_yandex}\n\n"
-            text += f"📋 Доступные поля XML ({len(xml_columns)}):\n\n"
-            for i, col in enumerate(xml_columns, 1):
-                text += f"{i}. {col}\n"
-                if i % 30 == 0:
-                    await message.answer(text)
-                    text = ""
-            if text:
-                await message.answer(text)
+            text += _build_columns_text('XML', xml_columns)
+            await _send_long_text(message, text)
 
             filled_count = (1 if wb_value else 0) + (1 if ozon_value else 0) + (1 if yandex_value else 0)
             hint = "💡 Введи NA чтобы пропустить" if filled_count >= 2 else "⚠️ XML обязателен (нужно минимум 2)"

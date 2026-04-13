@@ -1527,9 +1527,9 @@ class DataSynchronizer:
         
         # Форматируем согласно требованиям маркетплейса
         if marketplace == 'yandex':
-            return ', '.join(validated_parts)  # "Красный, Синий"
+            return ','.join(validated_parts)  # "Красный, Синий"
         elif marketplace == 'ozon':
-            return '; '.join(validated_parts)  # "Красный; Синий"
+            return ';'.join(validated_parts)  # "Красный; Синий"
         
         return validated_parts[0]  # На всякий случай
 

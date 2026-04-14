@@ -41,6 +41,10 @@ OFFER_FIXED_TAGS: List[str] = [
     'linked-parts-count',
 ]
 
+# Разделитель для тегов с множественными значениями (picture, video).
+# Яндекс.Маркет ожидает запятую в столбце "Ссылка на изображение *".
+MULTI_VALUE_SEPARATOR: str = ', '
+
 
 class XmlReader:
     """Класс для чтения полей офферов из XML файлов каталога."""
@@ -137,7 +141,7 @@ class XmlReader:
         фиксированные теги и param name, значения — текстовое содержимое.
 
         Для тегов с множественными значениями (picture, video) —
-        значения объединяются через точку с запятой.
+        значения объединяются через MULTI_VALUE_SEPARATOR (запятая).
 
         Args:
             file_path: путь к XML файлу
@@ -184,7 +188,7 @@ class XmlReader:
                             if el.text and el.text.strip()
                         ]
                         if values:
-                            offer_data[f"[XML] {tag_name}"] = '; '.join(values)
+                            offer_data[f"[XML] {tag_name}"] = MULTI_VALUE_SEPARATOR.join(values)
                 else:
                     element = offer.find(tag_name)
                     if element is not None and element.text:
@@ -396,7 +400,7 @@ class XmlReader:
                             if el.text and el.text.strip()
                         ]
                         if values:
-                            offer_data[f"[XML] {tag_name}"] = '; '.join(values)
+                            offer_data[f"[XML] {tag_name}"] = MULTI_VALUE_SEPARATOR.join(values)
                 else:
                     element = offer.find(tag_name)
                     if element is not None and element.text:

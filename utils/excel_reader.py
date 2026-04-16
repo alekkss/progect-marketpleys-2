@@ -86,13 +86,17 @@ class ExcelReader:
         Безопасно обрабатывает файлы с data validation (Ozon)
         и файлы с нестандартной структурой (Яндекс.Маркет).
 
+        Пустые столбцы (без заголовка) автоматически отфильтровываются:
+        сначала отбрасываются хвостовые пустые ячейки, затем удаляются
+        оставшиеся пустые столбцы из середины списка.
+
         Args:
             file_path: путь к файлу Excel
             sheet_name: название листа
             row_number: номер строки (1-индексация)
 
         Returns:
-            Список названий столбцов
+            Список названий столбцов (только непустые)
 
         Raises:
             FileNotFoundError: если файл не найден
@@ -129,13 +133,21 @@ class ExcelReader:
                 else:
                     row_values.append("")
 
-            non_empty_count = sum(1 for v in row_values if v)
+            raw_count = len(row_values)
+            non_empty_before = sum(1 for v in row_values if v)
+
+            # Фильтруем пустые столбцы
+            filtered = ExcelReader._filter_empty_columns(row_values)
+            filtered_out = raw_count - len(filtered)
+
             logger.info(
-                f"Прочитано столбцов: {len(row_values)}, "
-                f"непустых: {non_empty_count}"
+                f"Прочитано столбцов: {raw_count}, "
+                f"непустых: {non_empty_before}, "
+                f"после фильтрации: {len(filtered)} "
+                f"(отброшено пустых: {filtered_out})"
             )
 
-            return row_values
+            return filtered
 
         except KeyError:
             raise
@@ -158,6 +170,46 @@ class ExcelReader:
         finally:
             if workbook is not None:
                 workbook.close()
+
+    @staticmethod
+    def _filter_empty_columns(row_values: List[str]) -> List[str]:
+        """
+        Фильтрует пустые столбцы из списка заголовков.
+
+        Алгоритм:
+            1. Отбрасываются все хвостовые пустые значения (trailing empty).
+               Это основной источник мусора — Excel расширяет диапазон строки
+               далеко за пределы реальных данных.
+            2. Из оставшихся удаляются столбцы с пустым заголовком.
+               Пустые столбцы между непустыми тоже удаляются —
+               они не несут полезной информации для сопоставления.
+
+        Args:
+            row_values: исходный список значений из строки заголовков
+
+        Returns:
+            Отфильтрованный список (только непустые заголовки)
+        """
+        if not row_values:
+            return []
+
+        # Шаг 1: Отбрасываем хвостовые пустые значения
+        last_non_empty = -1
+        for i in range(len(row_values) - 1, -1, -1):
+            if row_values[i]:
+                last_non_empty = i
+                break
+
+        # Если все значения пустые — возвращаем пустой список
+        if last_non_empty == -1:
+            return []
+
+        trimmed = row_values[:last_non_empty + 1]
+
+        # Шаг 2: Убираем оставшиеся пустые заголовки из середины
+        result = [col for col in trimmed if col]
+
+        return result
 
     @staticmethod
     def find_column_fuzzy(columns: List[str], search_term: str) -> Optional[str]:

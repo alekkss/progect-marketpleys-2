@@ -1,631 +1,763 @@
 """
-Модуль для работы с базой данных SQLite
+Модуль для работы с базой данных PostgreSQL (asyncpg).
+
+Предоставляет асинхронный класс Database с connection pool
+для всех CRUD-операций. Миграции вынесены в отдельный модуль
+database/migrations.py.
 """
-import sqlite3
-from datetime import datetime
-from typing import Optional, Dict, List
+
 import json
-import os
-import sys
-from pathlib import Path
+from datetime import datetime, timezone
+from typing import Optional, Dict, List
+
+import asyncpg
+
 from utils.logger_config import setup_logger
-sys.path.insert(0, str(Path(__file__).parent.parent))
+
+logger = setup_logger('database')
+
 
 class Database:
+    """
+    Асинхронный класс для работы с PostgreSQL.
 
-    def migrate_add_role_column(self):
-        """
-        Миграция: добавляет колонку role в whitelist_users
-        """
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        try:
-            # Проверяем, есть ли уже колонка role
-            cursor.execute("PRAGMA table_info(whitelist_users)")
-            columns = [row[1] for row in cursor.fetchall()]
-            
-            if 'role' not in columns:
-                print("[MIGRATION] Добавление колонки 'role' в таблицу whitelist_users...")
-                
-                # Добавляем колонку role
-                cursor.execute("""
-                    ALTER TABLE whitelist_users 
-                    ADD COLUMN role TEXT NOT NULL DEFAULT 'user'
-                """)
-                
-                # Добавляем CHECK constraint (SQLite не поддерживает ADD CONSTRAINT, 
-                # поэтому пересоздаём таблицу)
-                cursor.execute("""
-                    CREATE TABLE whitelist_users_new (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        user_id INTEGER UNIQUE NOT NULL,
-                        role TEXT NOT NULL DEFAULT 'user',
-                        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        added_by INTEGER,
-                        notes TEXT,
-                        CHECK(role IN ('editor', 'user'))
-                    )
-                """)
-                
-                # Копируем данные из старой таблицы
-                cursor.execute("""
-                    INSERT INTO whitelist_users_new (id, user_id, role, added_at, added_by, notes)
-                    SELECT id, user_id, 'user', added_at, added_by, notes
-                    FROM whitelist_users
-                """)
-                
-                # Удаляем старую таблицу
-                cursor.execute("DROP TABLE whitelist_users")
-                
-                # Переименовываем новую
-                cursor.execute("ALTER TABLE whitelist_users_new RENAME TO whitelist_users")
-                
-                conn.commit()
-                print("[MIGRATION] ✅ Миграция завершена успешно!")
-            else:
-                print("[MIGRATION] Колонка 'role' уже существует, миграция не требуется.")
-        
-        except sqlite3.OperationalError as e:
-            print(f"[MIGRATION] ❌ Ошибка миграции: {e}")
-            conn.rollback()
-        finally:
-            conn.close()
+    Использует asyncpg connection pool для эффективного управления
+    соединениями. Каждый публичный метод получает соединение из пула,
+    выполняет запрос и автоматически возвращает соединение обратно.
 
-    def migrate_add_schema_type(self):
-        """
-        Миграция: добавляет колонку schema_type в таблицу schemas.
-        
-        Значения:
-            'standard' — стандартная схема (3 МП)
-            'mvm' — схема МВМ (3 МП + XML)
-        
-        Существующие схемы получают значение 'standard' по умолчанию.
-        """
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        try:
-            # Проверяем, есть ли уже колонка schema_type
-            cursor.execute("PRAGMA table_info(schemas)")
-            columns = [row[1] for row in cursor.fetchall()]
-            
-            if 'schema_type' not in columns:
-                print("[MIGRATION] Добавление колонки 'schema_type' в таблицу schemas...")
-                
-                cursor.execute("""
-                    ALTER TABLE schemas 
-                    ADD COLUMN schema_type TEXT NOT NULL DEFAULT 'standard'
-                """)
-                
-                conn.commit()
-                print("[MIGRATION] ✅ Колонка 'schema_type' добавлена в schemas!")
-            else:
-                print("[MIGRATION] Колонка 'schema_type' уже существует, миграция не требуется.")
-        
-        except sqlite3.OperationalError as e:
-            print(f"[MIGRATION] ❌ Ошибка миграции schema_type: {e}")
-            conn.rollback()
-        finally:
-            conn.close()
+    Жизненный цикл:
+        1. Создание экземпляра: db = Database(database_url)
+        2. Инициализация пула: await db.connect()
+        3. Использование: await db.add_user(...)
+        4. Завершение: await db.close()
+    """
 
-    def __init__(self, db_path: str = "marketplace_sync.db"):
-        self.db_path = db_path
-        self.init_db()
-        self.migrate_add_role_column()
-        self.migrate_add_schema_type()
-    
-    def get_connection(self):
-        return sqlite3.connect(self.db_path)
-    
-    def init_db(self):
-        """Инициализация базы данных"""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        # Таблица пользователей
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                last_name TEXT,
-                registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                total_processings INTEGER DEFAULT 0
+    def __init__(
+        self,
+        database_url: str,
+        pool_min_size: int = 2,
+        pool_max_size: int = 10,
+    ) -> None:
+        """
+        Инициализация параметров подключения.
+
+        Пул соединений НЕ создаётся в конструкторе — для этого
+        нужно вызвать await connect(). Это связано с тем, что
+        __init__ не может быть асинхронным.
+
+        Args:
+            database_url: Строка подключения PostgreSQL
+            pool_min_size: Минимальное количество соединений в пуле
+            pool_max_size: Максимальное количество соединений в пуле
+        """
+        self._database_url: str = database_url
+        self._pool_min_size: int = pool_min_size
+        self._pool_max_size: int = pool_max_size
+        self._pool: Optional[asyncpg.Pool] = None
+
+    async def connect(self) -> None:
+        """
+        Создаёт connection pool к PostgreSQL.
+
+        Вызывается один раз при старте приложения.
+        Если пул уже создан — повторный вызов безопасен.
+        """
+        if self._pool is not None:
+            logger.warning("Пул соединений уже создан, повторная инициализация пропущена.")
+            return
+
+        self._pool = await asyncpg.create_pool(
+            dsn=self._database_url,
+            min_size=self._pool_min_size,
+            max_size=self._pool_max_size,
+        )
+        logger.info(
+            "Пул соединений PostgreSQL создан (min=%d, max=%d).",
+            self._pool_min_size,
+            self._pool_max_size,
+        )
+
+    async def close(self) -> None:
+        """
+        Закрывает connection pool.
+
+        Вызывается при завершении работы приложения.
+        Ожидает завершения всех активных запросов.
+        """
+        if self._pool is not None:
+            await self._pool.close()
+            self._pool = None
+            logger.info("Пул соединений PostgreSQL закрыт.")
+
+    @property
+    def pool(self) -> asyncpg.Pool:
+        """
+        Возвращает пул соединений.
+
+        Raises:
+            RuntimeError: если пул не инициализирован
+        """
+        if self._pool is None:
+            raise RuntimeError(
+                "Пул соединений не инициализирован. "
+                "Вызовите await db.connect() перед использованием."
             )
-        """)
-        
-        # Таблица истории обработок
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS processing_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                started_at TIMESTAMP,
-                completed_at TIMESTAMP,
-                wb_products_count INTEGER DEFAULT 0,
-                ozon_products_count INTEGER DEFAULT 0,
-                yandex_products_count INTEGER DEFAULT 0,
-                synced_cells_count INTEGER DEFAULT 0,
-                status TEXT,
-                error_message TEXT,
-                FOREIGN KEY (user_id) REFERENCES users (user_id)
+        return self._pool
+
+    # =================================================================
+    # Пользователи
+    # =================================================================
+
+    async def add_user(
+        self,
+        user_id: int,
+        username: Optional[str] = None,
+        first_name: Optional[str] = None,
+        last_name: Optional[str] = None,
+    ) -> None:
+        """
+        Добавляет пользователя или обновляет его данные.
+
+        Использует INSERT ... ON CONFLICT DO UPDATE для атомарного
+        upsert. Поля registered_at и total_processings сохраняются
+        при обновлении.
+
+        Args:
+            user_id: Telegram user_id
+            username: Имя пользователя в Telegram
+            first_name: Имя
+            last_name: Фамилия
+        """
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO users (user_id, username, first_name, last_name)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    username = EXCLUDED.username,
+                    first_name = EXCLUDED.first_name,
+                    last_name = EXCLUDED.last_name
+                """,
+                user_id, username, first_name, last_name,
             )
-        """)
-        
-        # Таблица файлов
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS files (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                processing_id INTEGER,
-                marketplace TEXT,
-                original_filename TEXT,
-                file_path TEXT,
-                uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users (user_id),
-                FOREIGN KEY (processing_id) REFERENCES processing_history (id)
+
+    async def get_user_stats(self, user_id: int) -> Optional[Dict]:
+        """
+        Получает статистику пользователя.
+
+        Args:
+            user_id: Telegram user_id
+
+        Returns:
+            Словарь со статистикой или None если пользователь не найден
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    u.total_processings,
+                    u.registered_at,
+                    COUNT(CASE WHEN ph.status = 'completed' THEN 1 END) AS successful,
+                    COUNT(CASE WHEN ph.status = 'failed' THEN 1 END) AS failed,
+                    COALESCE(
+                        SUM(CASE WHEN ph.status = 'completed'
+                            THEN ph.synced_cells_count ELSE 0 END),
+                        0
+                    ) AS total_synced
+                FROM users u
+                LEFT JOIN processing_history ph ON u.user_id = ph.user_id
+                WHERE u.user_id = $1
+                GROUP BY u.user_id
+                """,
+                user_id,
             )
-        """)
-        
-        # НОВАЯ таблица для схем
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS schemas (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                schema_name TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                full_comparison_json TEXT,
-                FOREIGN KEY (user_id) REFERENCES users (user_id),
-                UNIQUE(user_id, schema_name)
+
+        if row is None:
+            return None
+
+        return {
+            'total_processings': row['total_processings'],
+            'registered_at': str(row['registered_at']) if row['registered_at'] else None,
+            'successful': row['successful'],
+            'failed': row['failed'],
+            'total_synced_cells': row['total_synced'],
+        }
+
+    async def get_user_history(
+        self,
+        user_id: int,
+        limit: int = 10,
+    ) -> List[Dict]:
+        """
+        Получает историю обработок пользователя.
+
+        Args:
+            user_id: Telegram user_id
+            limit: Максимальное количество записей
+
+        Returns:
+            Список словарей с историей обработок
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    id, started_at, completed_at,
+                    wb_products_count, ozon_products_count,
+                    yandex_products_count, synced_cells_count,
+                    status, error_message
+                FROM processing_history
+                WHERE user_id = $1
+                ORDER BY started_at DESC
+                LIMIT $2
+                """,
+                user_id, limit,
             )
-        """)
-        # Таблица настроек системы (для хранения admin_id и других настроек)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS system_settings (
-                setting_key TEXT PRIMARY KEY,
-                setting_value TEXT,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_by INTEGER
-            )
-        """)
-        
-        # Таблица белого списка пользователей (максимум 3 слота)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS whitelist_users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER UNIQUE NOT NULL,
-                role TEXT NOT NULL DEFAULT 'user',  -- 'editor' или 'user'
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                added_by INTEGER,
-                notes TEXT,
-                CHECK(role IN ('editor', 'user'))
-            )
-        """)
-        
-        # НОВАЯ таблица для сопоставлений столбцов в схеме
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS schema_matches (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                schema_id INTEGER,
-                wb_column TEXT,
-                ozon_column TEXT,
-                yandex_column TEXT,
-                confidence REAL,
-                is_mandatory BOOLEAN DEFAULT 0,
-                FOREIGN KEY (schema_id) REFERENCES schemas (id) ON DELETE CASCADE
-            )
-        """)
-        
-        conn.commit()
-        conn.close()
-    
-    def add_user(self, user_id: int, username: str = None, 
-                 first_name: str = None, last_name: str = None):
-        """Добавляет пользователя или обновляет его данные"""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            INSERT OR REPLACE INTO users (user_id, username, first_name, last_name, registered_at, total_processings)
-            VALUES (?, ?, ?, ?, COALESCE((SELECT registered_at FROM users WHERE user_id = ?), CURRENT_TIMESTAMP),
-                    COALESCE((SELECT total_processings FROM users WHERE user_id = ?), 0))
-        """, (user_id, username, first_name, last_name, user_id, user_id))
-        
-        conn.commit()
-        conn.close()
-    
-    def start_processing(self, user_id: int) -> int:
-        """Начинает новую обработку, возвращает processing_id"""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            INSERT INTO processing_history (user_id, started_at, status)
-            VALUES (?, ?, 'processing')
-        """, (user_id, datetime.now()))
-        
-        processing_id = cursor.lastrowid
-        conn.commit()
-        conn.close()
-        
-        return processing_id
-    
-    def complete_processing(self, processing_id: int, 
-                          wb_count: int, ozon_count: int, yandex_count: int,
-                          synced_cells: int):
-        """Завершает обработку успешно"""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            UPDATE processing_history
-            SET completed_at = ?,
-                wb_products_count = ?,
-                ozon_products_count = ?,
-                yandex_products_count = ?,
-                synced_cells_count = ?,
-                status = 'completed'
-            WHERE id = ?
-        """, (datetime.now(), wb_count, ozon_count, yandex_count, synced_cells, processing_id))
-        
-        # Увеличиваем счетчик обработок у пользователя
-        cursor.execute("""
-            UPDATE users
-            SET total_processings = total_processings + 1
-            WHERE user_id = (SELECT user_id FROM processing_history WHERE id = ?)
-        """, (processing_id,))
-        
-        conn.commit()
-        conn.close()
-    
-    def fail_processing(self, processing_id: int, error_message: str):
-        """Завершает обработку с ошибкой"""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            UPDATE processing_history
-            SET completed_at = ?,
-                status = 'failed',
-                error_message = ?
-            WHERE id = ?
-        """, (datetime.now(), error_message, processing_id))
-        
-        conn.commit()
-        conn.close()
-    
-    def add_file(self, user_id: int, processing_id: int, 
-                 marketplace: str, original_filename: str, file_path: str):
-        """Добавляет информацию о загруженном файле"""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            INSERT INTO files (user_id, processing_id, marketplace, original_filename, file_path)
-            VALUES (?, ?, ?, ?, ?)
-        """, (user_id, processing_id, marketplace, original_filename, file_path))
-        
-        conn.commit()
-        conn.close()
-    
-    def get_user_stats(self, user_id: int) -> Optional[Dict]:
-        """Получает статистику пользователя"""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT 
-                u.total_processings,
-                u.registered_at,
-                COUNT(CASE WHEN ph.status = 'completed' THEN 1 END) as successful,
-                COUNT(CASE WHEN ph.status = 'failed' THEN 1 END) as failed,
-                SUM(CASE WHEN ph.status = 'completed' THEN ph.synced_cells_count ELSE 0 END) as total_synced
-            FROM users u
-            LEFT JOIN processing_history ph ON u.user_id = ph.user_id
-            WHERE u.user_id = ?
-            GROUP BY u.user_id
-        """, (user_id,))
-        
-        row = cursor.fetchone()
-        conn.close()
-        
-        if row:
-            return {
-                'total_processings': row[0],
-                'registered_at': row[1],
-                'successful': row[2],
-                'failed': row[3],
-                'total_synced_cells': row[4] or 0
-            }
-        return None
-    
-    def get_user_history(self, user_id: int, limit: int = 10) -> List[Dict]:
-        """Получает историю обработок пользователя"""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT 
-                id,
-                started_at,
-                completed_at,
-                wb_products_count,
-                ozon_products_count,
-                yandex_products_count,
-                synced_cells_count,
-                status,
-                error_message
-            FROM processing_history
-            WHERE user_id = ?
-            ORDER BY started_at DESC
-            LIMIT ?
-        """, (user_id, limit))
-        
-        rows = cursor.fetchall()
-        conn.close()
-        
-        history = []
+
+        history: List[Dict] = []
         for row in rows:
             history.append({
-                'id': row[0],
-                'started_at': row[1],
-                'completed_at': row[2],
-                'wb_count': row[3],
-                'ozon_count': row[4],
-                'yandex_count': row[5],
-                'synced_cells': row[6],
-                'status': row[7],
-                'error': row[8]
+                'id': row['id'],
+                'started_at': str(row['started_at']) if row['started_at'] else None,
+                'completed_at': str(row['completed_at']) if row['completed_at'] else None,
+                'wb_count': row['wb_products_count'],
+                'ozon_count': row['ozon_products_count'],
+                'yandex_count': row['yandex_products_count'],
+                'synced_cells': row['synced_cells_count'],
+                'status': row['status'],
+                'error': row['error_message'],
             })
-        
+
         return history
-    
-    def create_schema(self, user_id: int, schema_name: str, schema_type: str = 'standard') -> int:
+
+    # =================================================================
+    # Обработки (processing)
+    # =================================================================
+
+    async def start_processing(self, user_id: int) -> int:
         """
-        Создает новую схему
-        
+        Начинает новую обработку.
+
+        Args:
+            user_id: Telegram user_id
+
+        Returns:
+            ID созданной записи обработки
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO processing_history (user_id, started_at, status)
+                VALUES ($1, $2, 'processing')
+                RETURNING id
+                """,
+                user_id, datetime.now(timezone.utc),
+            )
+            return row['id']
+
+    async def complete_processing(
+        self,
+        processing_id: int,
+        wb_count: int,
+        ozon_count: int,
+        yandex_count: int,
+        synced_cells: int,
+    ) -> None:
+        """
+        Завершает обработку успешно.
+
+        Обновляет запись обработки и увеличивает счётчик
+        total_processings у пользователя в одной транзакции.
+
+        Args:
+            processing_id: ID обработки
+            wb_count: Количество товаров WB
+            ozon_count: Количество товаров Ozon
+            yandex_count: Количество товаров Яндекс
+            synced_cells: Количество синхронизированных ячеек
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    UPDATE processing_history
+                    SET completed_at = $1,
+                        wb_products_count = $2,
+                        ozon_products_count = $3,
+                        yandex_products_count = $4,
+                        synced_cells_count = $5,
+                        status = 'completed'
+                    WHERE id = $6
+                    """,
+                    datetime.now(timezone.utc),
+                    wb_count, ozon_count, yandex_count,
+                    synced_cells, processing_id,
+                )
+
+                await conn.execute(
+                    """
+                    UPDATE users
+                    SET total_processings = total_processings + 1
+                    WHERE user_id = (
+                        SELECT user_id FROM processing_history WHERE id = $1
+                    )
+                    """,
+                    processing_id,
+                )
+
+    async def fail_processing(
+        self,
+        processing_id: int,
+        error_message: str,
+    ) -> None:
+        """
+        Завершает обработку с ошибкой.
+
+        Args:
+            processing_id: ID обработки
+            error_message: Текст ошибки
+        """
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE processing_history
+                SET completed_at = $1,
+                    status = 'failed',
+                    error_message = $2
+                WHERE id = $3
+                """,
+                datetime.now(timezone.utc),
+                error_message, processing_id,
+            )
+
+    # =================================================================
+    # Файлы
+    # =================================================================
+
+    async def add_file(
+        self,
+        user_id: int,
+        processing_id: int,
+        marketplace: str,
+        original_filename: str,
+        file_path: str,
+    ) -> None:
+        """
+        Добавляет информацию о загруженном файле.
+
+        Args:
+            user_id: Telegram user_id
+            processing_id: ID обработки
+            marketplace: Название маркетплейса
+            original_filename: Оригинальное имя файла
+            file_path: Путь к сохранённому файлу
+        """
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO files
+                    (user_id, processing_id, marketplace,
+                     original_filename, file_path)
+                VALUES ($1, $2, $3, $4, $5)
+                """,
+                user_id, processing_id, marketplace,
+                original_filename, file_path,
+            )
+
+    # =================================================================
+    # Схемы сопоставлений
+    # =================================================================
+
+    async def create_schema(
+        self,
+        user_id: int,
+        schema_name: str,
+        schema_type: str = 'standard',
+    ) -> Optional[int]:
+        """
+        Создаёт новую схему.
+
         Args:
             user_id: ID пользователя
-            schema_name: название схемы
-            schema_type: тип схемы ('standard' или 'mvm')
-        
-        Returns:
-            int: ID созданной схемы или None если уже существует
-        """
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute("""
-                INSERT INTO schemas (user_id, schema_name, schema_type)
-                VALUES (?, ?, ?)
-            """, (user_id, schema_name, schema_type))
-            
-            schema_id = cursor.lastrowid
-            conn.commit()
-            return schema_id
-        except sqlite3.IntegrityError:
-            return None  # Схема с таким именем уже существует
-        finally:
-            conn.close()
+            schema_name: Название схемы
+            schema_type: Тип схемы ('standard' или 'mvm')
 
-    def get_user_schemas(self, user_id: int, all_schemas: bool = False) -> List[Dict]:
+        Returns:
+            ID созданной схемы или None если имя уже занято
         """
-        Получает список схем пользователя
-        
+        async with self.pool.acquire() as conn:
+            try:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO schemas (user_id, schema_name, schema_type)
+                    VALUES ($1, $2, $3)
+                    RETURNING id
+                    """,
+                    user_id, schema_name, schema_type,
+                )
+                return row['id']
+            except asyncpg.UniqueViolationError:
+                return None
+
+    async def get_user_schemas(
+        self,
+        user_id: int,
+        all_schemas: bool = False,
+    ) -> List[Dict]:
+        """
+        Получает список схем пользователя.
+
         Args:
             user_id: ID пользователя (для фильтрации СВОИХ схем)
-            all_schemas: Если True - попытка получить ВСЕ схемы 
-                        (но проверка прав происходит в коде выше!)
-        
+            all_schemas: Если True — все схемы (для владельца/админа/редактора).
+                         Проверка прав должна быть сделана ДО вызова!
+
         Returns:
-            List[Dict]: Список схем
+            Список словарей с информацией о схемах
         """
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        if all_schemas:
-            # ВСЕ схемы (для владельца/админа/редактора)
-            # Проверка прав должна быть сделана ДО вызова этого метода!
-            cursor.execute("""
-                SELECT 
-                    s.id, s.schema_name, s.created_at, s.updated_at,
-                    s.user_id, u.username, u.first_name,
-                    (SELECT COUNT(*) FROM schema_matches WHERE schema_id = s.id) as matches_count,
-                    s.schema_type
-                FROM schemas s
-                LEFT JOIN users u ON s.user_id = u.user_id
-                ORDER BY s.updated_at DESC
-            """)
-            rows = cursor.fetchall()
-            conn.close()
-            
-            schemas = []
-            for row in rows:
-                owner_display = row[6] if row[6] else f"ID: {row[4]}"
-                schemas.append({
-                    'id': row[0],
-                    'name': row[1],
-                    'created_at': row[2],
-                    'updated_at': row[3],
-                    'owner_id': row[4],
-                    'owner_name': owner_display,
-                    'matches_count': row[7],
-                    'schema_type': row[8] if row[8] else 'standard'
-                })
-            return schemas
-        else:
-            # Только свои схемы (для всех пользователей, включая обычных)
-            cursor.execute("""
-                SELECT id, schema_name, created_at, updated_at,
-                    (SELECT COUNT(*) FROM schema_matches WHERE schema_id = schemas.id) as matches_count,
-                    schema_type
+        async with self.pool.acquire() as conn:
+            if all_schemas:
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        s.id, s.schema_name, s.created_at, s.updated_at,
+                        s.user_id, u.username, u.first_name,
+                        (SELECT COUNT(*) FROM schema_matches
+                         WHERE schema_id = s.id) AS matches_count,
+                        s.schema_type
+                    FROM schemas s
+                    LEFT JOIN users u ON s.user_id = u.user_id
+                    ORDER BY s.updated_at DESC
+                    """,
+                )
+
+                schemas: List[Dict] = []
+                for row in rows:
+                    owner_display = (
+                        row['first_name']
+                        if row['first_name']
+                        else f"ID: {row['user_id']}"
+                    )
+                    schemas.append({
+                        'id': row['id'],
+                        'name': row['schema_name'],
+                        'created_at': str(row['created_at']) if row['created_at'] else None,
+                        'updated_at': str(row['updated_at']) if row['updated_at'] else None,
+                        'owner_id': row['user_id'],
+                        'owner_name': owner_display,
+                        'matches_count': row['matches_count'],
+                        'schema_type': row['schema_type'] or 'standard',
+                    })
+                return schemas
+
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        id, schema_name, created_at, updated_at,
+                        (SELECT COUNT(*) FROM schema_matches
+                         WHERE schema_id = schemas.id) AS matches_count,
+                        schema_type
+                    FROM schemas
+                    WHERE user_id = $1
+                    ORDER BY updated_at DESC
+                    """,
+                    user_id,
+                )
+
+                schemas = []
+                for row in rows:
+                    schemas.append({
+                        'id': row['id'],
+                        'name': row['schema_name'],
+                        'created_at': str(row['created_at']) if row['created_at'] else None,
+                        'updated_at': str(row['updated_at']) if row['updated_at'] else None,
+                        'matches_count': row['matches_count'],
+                        'schema_type': row['schema_type'] or 'standard',
+                    })
+                return schemas
+
+    async def get_schema(
+        self,
+        user_id: int,
+        schema_name: str,
+    ) -> Optional[Dict]:
+        """
+        Получает схему по имени для конкретного пользователя.
+
+        Args:
+            user_id: Telegram user_id
+            schema_name: Название схемы
+
+        Returns:
+            Словарь с информацией о схеме или None
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, schema_name, created_at, updated_at, schema_type
                 FROM schemas
-                WHERE user_id = ?
-                ORDER BY updated_at DESC
-            """, (user_id,))
-            rows = cursor.fetchall()
-            conn.close()
-            
-            schemas = []
-            for row in rows:
-                schemas.append({
-                    'id': row[0],
-                    'name': row[1],
-                    'created_at': row[2],
-                    'updated_at': row[3],
-                    'matches_count': row[4],
-                    'schema_type': row[5] if row[5] else 'standard'
-                })
-            return schemas
-    
-    def get_schema_by_name_global(self, schema_name: str) -> Optional[Dict]:
+                WHERE user_id = $1 AND schema_name = $2
+                """,
+                user_id, schema_name,
+            )
+
+        if row is None:
+            return None
+
+        return {
+            'id': row['id'],
+            'name': row['schema_name'],
+            'created_at': str(row['created_at']) if row['created_at'] else None,
+            'updated_at': str(row['updated_at']) if row['updated_at'] else None,
+            'schema_type': row['schema_type'] or 'standard',
+        }
+
+    async def get_schema_by_name_global(
+        self,
+        schema_name: str,
+    ) -> Optional[Dict]:
         """
-        Получает схему по имени (глобальный поиск, для админов)
-        
+        Получает схему по имени (глобальный поиск, для админов).
+
         Args:
             schema_name: Имя схемы
-        
+
         Returns:
-            Optional[Dict]: Информация о схеме или None
+            Словарь с информацией о схеме или None
         """
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT id, schema_name, user_id, created_at, updated_at, schema_type
-            FROM schemas
-            WHERE schema_name = ?
-        """, (schema_name,))
-        
-        row = cursor.fetchone()
-        conn.close()
-        
-        if row:
-            return {
-                'id': row[0],
-                'name': row[1],
-                'owner_id': row[2],
-                'created_at': row[3],
-                'updated_at': row[4],
-                'schema_type': row[5] if row[5] else 'standard'
-            }
-        
-        return None
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, schema_name, user_id, created_at,
+                       updated_at, schema_type
+                FROM schemas
+                WHERE schema_name = $1
+                """,
+                schema_name,
+            )
 
-    def get_schema(self, user_id: int, schema_name: str) -> Optional[Dict]:
-        """Получает схему по имени"""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT id, schema_name, created_at, updated_at, schema_type
-            FROM schemas
-            WHERE user_id = ? AND schema_name = ?
-        """, (user_id, schema_name))
-        
-        row = cursor.fetchone()
-        conn.close()
-        
-        if row:
-            return {
-                'id': row[0],
-                'name': row[1],
-                'created_at': row[2],
-                'updated_at': row[3],
-                'schema_type': row[4] if row[4] else 'standard'
-            }
-        return None
+        if row is None:
+            return None
 
-    def delete_schema(self, user_id: int, schema_name: str) -> bool:
-        """Удаляет схему"""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            DELETE FROM schemas
-            WHERE user_id = ? AND schema_name = ?
-        """, (user_id, schema_name))
-        
-        deleted = cursor.rowcount > 0
-        conn.commit()
-        conn.close()
-        
-        return deleted
+        return {
+            'id': row['id'],
+            'name': row['schema_name'],
+            'owner_id': row['user_id'],
+            'created_at': str(row['created_at']) if row['created_at'] else None,
+            'updated_at': str(row['updated_at']) if row['updated_at'] else None,
+            'schema_type': row['schema_type'] or 'standard',
+        }
 
-    def save_schema_matches(self, schema_id: int, comparison_result: Dict):
-        """Сохраняет все совпадения (>= 85%)"""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        # Удаляем старые записи
-        cursor.execute("DELETE FROM schema_matches WHERE schema_id = ?", (schema_id,))
-        
-        saved_count = 0
-        skipped_count = 0
-        
-        # Сохраняем только matches_all_three в старую таблицу
-        for match in comparison_result.get('matches_all_three', []):
-            confidence = match.get('confidence', 0)
-            if confidence >= 0.85:
-                cursor.execute(
-                    "INSERT INTO schema_matches (schema_id, wb_column, ozon_column, yandex_column, confidence, is_mandatory) VALUES (?, ?, ?, ?, ?, ?)",
-                    (schema_id, match.get('column_1'), match.get('column_2'), match.get('column_3'), confidence, match.get('mandatory', False))
+    async def delete_schema(
+        self,
+        user_id: int,
+        schema_name: str,
+    ) -> bool:
+        """
+        Удаляет схему пользователя.
+
+        Args:
+            user_id: Telegram user_id
+            schema_name: Название схемы
+
+        Returns:
+            True если схема была удалена
+        """
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM schemas
+                WHERE user_id = $1 AND schema_name = $2
+                """,
+                user_id, schema_name,
+            )
+            # asyncpg возвращает строку вида 'DELETE N'
+            return result == 'DELETE 1'
+
+    async def get_schema_type(self, schema_id: int) -> str:
+        """
+        Получает тип схемы по её ID.
+
+        Args:
+            schema_id: ID схемы
+
+        Returns:
+            'standard' или 'mvm'
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT schema_type FROM schemas WHERE id = $1",
+                schema_id,
+            )
+
+        if row and row['schema_type']:
+            return row['schema_type']
+        return 'standard'
+
+    async def get_schema_by_name_global(
+        self,
+        schema_name: str,
+    ) -> Optional[Dict]:
+        """
+        Получает схему по имени среди всех пользователей (глобальный поиск).
+
+        Используется владельцем, администратором и редактором для работы
+        с чужими схемами. Проверка прав доступа должна быть выполнена
+        ДО вызова этого метода.
+
+        Args:
+            schema_name: Название схемы для поиска
+
+        Returns:
+            Словарь с информацией о схеме или None если не найдена
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, user_id, schema_name, schema_type,
+                       created_at, updated_at
+                FROM schemas
+                WHERE schema_name = $1
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                schema_name,
+            )
+
+        if row is None:
+            return None
+
+        return {
+            'id': row['id'],
+            'owner_id': row['user_id'],
+            'name': row['schema_name'],
+            'schema_type': row['schema_type'] or 'standard',
+            'created_at': str(row['created_at']) if row['created_at'] else None,
+            'updated_at': str(row['updated_at']) if row['updated_at'] else None,
+        }
+
+    # =================================================================
+    # Сопоставления схем (matches)
+    # =================================================================
+
+    async def save_schema_matches(
+        self,
+        schema_id: int,
+        comparison_result: Dict,
+    ) -> None:
+        """
+        Сохраняет все совпадения (>= 85%) и полный JSON результата.
+
+        Выполняется в одной транзакции: удаление старых записей,
+        вставка новых, обновление JSON в таблице schemas.
+
+        Args:
+            schema_id: ID схемы
+            comparison_result: Полный результат AI-сопоставления
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                # Удаляем старые записи
+                await conn.execute(
+                    "DELETE FROM schema_matches WHERE schema_id = $1",
+                    schema_id,
                 )
-                saved_count += 1
-            else:
-                skipped_count += 1
-        
-        # ✅ НОВОЕ: Сохраняем ВЕСЬ comparison_result как JSON
-        full_json = json.dumps(comparison_result, ensure_ascii=False)
-        cursor.execute(
-            "UPDATE schemas SET full_comparison_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (full_json, schema_id)
-        )
-        
-        cursor.execute("UPDATE schemas SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (schema_id,))
-        conn.commit()
-        conn.close()
-        
-        print(f"[DB] Сохранено совпадений: {saved_count}, пропущено (confidence < 85%): {skipped_count}")
 
-    def get_schema_matches(self, schema_id: int) -> Dict:
-        """Получает совпадения для схемы"""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        # ✅ НОВОЕ: Пробуем загрузить полный JSON
-        cursor.execute("SELECT full_comparison_json FROM schemas WHERE id = ?", (schema_id,))
-        row = cursor.fetchone()
-        
-        if row and row[0]:
-            # Есть полный JSON - возвращаем его
-            conn.close()
-            try:
-                return json.loads(row[0])
-            except json.JSONDecodeError:
-                print(f"[DB] Ошибка парсинга JSON для схемы {schema_id}")
-        
-        # Старая логика (для схем созданных ДО обновления)
-        cursor.execute(
-            "SELECT wb_column, ozon_column, yandex_column, confidence, is_mandatory FROM schema_matches WHERE schema_id = ?",
-            (schema_id,)
+                saved_count = 0
+                skipped_count = 0
+
+                # Сохраняем matches_all_three в legacy-таблицу
+                for match in comparison_result.get('matches_all_three', []):
+                    confidence = match.get('confidence', 0)
+                    if confidence >= 0.85:
+                        await conn.execute(
+                            """
+                            INSERT INTO schema_matches
+                                (schema_id, wb_column, ozon_column,
+                                 yandex_column, confidence, is_mandatory)
+                            VALUES ($1, $2, $3, $4, $5, $6)
+                            """,
+                            schema_id,
+                            match.get('column_1'),
+                            match.get('column_2'),
+                            match.get('column_3'),
+                            confidence,
+                            match.get('mandatory', False),
+                        )
+                        saved_count += 1
+                    else:
+                        skipped_count += 1
+
+                # Сохраняем полный JSON в schemas
+                full_json = json.dumps(
+                    comparison_result, ensure_ascii=False,
+                )
+                await conn.execute(
+                    """
+                    UPDATE schemas
+                    SET full_comparison_json = $1,
+                        updated_at = NOW()
+                    WHERE id = $2
+                    """,
+                    full_json, schema_id,
+                )
+
+        logger.info(
+            "Схема %d: сохранено совпадений: %d, пропущено (confidence < 85%%): %d",
+            schema_id, saved_count, skipped_count,
         )
-        rows = cursor.fetchall()
-        conn.close()
-        
-        matches = []
-        for row in rows:
+
+    async def get_schema_matches(self, schema_id: int) -> Dict:
+        """
+        Получает совпадения для схемы.
+
+        Сначала пробует загрузить полный JSON (новый формат),
+        при неудаче — fallback на legacy-таблицу schema_matches.
+
+        Args:
+            schema_id: ID схемы
+
+        Returns:
+            Словарь с группами сопоставлений
+        """
+        async with self.pool.acquire() as conn:
+            # Пробуем загрузить полный JSON
+            row = await conn.fetchrow(
+                "SELECT full_comparison_json FROM schemas WHERE id = $1",
+                schema_id,
+            )
+
+            if row and row['full_comparison_json']:
+                try:
+                    return json.loads(row['full_comparison_json'])
+                except json.JSONDecodeError:
+                    logger.error(
+                        "Ошибка парсинга JSON для схемы %d",
+                        schema_id,
+                    )
+
+            # Fallback: legacy-таблица schema_matches
+            rows = await conn.fetch(
+                """
+                SELECT wb_column, ozon_column, yandex_column,
+                       confidence, is_mandatory
+                FROM schema_matches
+                WHERE schema_id = $1
+                """,
+                schema_id,
+            )
+
+        matches: List[Dict] = []
+        for r in rows:
             matches.append({
-                'column_1': row[0],
-                'column_2': row[1],
-                'column_3': row[2],
-                'confidence': row[3],
-                'mandatory': row[4]
+                'column_1': r['wb_column'],
+                'column_2': r['ozon_column'],
+                'column_3': r['yandex_column'],
+                'confidence': r['confidence'],
+                'mandatory': r['is_mandatory'],
             })
-        
-        # Возвращаем пустые массивы для парных (старые схемы)
+
         return {
             'matches_all_three': matches,
             'matches_1_2': [],
@@ -633,37 +765,12 @@ class Database:
             'matches_2_3': [],
             'only_in_first': [],
             'only_in_second': [],
-            'only_in_third': []
+            'only_in_third': [],
         }
 
-    def get_schema_type(self, schema_id: int) -> str:
-        """
-        Получает тип схемы по её ID.
-        
-        Args:
-            schema_id: ID схемы
-        
-        Returns:
-            str: 'standard' или 'mvm'
-        """
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("SELECT schema_type FROM schemas WHERE id = ?", (schema_id,))
-        row = cursor.fetchone()
-        conn.close()
-        
-        if row and row[0]:
-            return row[0]
-        return 'standard'
-    
-    def get_schema_category_ids(self, schema_id: int) -> list:
+    async def get_schema_category_ids(self, schema_id: int) -> list:
         """
         Извлекает список выбранных category_id из JSON схемы.
-
-        Категории хранятся в full_comparison_json под ключом
-        'selected_category_ids'. Если ключ отсутствует (старая схема
-        или стандартная) — возвращает пустой список.
 
         Args:
             schema_id: ID схемы
@@ -671,21 +778,17 @@ class Database:
         Returns:
             Список строковых ID категорий, например ['16530', '16531']
         """
-        conn = self.get_connection()
-        cursor = conn.cursor()
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT full_comparison_json FROM schemas WHERE id = $1",
+                schema_id,
+            )
 
-        cursor.execute(
-            "SELECT full_comparison_json FROM schemas WHERE id = ?",
-            (schema_id,)
-        )
-        row = cursor.fetchone()
-        conn.close()
-
-        if not row or not row[0]:
+        if not row or not row['full_comparison_json']:
             return []
 
         try:
-            data = json.loads(row[0])
+            data = json.loads(row['full_comparison_json'])
             category_ids = data.get('selected_category_ids', [])
             if isinstance(category_ids, list):
                 return category_ids
@@ -693,269 +796,276 @@ class Database:
         except (json.JSONDecodeError, TypeError):
             return []
 
-    def update_schema_matches(self, schema_id: int, new_comparison_result: Dict):
-        """Обновляет схему, добавляя новые совпадения"""
-        # Получаем существующие совпадения
-        existing_matches = self.get_schema_matches(schema_id)
-        
-        # Создаем set существующих комбинаций столбцов
-        existing_set = set()
-        for match in existing_matches['matches_all_three']:
+    async def update_schema_matches(
+        self,
+        schema_id: int,
+        new_comparison_result: Dict,
+    ) -> int:
+        """
+        Обновляет схему, добавляя новые совпадения.
+
+        Args:
+            schema_id: ID схемы
+            new_comparison_result: Новый результат AI-сопоставления
+
+        Returns:
+            Количество добавленных совпадений
+        """
+        existing_matches = await self.get_schema_matches(schema_id)
+
+        existing_set: set = set()
+        for match in existing_matches.get('matches_all_three', []):
             key = (match['column_1'], match['column_2'], match['column_3'])
             existing_set.add(key)
-        
-        # Добавляем новые совпадения
+
         new_count = 0
         for match in new_comparison_result.get('matches_all_three', []):
-            key = (match.get('column_1'), match.get('column_2'), match.get('column_3'))
+            key = (
+                match.get('column_1'),
+                match.get('column_2'),
+                match.get('column_3'),
+            )
             if key not in existing_set:
                 existing_matches['matches_all_three'].append(match)
                 new_count += 1
-        
-        # Сохраняем обновленную схему
+
         if new_count > 0:
-            self.save_schema_matches(schema_id, existing_matches)
-        
+            await self.save_schema_matches(schema_id, existing_matches)
+
         return new_count
-    
-    def get_admin_user_id(self) -> Optional[int]:
-        """Получает ID администратора из БД"""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT setting_value 
-            FROM system_settings 
-            WHERE setting_key = 'admin_user_id'
-        """)
-        row = cursor.fetchone()
-        conn.close()
-        
-        if row and row[0]:
+
+    # =================================================================
+    # Системные настройки (admin)
+    # =================================================================
+
+    async def get_admin_user_id(self) -> Optional[int]:
+        """
+        Получает ID администратора из БД.
+
+        Returns:
+            Telegram user_id администратора или None
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT setting_value
+                FROM system_settings
+                WHERE setting_key = 'admin_user_id'
+                """,
+            )
+
+        if row and row['setting_value']:
             try:
-                return int(row[0])
+                return int(row['setting_value'])
             except (TypeError, ValueError):
                 return None
         return None
 
-
-    def set_admin_user_id(self, admin_id: int, updated_by: int) -> bool:
+    async def set_admin_user_id(
+        self,
+        admin_id: int,
+        updated_by: int,
+    ) -> bool:
         """
-        Устанавливает ID администратора
-        
+        Устанавливает ID администратора.
+
         Args:
             admin_id: Telegram user_id нового администратора
-            updated_by: Telegram user_id владельца, который делает изменение
-        
+            updated_by: Telegram user_id владельца
+
         Returns:
-            bool: True если успешно
+            True если успешно
         """
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            INSERT OR REPLACE INTO system_settings (setting_key, setting_value, updated_at, updated_by)
-            VALUES ('admin_user_id', ?, CURRENT_TIMESTAMP, ?)
-        """, (str(admin_id), updated_by))
-        
-        conn.commit()
-        conn.close()
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO system_settings
+                    (setting_key, setting_value, updated_at, updated_by)
+                VALUES ('admin_user_id', $1, NOW(), $2)
+                ON CONFLICT (setting_key) DO UPDATE SET
+                    setting_value = EXCLUDED.setting_value,
+                    updated_at = NOW(),
+                    updated_by = EXCLUDED.updated_by
+                """,
+                str(admin_id), updated_by,
+            )
         return True
 
-
-    def remove_admin_user_id(self, updated_by: int) -> bool:
+    async def remove_admin_user_id(self, updated_by: int) -> bool:
         """
-        Удаляет администратора (сброс)
-        
+        Удаляет администратора (сброс).
+
         Args:
             updated_by: Telegram user_id владельца
-        
+
         Returns:
-            bool: True если успешно
+            True если запись была удалена
         """
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            DELETE FROM system_settings 
-            WHERE setting_key = 'admin_user_id'
-        """)
-        
-        deleted = cursor.rowcount > 0
-        conn.commit()
-        conn.close()
-        return deleted
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM system_settings
+                WHERE setting_key = 'admin_user_id'
+                """,
+            )
+            return result == 'DELETE 1'
 
-    def get_whitelist_users(self) -> List[int]:
-        """Получает список ID пользователей из белого списка"""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT user_id 
-            FROM whitelist_users 
-            ORDER BY added_at ASC
-        """)
-        rows = cursor.fetchall()
-        conn.close()
-        return [row[0] for row in rows]
+    # =================================================================
+    # Белый список (whitelist)
+    # =================================================================
 
-
-    def get_whitelist_details(self) -> list:
+    async def get_whitelist_users(self) -> List[int]:
         """
-        Получает детальную информацию о пользователях в whitelist
-        
+        Получает список ID пользователей из белого списка.
+
         Returns:
-            list: Список словарей с информацией о каждом пользователе
+            Список Telegram user_id
         """
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT user_id, role, added_at, added_by, notes
-            FROM whitelist_users
-            ORDER BY 
-                CASE role 
-                    WHEN 'editor' THEN 1 
-                    WHEN 'user' THEN 2 
-                END,
-                added_at ASC
-        """)
-        
-        rows = cursor.fetchall()
-        conn.close()
-        
-        result = []
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT user_id
+                FROM whitelist_users
+                ORDER BY added_at ASC
+                """,
+            )
+        return [row['user_id'] for row in rows]
+
+    async def get_whitelist_details(self) -> List[Dict]:
+        """
+        Получает детальную информацию о пользователях в whitelist.
+
+        Returns:
+            Список словарей с информацией о каждом пользователе
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT user_id, role, added_at, added_by, notes
+                FROM whitelist_users
+                ORDER BY
+                    CASE role
+                        WHEN 'editor' THEN 1
+                        WHEN 'user' THEN 2
+                    END,
+                    added_at ASC
+                """,
+            )
+
+        result: List[Dict] = []
         for row in rows:
             result.append({
-                'user_id': row[0],
-                'role': row[1],
-                'added_at': row[2],
-                'added_by': row[3],
-                'notes': row[4]
+                'user_id': row['user_id'],
+                'role': row['role'],
+                'added_at': str(row['added_at']) if row['added_at'] else None,
+                'added_by': row['added_by'],
+                'notes': row['notes'],
             })
-        
         return result
 
-
-    def add_whitelist_user(self, user_id: int, added_by: int, role: str = 'user', notes: str = None) -> bool:
+    async def add_whitelist_user(
+        self,
+        user_id: int,
+        added_by: int,
+        role: str = 'user',
+        notes: Optional[str] = None,
+    ) -> bool:
         """
-        Добавляет пользователя в whitelist с указанием роли
-        
+        Добавляет пользователя в whitelist с указанием роли.
+
         Args:
             user_id: Telegram ID пользователя
             added_by: Telegram ID того, кто добавляет
             role: Роль ('editor' или 'user')
             notes: Опциональная заметка
-        
+
         Returns:
-            bool: True если успешно, False если лимит достигнут или ошибка
+            True если успешно, False если дубликат или невалидная роль
         """
-        # Валидация роли
         if role not in ('editor', 'user'):
             return False
-        
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        try:
-            # Добавляем пользователя (без проверки лимитов)
-            cursor.execute("""
-                INSERT INTO whitelist_users (user_id, role, added_by, notes)
-                VALUES (?, ?, ?, ?)
-            """, (user_id, role, added_by, notes))
-            
-            conn.commit()
-            conn.close()
-            return True
-        
-        except sqlite3.IntegrityError:
-            conn.close()
-            return False  # Дубликат user_id
 
+        async with self.pool.acquire() as conn:
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO whitelist_users
+                        (user_id, role, added_by, notes)
+                    VALUES ($1, $2, $3, $4)
+                    """,
+                    user_id, role, added_by, notes,
+                )
+                return True
+            except asyncpg.UniqueViolationError:
+                return False
 
-    def remove_whitelist_user(self, user_id: int) -> bool:
+    async def remove_whitelist_user(self, user_id: int) -> bool:
         """
-        Удаляет пользователя из белого списка
-        
+        Удаляет пользователя из белого списка.
+
         Args:
             user_id: Telegram user_id удаляемого пользователя
-        
+
         Returns:
-            bool: True если успешно удалён
+            True если успешно удалён
         """
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            DELETE FROM whitelist_users 
-            WHERE user_id = ?
-        """, (user_id,))
-        
-        deleted = cursor.rowcount > 0
-        conn.commit()
-        conn.close()
-        return deleted
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM whitelist_users WHERE user_id = $1",
+                user_id,
+            )
+            return result == 'DELETE 1'
 
-
-    def get_whitelist_count(self) -> int:
-        """Возвращает текущее количество пользователей в белом списке"""
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM whitelist_users")
-        count = cursor.fetchone()[0]
-        conn.close()
-        return count
-    
-    def get_user_role(self, user_id: int) -> str | None:
+    async def get_whitelist_count(self) -> int:
         """
-        Получает роль пользователя из whitelist
-        
+        Возвращает текущее количество пользователей в белом списке.
+
+        Returns:
+            Количество пользователей
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT COUNT(*) AS cnt FROM whitelist_users",
+            )
+        return row['cnt']
+
+    async def get_user_role(self, user_id: int) -> Optional[str]:
+        """
+        Получает роль пользователя из whitelist.
+
         Args:
             user_id: Telegram ID пользователя
-        
+
         Returns:
-            str | None: 'editor', 'user' или None если не в whitelist
+            'editor', 'user' или None если не в whitelist
         """
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT role FROM whitelist_users WHERE user_id = ?
-        """, (user_id,))
-        
-        row = cursor.fetchone()
-        conn.close()
-        
-        return row[0] if row else None
-    
-    def get_whitelist_slots_info(self) -> dict:
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT role FROM whitelist_users WHERE user_id = $1",
+                user_id,
+            )
+        return row['role'] if row else None
+
+    async def get_whitelist_slots_info(self) -> Dict:
         """
-        Возвращает информацию о количестве пользователей по ролям
+        Возвращает информацию о количестве пользователей по ролям.
+
         Returns:
-            dict: {
-                'editor': {'used': int},
-                'user': {'used': int},
-                'total_used': int
-            }
+            Словарь с количеством пользователей по ролям
         """
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
-        # Считаем редакторов
-        cursor.execute("SELECT COUNT(*) FROM whitelist_users WHERE role = 'editor'")
-        editor_count = cursor.fetchone()[0]
-        
-        # Считаем обычных пользователей
-        cursor.execute("SELECT COUNT(*) FROM whitelist_users WHERE role = 'user'")
-        user_count = cursor.fetchone()[0]
-        
-        conn.close()
-        
+        async with self.pool.acquire() as conn:
+            editor_row = await conn.fetchrow(
+                "SELECT COUNT(*) AS cnt FROM whitelist_users WHERE role = 'editor'",
+            )
+            user_row = await conn.fetchrow(
+                "SELECT COUNT(*) AS cnt FROM whitelist_users WHERE role = 'user'",
+            )
+
+        editor_count = editor_row['cnt']
+        user_count = user_row['cnt']
+
         return {
-            'editor': {
-                'used': editor_count
-            },
-            'user': {
-                'used': user_count
-            },
-            'total_used': editor_count + user_count
+            'editor': {'used': editor_count},
+            'user': {'used': user_count},
+            'total_used': editor_count + user_count,
         }

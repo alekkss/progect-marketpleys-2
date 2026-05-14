@@ -38,12 +38,37 @@ class Config:
     OPENROUTER_BASE_URL: str = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
     AI_MODEL: str = os.getenv("AI_MODEL", "google/gemini-2.5-flash-preview-09-2025")
     AI_TEMPERATURE: float = float(os.getenv("AI_TEMPERATURE", "0.1"))
+
     # Права доступа
     ACCESS_OWNER_ID: int = _safe_int_env("ACCESS_OWNER_ID", 0)
     ACCESS_ADMIN_ID: int = _safe_int_env("ACCESS_ADMIN_ID", 0)
     
     # Telegram Bot
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+
+    # ===================================================================
+    # PostgreSQL — основная база данных (asyncpg)
+    # ===================================================================
+    # Формат: postgresql://user:password@host:port/dbname
+    # Пример: postgresql://bot_user:secret@localhost:5432/marketplace_sync
+    # ===================================================================
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "")
+    DATABASE_POOL_MIN_SIZE: int = _safe_int_env("DATABASE_POOL_MIN_SIZE", 2)
+    DATABASE_POOL_MAX_SIZE: int = _safe_int_env("DATABASE_POOL_MAX_SIZE", 10)
+
+    # ===================================================================
+    # Redis — хранилище FSM-состояний и кэш
+    # ===================================================================
+    # Формат: redis://host:port/db_number
+    # Пример: redis://localhost:6379/0
+    # ===================================================================
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+    # ===================================================================
+    # Логирование
+    # ===================================================================
+    LOG_FILE_PATH: str = os.getenv("LOG_FILE_PATH", "./logs/app.log")
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     
     # Конфигурация файлов для каждого маркетплейса
     FILE_CONFIGS: Dict[str, Dict[str, Any]] = {
@@ -105,22 +130,14 @@ class Config:
     # ===================================================================
     # Маппинг единиц измерения для XML-полей
     # ===================================================================
-    # XML-поля имеют префиксы [XML] и [XML param], из которых
-    # невозможно определить единицу измерения автоматически.
-    # Этот маппинг позволяет _detect_unit() корректно определять
-    # единицы для конвертации (например, кг → г при записи в Ozon).
-    #
-    # Формат: { "название XML-поля": "единица измерения" }
-    # Допустимые единицы: 'kg', 'g', 'mm', 'cm'
-    # ===================================================================
     XML_UNIT_MAPPING: Dict[str, str] = {
         # Вес
-        '[XML] weight': 'kg',           # Вес товара с упаковкой в кг
-        '[XML param] Вес': 'kg',        # Вес товара без упаковки в кг
-        '[XML param] Вес, кг': 'kg',    # Альтернативное название
-        '[XML param] Вес, г': 'g',      # Если встретится в граммах
-        # Габариты (если будут встречаться в XML)
-        '[XML] dimensions': 'cm',       # Габариты в см (формат "Д/Ш/В")
+        '[XML] weight': 'kg',
+        '[XML param] Вес': 'kg',
+        '[XML param] Вес, кг': 'kg',
+        '[XML param] Вес, г': 'g',
+        # Габариты
+        '[XML] dimensions': 'cm',
         '[XML param] Длина': 'cm',
         '[XML param] Ширина': 'cm',
         '[XML param] Высота': 'cm',
@@ -132,18 +149,14 @@ class Config:
     # ===================================================================
     # Все весовые столбцы МП (для специальной обработки конвертации)
     # ===================================================================
-    # Аналогично ALL_DIMENSION_COLUMN_NAMES, но для веса.
-    # Используется для определения необходимости конвертации единиц
-    # при заполнении из XML.
-    # ===================================================================
     ALL_WEIGHT_COLUMN_NAMES: Dict[str, str] = {
         # Вес С упаковкой
-        'Вес с упаковкой (кг)': 'kg',       # WB
-        'Вес в упаковке, г*': 'g',           # Ozon
-        'Вес с упаковкой, кг': 'kg',         # Яндекс
+        'Вес с упаковкой (кг)': 'kg',
+        'Вес в упаковке, г*': 'g',
+        'Вес с упаковкой, кг': 'kg',
         # Вес БЕЗ упаковки
-        'Вес без упаковки (кг)': 'kg',       # WB
-        'Вес, кг': 'kg',                     # Ozon и Яндекс
+        'Вес без упаковки (кг)': 'kg',
+        'Вес, кг': 'kg',
     }
     
     # Обязательные совпадения (всегда должны быть сопоставлены)
@@ -242,13 +255,44 @@ class Config:
     @classmethod
     def validate(cls) -> bool:
         """
-        Валидация обязательных параметров конфигурации
+        Валидация обязательных параметров конфигурации.
+        
+        Проверяет наличие всех критически важных переменных окружения.
+        Вызывается при старте приложения. При отсутствии обязательного
+        параметра выбрасывает ValueError с понятным описанием.
         
         Returns:
             bool: True если все обязательные параметры заполнены
+        
+        Raises:
+            ValueError: если обязательный параметр отсутствует
         """
-        required_fields = [cls.OPENROUTER_API_KEY, cls.TELEGRAM_BOT_TOKEN]
-        return all(field for field in required_fields)
+        # Критические параметры — без них бот не может работать
+        if not cls.TELEGRAM_BOT_TOKEN:
+            raise ValueError(
+                "Не задан TELEGRAM_BOT_TOKEN в .env. "
+                "Бот не может работать без токена Telegram."
+            )
+        
+        if not cls.OPENROUTER_API_KEY:
+            raise ValueError(
+                "Не задан OPENROUTER_API_KEY в .env. "
+                "AI-сопоставление и валидация не будут работать."
+            )
+        
+        if not cls.DATABASE_URL:
+            raise ValueError(
+                "Не задан DATABASE_URL в .env. "
+                "Формат: postgresql://user:password@host:port/dbname"
+            )
+        
+        if not cls.ACCESS_OWNER_ID:
+            raise ValueError(
+                "Не задан ACCESS_OWNER_ID в .env. "
+                "Система доступа не может работать без ID владельца."
+            )
+        
+        return True
     
     # Прокси настройки
     PROXY_ENABLED: bool = os.getenv("PROXY_ENABLED", "false").lower() == "true"
@@ -297,5 +341,16 @@ ACCESS_OWNER_ID = Config.ACCESS_OWNER_ID
 ACCESS_ADMIN_ID = Config.ACCESS_ADMIN_ID
 WB_DIMENSION_PATTERNS = Config.WB_DIMENSION_PATTERNS
 ALL_DIMENSION_COLUMN_NAMES = Config.ALL_DIMENSION_COLUMN_NAMES
+WB_MULTI_VALUE_COLUMNS: set = {
+    'Цвет', 'Размер', 'Материал', 'Состав', 'Особенности модели',
+    'Страна производства', 'Комплектация', 'Рекомендуемый возраст',
+    'Пол', 'Назначение'
+}
 XML_UNIT_MAPPING = Config.XML_UNIT_MAPPING
 ALL_WEIGHT_COLUMN_NAMES = Config.ALL_WEIGHT_COLUMN_NAMES
+DATABASE_URL = Config.DATABASE_URL
+DATABASE_POOL_MIN_SIZE = Config.DATABASE_POOL_MIN_SIZE
+DATABASE_POOL_MAX_SIZE = Config.DATABASE_POOL_MAX_SIZE
+REDIS_URL = Config.REDIS_URL
+LOG_FILE_PATH = Config.LOG_FILE_PATH
+LOG_LEVEL = Config.LOG_LEVEL

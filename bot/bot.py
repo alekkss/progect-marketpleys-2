@@ -1,7 +1,8 @@
 """
-Telegram бот для синхронизации маркетплейсов
-Главный файл инициализации
+Telegram бот для синхронизации маркетплейсов.
+Главный файл инициализации.
 """
+
 import sys
 from pathlib import Path
 
@@ -10,7 +11,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import logging
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
-from config.config import TELEGRAM_BOT_TOKEN
+
+from config.config import Config, TELEGRAM_BOT_TOKEN
+from bot.storage import init_database, shutdown_database
 from utils.logger_config import setup_logger
 
 # Импорт регистраторов обработчиков
@@ -29,12 +32,18 @@ logger = setup_logger('bot')
 logging.basicConfig(level=logging.INFO)
 
 
-def create_bot():
+def create_bot() -> tuple[Bot, Dispatcher]:
     """
-    Создание и настройка бота
+    Создание и настройка бота.
+
+    Создаёт экземпляры Bot и Dispatcher, регистрирует middleware
+    и все обработчики команд. Порядок регистрации важен:
+        1. Middleware (проверка доступа) — ПЕРЕД handlers
+        2. Handlers — в порядке приоритета (common → специфичные)
+        3. schema_create_mvm — ПОСЛЕ schema_create
 
     Returns:
-        tuple: (bot, dispatcher)
+        Кортеж (bot, dispatcher)
     """
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
     dp = Dispatcher(storage=MemoryStorage())
@@ -57,8 +66,50 @@ def create_bot():
     return bot, dp
 
 
-async def start_bot():
-    """Запуск бота"""
+async def start_bot() -> None:
+    """
+    Запуск бота с полным жизненным циклом.
+
+    Порядок выполнения:
+        1. Валидация конфигурации (fail fast)
+        2. Инициализация PostgreSQL (pool + миграции)
+        3. Создание бота и диспетчера
+        4. Запуск polling
+        5. При остановке — graceful shutdown (закрытие pool)
+
+    Raises:
+        ValueError: если обязательные параметры конфигурации не заданы
+        asyncpg.PostgresError: если не удалось подключиться к БД
+    """
+    # Шаг 1: Валидация конфигурации
+    # Если не задан DATABASE_URL, TELEGRAM_BOT_TOKEN и т.д. —
+    # приложение остановится с понятным сообщением об ошибке
+    try:
+        Config.validate()
+        logger.info("Конфигурация прошла валидацию.")
+    except ValueError as e:
+        logger.error("Ошибка конфигурации: %s", e)
+        raise
+
+    # Шаг 2: Инициализация базы данных
+    # Создаёт connection pool и запускает миграции.
+    # После этого шага глобальная переменная db в bot/storage.py
+    # содержит готовый к работе экземпляр Database.
+    await init_database()
+
+    # Шаг 3: Создание бота и диспетчера
     bot, dp = create_bot()
+
+    # Шаг 4: Запуск polling с graceful shutdown
+    logger.info("Telegram бот запущен!")
     print("🚀 Telegram бот запущен!")
-    await dp.start_polling(bot)
+
+    try:
+        await dp.start_polling(bot)
+    finally:
+        # Шаг 5: Корректное завершение
+        # Закрываем connection pool PostgreSQL,
+        # ожидая завершения всех активных запросов
+        logger.info("Остановка бота, закрытие ресурсов...")
+        await shutdown_database()
+        logger.info("Все ресурсы освобождены.")

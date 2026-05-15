@@ -518,88 +518,6 @@ class Database:
         schema_name: str,
     ) -> Optional[Dict]:
         """
-        Получает схему по имени (глобальный поиск, для админов).
-
-        Args:
-            schema_name: Имя схемы
-
-        Returns:
-            Словарь с информацией о схеме или None
-        """
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT id, schema_name, user_id, created_at,
-                       updated_at, schema_type
-                FROM schemas
-                WHERE schema_name = $1
-                """,
-                schema_name,
-            )
-
-        if row is None:
-            return None
-
-        return {
-            'id': row['id'],
-            'name': row['schema_name'],
-            'owner_id': row['user_id'],
-            'created_at': str(row['created_at']) if row['created_at'] else None,
-            'updated_at': str(row['updated_at']) if row['updated_at'] else None,
-            'schema_type': row['schema_type'] or 'standard',
-        }
-
-    async def delete_schema(
-        self,
-        user_id: int,
-        schema_name: str,
-    ) -> bool:
-        """
-        Удаляет схему пользователя.
-
-        Args:
-            user_id: Telegram user_id
-            schema_name: Название схемы
-
-        Returns:
-            True если схема была удалена
-        """
-        async with self.pool.acquire() as conn:
-            result = await conn.execute(
-                """
-                DELETE FROM schemas
-                WHERE user_id = $1 AND schema_name = $2
-                """,
-                user_id, schema_name,
-            )
-            # asyncpg возвращает строку вида 'DELETE N'
-            return result == 'DELETE 1'
-
-    async def get_schema_type(self, schema_id: int) -> str:
-        """
-        Получает тип схемы по её ID.
-
-        Args:
-            schema_id: ID схемы
-
-        Returns:
-            'standard' или 'mvm'
-        """
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT schema_type FROM schemas WHERE id = $1",
-                schema_id,
-            )
-
-        if row and row['schema_type']:
-            return row['schema_type']
-        return 'standard'
-
-    async def get_schema_by_name_global(
-        self,
-        schema_name: str,
-    ) -> Optional[Dict]:
-        """
         Получает схему по имени среди всех пользователей (глобальный поиск).
 
         Используется владельцем, администратором и редактором для работы
@@ -636,6 +554,51 @@ class Database:
             'created_at': str(row['created_at']) if row['created_at'] else None,
             'updated_at': str(row['updated_at']) if row['updated_at'] else None,
         }
+
+    async def delete_schema(
+        self,
+        user_id: int,
+        schema_name: str,
+    ) -> bool:
+        """
+        Удаляет схему пользователя.
+
+        Args:
+            user_id: Telegram user_id
+            schema_name: Название схемы
+
+        Returns:
+            True если схема была удалена
+        """
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM schemas
+                WHERE user_id = $1 AND schema_name = $2
+                """,
+                user_id, schema_name,
+            )
+            return result == 'DELETE 1'
+
+    async def get_schema_type(self, schema_id: int) -> str:
+        """
+        Получает тип схемы по её ID.
+
+        Args:
+            schema_id: ID схемы
+
+        Returns:
+            'standard' или 'mvm'
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT schema_type FROM schemas WHERE id = $1",
+                schema_id,
+            )
+
+        if row and row['schema_type']:
+            return row['schema_type']
+        return 'standard'
 
     # =================================================================
     # Сопоставления схем (matches)

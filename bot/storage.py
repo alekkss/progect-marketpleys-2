@@ -59,7 +59,7 @@ async def init_database() -> Database:
 
     Выполняет три действия в строгом порядке:
         1. Создаёт экземпляр Database с параметрами из конфигурации
-        2. Создаёт connection pool (await storage.db.connect())
+        2. Создаёт connection pool (await db.connect())
         3. Запускает миграции (создание таблиц, обновление структуры)
 
     Функция должна вызываться ОДИН РАЗ при старте приложения,
@@ -87,7 +87,7 @@ async def init_database() -> Database:
     )
 
     # Создаём connection pool
-    await storage.db.connect()
+    await db.connect()
 
     # Запускаем миграции (создание таблиц + обновление структуры)
     await run_migrations(db.pool)
@@ -111,6 +111,6 @@ async def shutdown_database() -> None:
         return
 
     logger.info("Закрытие подключения к PostgreSQL...")
-    await storage.db.close()
+    await db.close()
     db = None
     logger.info("Подключение к PostgreSQL закрыто.")

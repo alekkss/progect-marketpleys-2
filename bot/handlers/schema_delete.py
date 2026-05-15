@@ -13,16 +13,13 @@ from aiogram.fsm.context import FSMContext
 from bot.states import SchemaStates
 from bot.keyboards import get_main_menu_keyboard, get_schema_list_keyboard
 from bot import storage
-from bot.security import AccessManager
 from bot.handlers.common import schema_management
 
 
 async def delete_schema_start(message: types.Message, state: FSMContext) -> None:
-    """Начало удаления схемы — показываем список схем пользователя."""
+    """Начало удаления схемы — показываем список своих схем."""
     user_id = message.from_user.id
-
-    can_see_all = await AccessManager.can_see_all_schemas(user_id)
-    schemas = await storage.db.get_user_schemas(user_id, all_schemas=can_see_all)
+    schemas = await storage.db.get_user_schemas(user_id)
 
     if not schemas:
         await message.answer("❌ У тебя нет схем!")

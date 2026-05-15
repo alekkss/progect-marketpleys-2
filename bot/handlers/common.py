@@ -19,17 +19,21 @@ from bot.security import AccessManager
 async def cmd_start(message: types.Message, state: FSMContext) -> None:
     """Команда /start — очистка состояния и главное меню."""
     await state.clear()
-    await state.update_data(files={})
+
+    # Сбрасываем in-memory хранилища для этого пользователя,
+    # чтобы не оставались пути к файлам от прерванных сессий
+    user_id = message.from_user.id
+    storage.user_files[user_id] = {}
+    storage.user_schemas[user_id] = {}
 
     # Регистрируем или обновляем данные пользователя в БД
     await storage.db.add_user(
-        message.from_user.id,
+        user_id,
         message.from_user.username,
         message.from_user.first_name,
         message.from_user.last_name,
     )
 
-    user_id = message.from_user.id
     has_management_rights = await AccessManager.has_access_management_rights(user_id)
 
     await message.answer(

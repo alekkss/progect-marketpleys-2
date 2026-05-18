@@ -12,6 +12,7 @@ from config.config import (
     FILE_CONFIGS, is_excluded_column,
     WB_DIMENSION_PATTERNS, ALL_DIMENSION_COLUMN_NAMES,
     XML_UNIT_MAPPING, ALL_WEIGHT_COLUMN_NAMES,
+    WB_MULTI_VALUE_COLUMNS,
 )
 from services.ai_comparator import AIComparator
 from utils.logger_config import setup_logger
@@ -1484,53 +1485,80 @@ class DataSynchronizer:
     
     def _validate_multiple_values(self, value, marketplace: str, column_name: str) -> Optional[str]:
         """
-        Валидирует значения с разделителями (;) и форматирует согласно требованиям маркетплейса
-        
+        Валидирует значения с разделителями (;) и форматирует согласно требованиям маркетплейса.
+
+        Правила форматирования множественных значений:
+            - WB (по умолчанию): только ПЕРВОЕ значение
+            - WB (столбцы из WB_MULTI_VALUE_COLUMNS — Фото, Видео и т.д.):
+              все значения через ";" (до 30 ссылок)
+            - Ozon: все значения через ";"
+            - Яндекс: все значения через ","
+
         Args:
             value: исходное значение (может содержать ";")
             marketplace: 'wildberries', 'ozon', 'yandex'
             column_name: название столбца
-        
+
         Returns:
             Отформатированная строка или None
         """
         if not value:
             return None
-        
+
         value_str = str(value).strip()
-        
+
         # Проверяем есть ли разделители
         if ';' not in value_str:
             # Одно значение - обычная валидация
             return self._validate_with_ai(value_str, marketplace, column_name)
-        
+
         # Множественные значения - разбиваем по ";"
         parts = [part.strip() for part in value_str.split(';') if part.strip()]
-        
+
         if not parts:
             return None
-        
-        # Wildberries: только ПЕРВОЕ значение
+
+        # Wildberries: проверяем, принимает ли столбец множественные значения
         if marketplace == 'wildberries':
-            validated = self._validate_with_ai(parts[0], marketplace, column_name)
-            return validated if validated else parts[0]  # Если валидация не прошла, берём как есть
-        
+            if column_name not in WB_MULTI_VALUE_COLUMNS:
+                # Обычный столбец WB — только первое значение
+                validated = self._validate_with_ai(parts[0], marketplace, column_name)
+                return validated if validated else parts[0]
+            # Столбец из WB_MULTI_VALUE_COLUMNS (Фото, Видео) —
+            # сохраняем все значения через ";"
+            validated_parts = []
+            for part in parts:
+                validated = self._validate_with_ai(part, marketplace, column_name)
+                if validated and validated not in validated_parts:
+                    validated_parts.append(validated)
+                elif not validated:
+                    # Для ссылок (фото/видео) validation обычно отсутствует —
+                    # сохраняем как есть, если _validate_with_ai вернул None
+                    if not self.column_validations.get(marketplace, {}).get(column_name):
+                        if part not in validated_parts:
+                            validated_parts.append(part)
+
+            if not validated_parts:
+                return None
+
+            return ';'.join(validated_parts)
+
         # Ozon и Яндекс: валидируем каждое значение
         validated_parts = []
         for part in parts:
             validated = self._validate_with_ai(part, marketplace, column_name)
             if validated and validated not in validated_parts:  # Избегаем дубликатов
                 validated_parts.append(validated)
-        
+
         if not validated_parts:
             return None
-        
+
         # Форматируем согласно требованиям маркетплейса
         if marketplace == 'yandex':
             return ','.join(validated_parts)  # "Красный, Синий"
         elif marketplace == 'ozon':
             return ';'.join(validated_parts)  # "Красный; Синий"
-        
+
         return validated_parts[0]  # На всякий случай
 
 

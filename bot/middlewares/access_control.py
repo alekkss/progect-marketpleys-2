@@ -39,7 +39,7 @@ class AccessControlMiddleware(BaseMiddleware):
         Args:
             handler: Следующий обработчик в цепочке
             event: Событие (Message или CallbackQuery)
-            data: Данные для передачи обработчику
+            data: Данные для передаче обработчику
 
         Returns:
             Результат обработки или None если доступ запрещён

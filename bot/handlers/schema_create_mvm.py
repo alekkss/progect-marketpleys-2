@@ -557,7 +557,7 @@ async def finalize_mvm_schema(message: types.Message, state: FSMContext) -> None
         )
 
         comparator = AIComparator()
-        comparison_result = comparator.compare_columns_mvm(
+        comparison_result = await comparator.compare_columns_mvm(
             columns['wildberries'],
             columns['ozon'],
             columns['yandex'],
@@ -736,4 +736,5 @@ def register_schema_create_mvm_handlers(dp, bot) -> None:
     dp.message.register(
         finalize_mvm_schema,
         SchemaMvmStates.finalizing,
+        F.text,
     )

@@ -164,7 +164,7 @@ async def process_files(message: types.Message, state: FSMContext, bot) -> None:
         report_path = f"{output_dir}/результат_{timestamp}.xlsx"
 
         synchronizer = DataSynchronizer(comparison_result, ai_comparator=comparator)
-        synced_dfs, changes_log = synchronizer.synchronize_data(file_paths, output_sync_paths, report_path=report_path)
+        synced_dfs, changes_log = await synchronizer.synchronize_data(file_paths, output_sync_paths, report_path=report_path)
 
         await message.answer("📊 Создаю отчет...")
         writer = ExcelWriter()
@@ -346,7 +346,7 @@ async def process_files_mvm(message: types.Message, state: FSMContext, bot) -> N
             xml_offer_data=xml_offer_data, xml_categories=xml_categories,
             selected_category_ids=selected_category_ids,
         )
-        synced_dfs, changes_log = synchronizer.synchronize_data(file_paths, output_sync_paths, report_path=report_path)
+        synced_dfs, changes_log = await synchronizer.synchronize_data(file_paths, output_sync_paths, report_path=report_path)
 
         await message.answer("📊 Создаю отчет...")
         writer = ExcelWriter()

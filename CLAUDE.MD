@@ -112,9 +112,16 @@ Telegram-бот для автоматической синхронизации �
 - **Управление**: только владелец и администратор
 - **Проверка прав**: `AccessControlMiddleware` на уровне dispatcher
 
-### AccessManager (bot/access.py)
+### AccessManager (bot/security/access.py)
 
 Все методы **асинхронные**. Единственное исключение — `is_owner()`, читает только `Config`.
+
+**Кэширование данных доступа (TTL 60 сек):**
+- `get_admin_user_id()` — кэшируется в `_TTLCache` с ключом `admin_id`
+- `get_whitelist_users()` — кэшируется в `_TTLCache` с ключом `whitelist`
+- `get_user_role(user_id)` — кэшируется в `_TTLCache` с ключом `role:{user_id}`
+- **Инвалидация** при изменении whitelist/admin через `add_whitelist_user`, `remove_whitelist_user`, `set_admin`, `remove_admin`
+- Это снижает нагрузку на PostgreSQL с ~2 запросов на сообщение до 0 при актуальном кэше
 
 ```python
 # Асинхронные методы
@@ -461,6 +468,28 @@ AI_MODEL=google/gemini-2.5-flash-preview-09-2025
 AI_TEMPERATURE=0.1
 ```
 
+### Асинхронный клиент и ограничение нагрузки (v4.1)
+
+- **Клиент**: `AsyncOpenAI` из библиотеки `openai` (вместо синхронного `OpenAI`)
+- **Семафор**: `asyncio.Semaphore(5)` в `AIComparator` — максимум 5 параллельных AI-запросов к OpenRouter
+- **HTTP-клиент**: `httpx.AsyncClient` для поддержки прокси
+- **Преимущества**:
+  - AI-запросы (5–30 сек) не блокируют event loop бота
+  - Бот продолжает обрабатывать сообщения других пользователей во время ожидания ответа от OpenRouter
+  - Семафор предотвращает перегрузку OpenRouter и исчерпание rate limits
+
+### Асинхронная цепочка вызовов
+
+Все методы, обращающиеся к AI, стали асинхронными:
+- `AIComparator.compare_columns()` — `async def`
+- `AIComparator.compare_columns_mvm()` — `async def`
+- `AIComparator.match_value_with_list()` — `async def`
+- `DataSynchronizer.synchronize_data()` — `async def`
+- `DataSynchronizer._validate_with_ai()` — `async def`
+- `DataSynchronizer._validate_multiple_values()` — `async def`
+
+Хендлеры вызывают эти методы с `await`.
+
 ### Два прохода AI (стандартная схема)
 
 1. **Первый проход**: Сопоставление всех столбцов трёх файлов
@@ -575,6 +604,8 @@ python main.py
 - [x] Добавление новых артикулов из XML в МП при обработке (v3.1)
 - [x] Добавление сопоставлений в МВМ-схемах + защита от Flood control (v3.2)
 - [x] Миграция с SQLite на PostgreSQL + async архитектура (v4.0)
+- [x] Кэширование данных доступа в AccessManager с TTL 60 сек (v4.1)
+- [x] AsyncOpenAI + Semaphore(5) для неблокирующих AI-запросов (v4.1)
 - [ ] Перевод FSM-хранилища с MemoryStorage на RedisStorage (REDIS_URL уже в конфиге)
 - [ ] Добавление unit-тестов (pytest)
 - [ ] CI/CD pipeline
@@ -802,9 +833,10 @@ Telegram Bot API ограничивает скачивание файлов до
 
 ---
 
-**Версия документации**: 4.0
+**Версия документации**: 4.1
 **Дата обновления**: Май 2026
 **Последние изменения**:
+- v4.1: AccessManager — in-memory кэш с TTL 60 сек (admin_id, whitelist, user_roles) с инвалидацией при мутациях. AIComparator — миграция на AsyncOpenAI с asyncio.Semaphore(5) для ограничения параллельных запросов. DataSynchronizer — полная асинхронизация цепочки AI-валидации.
 - v4.0: Миграция с SQLite на PostgreSQL (asyncpg, connection pool), полностью асинхронная архитектура, async AccessManager, отдельный модуль миграций, новые переменные конфигурации (DATABASE_URL, REDIS_URL, LOG_FILE_PATH, LOG_LEVEL)
 - v3.2: Добавление сопоставлений в МВМ-схемах (кнопка "➕ Добавить сопоставление"), защита от Telegram Flood control при отображении списков столбцов
 - v3.1: Автоматическое добавление новых артикулов из XML в МП-файлы при обработке по МВМ-схеме

@@ -155,7 +155,7 @@ async def finalize_schema_creation(message: types.Message, state: FSMContext) ->
 
         await message.answer("🤖 AI сравнивает столбцы...")
         comparator = AIComparator()
-        comparison_result = comparator.compare_columns(
+        comparison_result = await comparator.compare_columns(
             columns['wildberries'], columns['ozon'], columns['yandex']
         )
 

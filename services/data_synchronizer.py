@@ -761,7 +761,7 @@ class DataSynchronizer:
         # Если конвертация не поддерживается - возвращаем исходное значение
         return value
     
-    def synchronize_data(
+    async def synchronize_data(
         self,
         file_paths: Dict[str, str],
         output_paths: Dict[str, str] = None,
@@ -799,14 +799,14 @@ class DataSynchronizer:
         logger.info("\n" + "=" * 60)
         logger.info("📝 СИНХРОНИЗАЦИЯ ОСТАЛЬНЫХ СТОЛБЦОВ")
         logger.info("=" * 60)
-        synced_dfs = self._sync_all_matches(dfs)
+        synced_dfs = await self._sync_all_matches(dfs)
 
         # 6. [МВМ] Заполнение из XML каталога
         if self.xml_offer_data:
             logger.info("\n" + "=" * 60)
             logger.info("📦 ЗАПОЛНЕНИЕ ИЗ XML КАТАЛОГА")
             logger.info("=" * 60)
-            xml_filled = self._sync_from_xml(synced_dfs)
+            xml_filled = await self._sync_from_xml(synced_dfs)
             xml_dims_filled = self._sync_dimensions_from_xml(synced_dfs)
             xml_total = xml_filled + xml_dims_filled
             logger.info(f"✅ Из XML заполнено: {xml_filled} ячеек (данные) + {xml_dims_filled} ячеек (габариты) = {xml_total} итого")
@@ -815,7 +815,7 @@ class DataSynchronizer:
 
         # 6. Сохраняем результаты
         if output_paths:
-            self._save_results(synced_dfs, output_paths)
+            await self._save_results(synced_dfs, output_paths)
 
         logger.info("\n" + "=" * 60)
         logger.info("✅ СИНХРОНИЗАЦИЯ ЗАВЕРШЕНА!")
@@ -1049,7 +1049,7 @@ class DataSynchronizer:
             logger.debug(f"  • {col_name}: {len(values)} значений (первые 3: {values[:3]})")
 
     
-    def _sync_all_matches(self, dfs: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    async def _sync_all_matches(self, dfs: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
         """Синхронизирует все совпадающие столбцы"""
         
         # Создаем копии для работы
@@ -1064,15 +1064,15 @@ class DataSynchronizer:
         
         # Синхронизируем совпадения всех трех маркетплейсов
         print("\n[*] Синхронизирую совпадения всех 3 маркетплейсов...")
-        synced_dfs = self._sync_three_way_matches(synced_dfs)
+        synced_dfs = await self._sync_three_way_matches(synced_dfs)
         
         # Синхронизируем совпадения между двумя маркетплейсами
         print("\n[*] Синхронизирую совпадения между парами маркетплейсов...")
-        synced_dfs = self._sync_two_way_matches(synced_dfs)
+        synced_dfs = await self._sync_two_way_matches(synced_dfs)
         
         return synced_dfs
     
-    def _sync_three_way_matches(self, dfs: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    async def _sync_three_way_matches(self, dfs: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
         """Синхронизирует совпадения всех трех маркетплейсов"""
         matches = self.comparison_result.get('matches_all_three', [])
         if not matches:
@@ -1112,7 +1112,7 @@ class DataSynchronizer:
                 continue
             
             # Синхронизируем данные между тремя файлами
-            filled = self._sync_three_columns(
+            filled = await self._sync_three_columns(
                 dfs,
                 col_wb, col_ozon, col_yandex
             )
@@ -1128,7 +1128,7 @@ class DataSynchronizer:
         
         return dfs
     
-    def _sync_two_way_matches(self, dfs: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    async def _sync_two_way_matches(self, dfs: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
         """Синхронизирует совпадения между парами маркетплейсов"""
         
         pairs = [
@@ -1169,7 +1169,7 @@ class DataSynchronizer:
                     continue
                 
                 # Синхронизируем данные между двумя файлами
-                filled = self._sync_two_columns(dfs, mp1, mp2, col1, col2)
+                filled = await self._sync_two_columns(dfs, mp1, mp2, col1, col2)
                 
                 if filled > 0:
                     confidence = int(match.get('confidence', 0) * 100)
@@ -1181,7 +1181,7 @@ class DataSynchronizer:
         print(f"[+] Всего заполнено {total_filled} пустых ячеек в совпадениях между парами")
         return dfs
     
-    def _sync_three_columns(
+    async def _sync_three_columns(
         self,
         dfs: Dict[str, pd.DataFrame],
         col_wb: str,
@@ -1261,7 +1261,7 @@ class DataSynchronizer:
                     converted_value = self._convert_value(source_value, source_unit, unit_wb)
                     
                     # Проверка validation через AI
-                    final_value = self._validate_multiple_values(converted_value, 'wildberries', col_wb)
+                    final_value = await self._validate_multiple_values(converted_value, 'wildberries', col_wb)
                     
                     try:
                         # ИСПРАВЛЕНИЕ:
@@ -1297,7 +1297,7 @@ class DataSynchronizer:
                     col_dtype = series.dtype
                     converted_value = self._convert_value(source_value, source_unit, unit_ozon)
                     
-                    final_value = self._validate_multiple_values(converted_value, 'ozon', col_ozon)
+                    final_value = await self._validate_multiple_values(converted_value, 'ozon', col_ozon)
                     
                     try:
                         # ИСПРАВЛЕНИЕ:
@@ -1370,7 +1370,7 @@ class DataSynchronizer:
                     
                     # Обычная логика для остальных столбцов
                     converted_value = self._convert_value(source_value, source_unit, unit_yandex)
-                    final_value = self._validate_multiple_values(converted_value, 'yandex', col_yandex)
+                    final_value = await self._validate_multiple_values(converted_value, 'yandex', col_yandex)
                     
                     try:
                         if final_value:
@@ -1393,7 +1393,7 @@ class DataSynchronizer:
         
         return filled_count
     
-    def _validate_with_ai(self, value, marketplace: str, column_name: str) -> Optional[str]:
+    async def _validate_with_ai(self, value, marketplace: str, column_name: str) -> Optional[str]:
         """
         Проверяет значение через AI если есть validation
         Returns:
@@ -1473,7 +1473,7 @@ class DataSynchronizer:
         
         # 5. Спрашиваем AI (без кэша!)
         logger.info(f"🤖 [AI] Проверяю '{value_str}' для столбца '{column_name}'...")
-        matched_value = self.ai_comparator.match_value_with_list(value_str, allowed_values, column_name=column_name)
+        matched_value = await self.ai_comparator.match_value_with_list(value_str, allowed_values, column_name=column_name)
         
         if matched_value:
             logger.info(f"✅ [AI] Найдено: '{value_str}' → '{matched_value}'")
@@ -1483,7 +1483,7 @@ class DataSynchronizer:
             logger.warning(f"❌ [AI] Не найдено совпадение для '{value_str}'")
             return None
     
-    def _validate_multiple_values(self, value, marketplace: str, column_name: str) -> Optional[str]:
+    async def _validate_multiple_values(self, value, marketplace: str, column_name: str) -> Optional[str]:
         """
         Валидирует значения с разделителями (;) и форматирует согласно требованиям маркетплейса.
 
@@ -1510,7 +1510,7 @@ class DataSynchronizer:
         # Проверяем есть ли разделители
         if ';' not in value_str:
             # Одно значение - обычная валидация
-            return self._validate_with_ai(value_str, marketplace, column_name)
+            return await self._validate_with_ai(value_str, marketplace, column_name)
 
         # Множественные значения - разбиваем по ";"
         parts = [part.strip() for part in value_str.split(';') if part.strip()]
@@ -1522,13 +1522,13 @@ class DataSynchronizer:
         if marketplace == 'wildberries':
             if column_name not in WB_MULTI_VALUE_COLUMNS:
                 # Обычный столбец WB — только первое значение
-                validated = self._validate_with_ai(parts[0], marketplace, column_name)
+                validated = await self._validate_with_ai(parts[0], marketplace, column_name)
                 return validated if validated else parts[0]
             # Столбец из WB_MULTI_VALUE_COLUMNS (Фото, Видео) —
             # сохраняем все значения через ";"
             validated_parts = []
             for part in parts:
-                validated = self._validate_with_ai(part, marketplace, column_name)
+                validated = await self._validate_with_ai(part, marketplace, column_name)
                 if validated and validated not in validated_parts:
                     validated_parts.append(validated)
                 elif not validated:
@@ -1546,7 +1546,7 @@ class DataSynchronizer:
         # Ozon и Яндекс: валидируем каждое значение
         validated_parts = []
         for part in parts:
-            validated = self._validate_with_ai(part, marketplace, column_name)
+            validated = await self._validate_with_ai(part, marketplace, column_name)
             if validated and validated not in validated_parts:  # Избегаем дубликатов
                 validated_parts.append(validated)
 
@@ -1563,7 +1563,7 @@ class DataSynchronizer:
 
 
     
-    def _sync_two_columns(
+    async def _sync_two_columns(
         self,
         dfs: Dict[str, pd.DataFrame],
         mp1: str,
@@ -1618,7 +1618,7 @@ class DataSynchronizer:
                     col_dtype = series.dtype
                     converted_value = self._convert_value(val2, unit2, unit1)
                     
-                    final_value = self._validate_multiple_values(converted_value, mp1, col1)
+                    final_value = await self._validate_multiple_values(converted_value, mp1, col1)
                     
                     try:
                         # ИСПРАВЛЕНИЕ:
@@ -1647,7 +1647,7 @@ class DataSynchronizer:
                     col_dtype = series.dtype
                     converted_value = self._convert_value(val1, unit1, unit2)
                     
-                    final_value = self._validate_multiple_values(converted_value, mp2, col2)
+                    final_value = await self._validate_multiple_values(converted_value, mp2, col2)
                     
                     try:
                         # ИСПРАВЛЕНИЕ:
@@ -1972,7 +1972,7 @@ class DataSynchronizer:
             logger.error(f"❌ Ошибка при создании AI-лога: {e}")
 
     
-    def _save_results(self, dfs: Dict[str, pd.DataFrame], output_paths: Dict[str, str]):
+    async def _save_results(self, dfs: Dict[str, pd.DataFrame], output_paths: Dict[str, str]):
         """Сохраняет синхронизированные данные в файлы"""
         print("\n[*] Сохраняю синхронизированные данные...")
         
@@ -2077,7 +2077,7 @@ class DataSynchronizer:
                         allowed_values = self._get_validation_list_values(ws, excel_row_idx, excel_col_idx)
                         
                         if allowed_values and self.ai_comparator:
-                            matched_value = self.ai_comparator.match_value_with_list(str(value), allowed_values)
+                            matched_value = await self.ai_comparator.match_value_with_list(str(value), allowed_values)
                             if matched_value:
                                 cell.value = matched_value
                                 stats['ai_matched'] += 1
@@ -2147,7 +2147,7 @@ class DataSynchronizer:
             fields_count = len(data)
             logger.debug(f"   [{article}]: {fields_count} полей")
 
-    def _sync_from_xml(self, dfs: Dict[str, pd.DataFrame]) -> int:
+    async def _sync_from_xml(self, dfs: Dict[str, pd.DataFrame]) -> int:
         """
         Заполняет пустые ячейки в МП-файлах данными из XML каталога.
 
@@ -2271,7 +2271,7 @@ class DataSynchronizer:
                         )
 
                         # Валидация через AI (если есть validation list)
-                        final_value = self._validate_multiple_values(
+                        final_value = await self._validate_multiple_values(
                             converted_value, mp_name, col_name
                         )
 

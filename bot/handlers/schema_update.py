@@ -145,7 +145,7 @@ async def finalize_schema_update(message: types.Message, state: FSMContext):
             return
 
         await message.answer(f"🔍 Несопоставленных: WB:{len(remaining['wildberries'])} Ozon:{len(remaining['ozon'])} Я:{len(remaining['yandex'])}\n\n🤖 AI ищет новые совпадения...")
-        new_result = AIComparator().compare_columns(remaining['wildberries'], remaining['ozon'], remaining['yandex'])
+        new_result = await AIComparator().compare_columns(remaining['wildberries'], remaining['ozon'], remaining['yandex'])
         new_count, skipped = _merge_new_standard_matches(existing_matches, new_result)
 
         if new_count > 0:
@@ -266,7 +266,7 @@ async def finalize_mvm_schema_update(message: types.Message, state: FSMContext):
             return
 
         await message.answer(f"🔍 Несопоставленных: WB:{len(rem['wildberries'])} Ozon:{len(rem['ozon'])} Я:{len(rem['yandex'])} XML:{len(rem['xml'])}\n\n🤖 AI ищет новые совпадения (4 источника)...")
-        new_res = AIComparator().compare_columns_mvm(rem['wildberries'], rem['ozon'], rem['yandex'], rem['xml'])
+        new_res = await AIComparator().compare_columns_mvm(rem['wildberries'], rem['ozon'], rem['yandex'], rem['xml'])
         new_cnt, skip = _merge_new_mvm_matches(existing, new_res)
 
         if new_cnt > 0:

@@ -43,8 +43,17 @@ Telegram-бот для автоматической синхронизации �
 │   └── access.py                    # AccessManager - управление правами (async)
 │
 ├── /services/
-│   ├── data_synchronizer.py         # Синхронизация данных (3 МП + XML источник)
-│   └── ai_comparator.py             # AI-сопоставление столбцов (3 МП + МВМ 4 источника)
+│   ├── data_synchronizer.py         # Оркестратор синхронизации (Facade)
+│   ├── ai_comparator.py             # AI-сопоставление столбцов (3 МП + МВМ 4 источника)
+│   └── /sync/                       # Подпакет компонентов синхронизации (v4.2)
+│       ├── __init__.py              # Экспорты подпакета
+│       ├── value_converter.py       # ValueConverter — единицы измерения и конвертация
+│       ├── ai_validator.py          # AiValidator — 5-уровневая валидация через AI
+│       ├── article_aligner.py       # ArticleAligner — выравнивание артикулов
+│       ├── dimensions_synchronizer.py # DimensionsSynchronizer — синхронизация габаритов
+│       ├── column_syncer.py         # ColumnSyncer — синхронизация столбцов МП
+│       ├── xml_syncer.py            # XmlSyncer — заполнение МП из XML-каталога
+│       └── excel_io.py              # ExcelFileManager — загрузка и сохранение xlsx
 │
 ├── /utils/
 │   ├── excel_reader.py              # Чтение Excel файлов
@@ -237,6 +246,7 @@ whitelist_users         # Белый список (без лимитов)
 - **SOLID**: Разделение ответственности
   - `handlers` → взаимодействие с пользователем
   - `services` → бизнес-логика
+  - `services/sync` → компоненты синхронизации (каждый за одну задачу)
   - `database` → работа с данными
   - `config` → конфигурация
 - **Async/Await**: Все IO операции асинхронны (включая все обращения к БД)
@@ -273,7 +283,167 @@ except SpecificException as e:
 
 ## Ключевые компоненты
 
-### 1. Схемы сопоставлений (Schema)
+### 1. DataSynchronizer — оркестратор (v4.2)
+
+`services/data_synchronizer.py` — **Facade**-оркестратор. Создаёт компоненты подпакета `sync/`, передаёт им разделяемое состояние и вызывает в строго определённом порядке.
+
+**Публичный интерфейс не изменился** — все хендлеры продолжают работать без правок.
+
+```python
+from services.data_synchronizer import DataSynchronizer
+
+synchronizer = DataSynchronizer(comparison_result, ai_comparator=comparator)
+synced_dfs, changes_log = await synchronizer.synchronize_data(file_paths, output_paths)
+
+# AI-лог записывается ПОСЛЕ создания отчёта ExcelWriter'ом
+writer.create_report_with_changes(comparison_result, changes_log, report_path)
+synchronizer.create_ai_log_in_report(report_path)
+```
+
+**CPU-операции и event loop (v4.3):**
+Тяжёлые синхронные шаги выносятся в поток через `asyncio.to_thread()` —
+event loop остаётся свободным для других пользователей во время обработки:
+- Загрузка файлов (`load_all_dataframes`) — openpyxl + pandas
+- Построение XML-индекса (`build_index`) — итерация по офферам
+- Выравнивание артикулов (`article_aligner.align`) — pandas concat
+- Синхронизация габаритов (`sync_dimensions`) — шесть проходов по DataFrame
+- Габариты из XML (`sync_dimensions_from_xml`) — парсинг + запись
+
+Три метода остаются в event loop — их нельзя перенести в поток,
+так как внутри есть `await` AI-запросов:
+`sync_all_matches`, `sync_from_xml`, `save_results`.
+
+**КРИТИЧЕСКИ ВАЖНО — порядок записи AI-лога:**
+1. `synchronizer.synchronize_data(...)` — синхронизация и сохранение МП-файлов
+2. `writer.create_report_with_changes(...)` — ExcelWriter создаёт файл отчёта с нуля
+3. `synchronizer.create_ai_log_in_report(report_path)` — добавляет лист «AI_Логи» в уже готовый файл
+
+Если вызвать `create_ai_log_in_report` до `create_report_with_changes`, ExcelWriter перезапишет файл и лог будет потерян.
+
+#### Порядок этапов внутри synchronize_data
+
+1. Загрузка DataFrame и validation-списков (`ExcelFileManager`)
+2. Построение XML-индекса по vendorCode (`XmlSyncer.build_index`)
+3. Выравнивание артикулов между МП — включая артикулы из XML (`ArticleAligner.align`)
+4. Синхронизация габаритов (`DimensionsSynchronizer.sync_dimensions`)
+5. Синхронизация остальных столбцов по схеме (`ColumnSyncer.sync_all_matches`)
+6. [МВМ] Заполнение МП из XML-каталога (`XmlSyncer.sync_from_xml` + `sync_dimensions_from_xml`)
+7. Сохранение МП-файлов (`ExcelFileManager.save_results`)
+
+#### Разделяемое состояние
+
+Передаётся по ссылке во все компоненты — изменения накапливаются в одном месте:
+- `synchronizer.changes_log` — лог всех изменений ячеек по маркетплейсам
+- `synchronizer.ai_validation_log` — лог всех AI-валидаций (используется для листа «AI_Логи»)
+
+### 2. Подпакет services/sync/ (v4.2)
+
+Семь специализированных классов, каждый отвечает за одну задачу. Все зависимости инжектируются через конструктор.
+
+#### ValueConverter (`services/sync/value_converter.py`)
+
+Определяет единицу измерения по названию столбца и конвертирует числовые значения.
+
+```python
+converter = ValueConverter()
+unit = converter.detect_unit("Длина упаковки, мм*")  # → 'mm'
+value = converter.convert_value(150, 'mm', 'cm')      # → 15.0
+```
+
+Порядок определения единицы: XML_UNIT_MAPPING → ALL_WEIGHT_COLUMN_NAMES → эвристика по ключевым словам.
+
+#### AiValidator (`services/sync/ai_validator.py`)
+
+5-уровневая валидация значений против списков допустимых значений. Принимает `column_validations` и `ai_validation_log` по ссылке.
+
+```python
+validator = AiValidator(ai_comparator, column_validations, ai_validation_log)
+result = await validator.validate_multiple_values(value, 'wildberries', 'Цвет')
+```
+
+Каскад проверок (от быстрых к медленным):
+1. Точное совпадение
+2. Нормализация (lowercase + ё→е)
+3. Извлечение числа из строки (`\d+`)
+4. Subset matching по словам
+5. AI-запрос через AIComparator (только если все предыдущие не сработали)
+
+#### ArticleAligner (`services/sync/article_aligner.py`)
+
+Выравнивает артикулы между МП (добавляет недостающие строки) и строит article_map для быстрого поиска.
+
+```python
+aligner = ArticleAligner(article_columns, xml_article_map)
+dfs = aligner.align(dfs)
+article_map = aligner.create_article_map(df, article_col, value_col)
+```
+
+Фильтрация некорректных артикулов: служебные строки-описания и строки длиннее 50 символов автоматически исключаются.
+
+#### DimensionsSynchronizer (`services/sync/dimensions_synchronizer.py`)
+
+Синхронизирует габариты упаковки между всеми МП с учётом форматов:
+- WB: раздельные столбцы в сантиметрах (имена определяются динамически через паттерны)
+- Ozon: раздельные столбцы в миллиметрах
+- Яндекс: составной столбец «длина/ширина/высота» в сантиметрах
+
+```python
+synced_count, resolved_wb_dims = DimensionsSynchronizer.sync_dimensions(dfs)
+```
+
+**Важно:** `sync_dimensions` возвращает кортеж `(int, Optional[Dict])`. `resolved_wb_dims` — словарь с реальными именами столбцов WB (`{'length': '...', 'width': '...', 'height': '...'}`). Этот словарь передаётся оркестратором в `ColumnSyncer` и `XmlSyncer`, чтобы не определять имена столбцов повторно.
+
+#### ColumnSyncer (`services/sync/column_syncer.py`)
+
+Синхронизирует тройные и парные совпадения между МП по схеме сопоставлений.
+
+```python
+syncer = ColumnSyncer(
+    comparison_result, article_columns,
+    value_converter, ai_validator, article_aligner,
+    changes_log, resolved_wb_dims
+)
+synced_dfs = await syncer.sync_all_matches(dfs)
+```
+
+Пары МП описаны декларативно в константе `_PAIR_CONFIGS` — добавить новую пару значит дописать одну строку в список. Габаритные столбцы и исключённые столбцы пропускаются автоматически.
+
+#### XmlSyncer (`services/sync/xml_syncer.py`)
+
+Строит индекс XML-офферов по vendorCode и заполняет пустые ячейки МП данными из XML.
+
+```python
+syncer = XmlSyncer(
+    comparison_result, article_columns,
+    value_converter, ai_validator, changes_log,
+    resolved_wb_dims, xml_offer_data, xml_categories, selected_category_ids
+)
+syncer.build_index()                           # строит xml_article_map
+filled = await syncer.sync_from_xml(dfs)       # обычные поля
+dims   = syncer.sync_dimensions_from_xml(dfs)  # габариты из [XML] dimensions
+```
+
+Поле `[XML] dimensions` обрабатывается отдельно в `sync_dimensions_from_xml` — оно требует парсинга строки «д/ш/в» и конвертации единиц для каждого МП.
+
+#### ExcelFileManager (`services/sync/excel_io.py`)
+
+Загружает xlsx через openpyxl (с сохранением data validation и стилей), сохраняет результаты обратно в файлы, записывает лист «AI_Логи».
+
+```python
+manager = ExcelFileManager(ai_comparator=comparator)
+dfs = manager.load_all_dataframes(file_paths)
+# После загрузки доступны:
+# manager.column_validations    — {маркетплейс: {столбец: [значения]}}
+# manager.original_column_names — маппинг переименованных дубликатов
+# manager.original_file_paths   — пути к исходным файлам
+
+await manager.save_results(dfs, output_paths, ai_validation_log)
+manager.create_ai_log_in_report(report_path, ai_validation_log)
+```
+
+Обрабатывает дублирующиеся заголовки: добавляет числовой суффикс при загрузке («Вес (кг)1») и восстанавливает оригинальные имена при сохранении.
+
+### 3. Схемы сопоставлений (Schema)
 
 Поддерживаются два типа схем:
 
@@ -318,7 +488,7 @@ except SpecificException as e:
 - `[XML] тег` — для фиксированных тегов (например, `[XML] vendor`)
 - `[XML param] Название` — для параметров (например, `[XML param] Цвет`)
 
-### Работа с парными и тройными сопоставлениями (v2.1)
+### 4. Работа с парными и тройными сопоставлениями (v2.1)
 
 #### Просмотр сопоставлений
 Функция `show_schema_matches` в `bot/handlers/schema_edit.py` отображает:
@@ -361,7 +531,7 @@ except SpecificException as e:
 - `🔗 Показать парные (Ozon+Яндекс)` → `filter_type = 'pair_2_3'`
 - `📋 Показать всё` → `filter_type = None`
 
-### Работа с МВМ-сопоставлениями (v3.0)
+### 5. Работа с МВМ-сопоставлениями (v3.0)
 
 #### Создание МВМ-схемы
 
@@ -401,38 +571,40 @@ except SpecificException as e:
 1. "📤 Загрузить файлы" → выбрать МВМ-схему (отмечена иконкой 📦)
 2. Загрузить 3 файла МП + XML файл каталога
 3. Синхронизация между МП (стандартная: габариты → тройные → парные)
-4. **Заполнение из XML**: `DataSynchronizer._sync_from_xml()`:
-   - Строит индекс XML по vendorCode: `_build_xml_article_map()`
-   - **Проход 1**: Проходит по группам с `column_4` (7 групп) — заполняет пустые ячейки МП из XML
-   - **Проход 2**: Добавление новых артикулов из XML: `_add_new_articles_from_xml()`
-     - Находит артикулы из XML, которых нет ни в одном МП
-     - Добавляет строку во все 3 МП-файла, заполняет из XML по сопоставлениям
-   - Конвертация единиц (`_detect_unit` / `_convert_value`)
+4. **Заполнение из XML** (`XmlSyncer`):
+   - Строит индекс XML по vendorCode: `build_index()`
+   - **Проход 1**: `sync_from_xml()` — проходит по группам с `column_4` (7 групп), заполняет пустые ячейки МП из XML
+   - **Проход 2**: Новые артикулы из XML добавляются в МП через `ArticleAligner.align()` ещё до синхронизации
+   - `sync_dimensions_from_xml()` — конвертирует и записывает габариты из `[XML] dimensions`
+   - Конвертация единиц (`ValueConverter`)
    - Валидация через AI (5-уровневая), логирование с `source_marketplace='xml'`
 
 **FSM-состояния**: `UploadMvmStates` (selecting_schema → waiting_for_mp_files → waiting_for_xml_file)
 
-### 2. Валидация значений (5 уровней)
+### 6. Валидация значений (5 уровней)
+
+Реализована в `AiValidator` (`services/sync/ai_validator.py`):
 
 1. **Точное совпадение** (case-sensitive)
-2. **Нормализованное совпадение** (lowercase + strip)
+2. **Нормализованное совпадение** (lowercase + ё→е)
 3. **Извлечение чисел** из строк (regex `\d+`)
 4. **Subset matching** (совпадение по словам)
 5. **AI-сопоставление** через OpenRouter (финальный уровень)
 
-### 3. Множественные значения
+### 7. Множественные значения
 
 - **Разделитель входной**: `;` (точка с запятой)
-- **WB**: только первое значение
-- **Ozon**: выход через `"; "` (точка с запятой + пробел)
-- **Яндекс**: выход через `", "` (запятая + пробел)
+- **WB**: только первое значение (кроме столбцов из `WB_MULTI_VALUE_COLUMNS`)
+- **WB (Фото, Видео и др.)**: все значения через `";"`
+- **Ozon**: все значения через `";"`
+- **Яндекс**: все значения через `","`
 
-### 4. Специальная обработка
+### 8. Специальная обработка
 
 - **Габариты**: композитный формат `"длина/ширина/высота"` для Яндекса
-- **Единицы измерения**: автоконвертация (мм ↔ см)
-- **Артикулы**: выравнивание по всем маркетплейсам
-- **Фильтрация**: Максимум 50 символов в артикуле
+- **Единицы измерения**: автоконвертация (мм ↔ см, г ↔ кг) через `ValueConverter`
+- **Артикулы**: выравнивание по всем маркетплейсам через `ArticleAligner`
+- **Фильтрация**: максимум 50 символов в артикуле
 
 ## Формат данных
 
@@ -480,13 +652,13 @@ AI_TEMPERATURE=0.1
 
 ### Асинхронная цепочка вызовов
 
-Все методы, обращающиеся к AI, стали асинхронными:
+Все методы, обращающиеся к AI, асинхронны:
 - `AIComparator.compare_columns()` — `async def`
 - `AIComparator.compare_columns_mvm()` — `async def`
 - `AIComparator.match_value_with_list()` — `async def`
 - `DataSynchronizer.synchronize_data()` — `async def`
-- `DataSynchronizer._validate_with_ai()` — `async def`
-- `DataSynchronizer._validate_multiple_values()` — `async def`
+- `AiValidator.validate_multiple_values()` — `async def`
+- `AiValidator._validate_with_ai()` — `async def`
 
 Хендлеры вызывают эти методы с `await`.
 
@@ -503,9 +675,9 @@ AI_TEMPERATURE=0.1
 
 ### Логирование AI
 
-- Все AI-валидации сохраняются в список `ai_validation_log`
-- Экспортируются в отдельный лист Excel **"AI_Логи"**
-- Формат: `[Артикул, Столбец, Исходное значение, Найденное значение, Confidence]`
+- Все AI-валидации накапливаются в `synchronizer.ai_validation_log`
+- Записываются в лист **«AI_Логи»** через `synchronizer.create_ai_log_in_report(report_path)`
+- Формат: `[Маркетплейс, Столбец, Исходное значение, Сопоставлено с, Метод]`
 
 ## Конфигурация (.env)
 
@@ -606,7 +778,9 @@ python main.py
 - [x] Миграция с SQLite на PostgreSQL + async архитектура (v4.0)
 - [x] Кэширование данных доступа в AccessManager с TTL 60 сек (v4.1)
 - [x] AsyncOpenAI + Semaphore(5) для неблокирующих AI-запросов (v4.1)
+- [x] Рефакторинг DataSynchronizer: подпакет services/sync/ с 7 компонентами (v4.2)
 - [ ] Перевод FSM-хранилища с MemoryStorage на RedisStorage (REDIS_URL уже в конфиге)
+- [x] asyncio.to_thread() для CPU-тяжёлых операций pandas/openpyxl (v4.3)
 - [ ] Добавление unit-тестов (pytest)
 - [ ] CI/CD pipeline
 - [ ] Поддержка 5-го маркетплейса (расширение архитектуры)
@@ -627,41 +801,43 @@ python main.py
 ### НЕ изменять без обсуждения
 
 - Формат обязательных столбцов (`MANDATORY_MATCHES`)
-- Логику 5-уровневой валидации
-- Разделители множественных значений (`;` → `"; "` / `", "`)
+- Логику 5-уровневой валидации в `AiValidator`
+- Разделители множественных значений (`;` → `";"` / `","`)
 - Структуру прав доступа (роли и whitelist без лимитов)
 - Префиксы XML-полей (`[XML]` и `[XML param]`)
 - Порядок этапов синхронизации (габариты → МП → XML)
 - Привязку XML по vendorCode
 - Порядок инициализации: `Config.validate()` → `init_database()` → `create_bot()` → `polling`
+- Порядок записи AI-лога: `synchronize_data` → `create_report_with_changes` → `create_ai_log_in_report`
 
 ### Критичные зависимости
 
 - Порядок вызовов: схема → синхронизация → валидация
-- Порядок синхронизации МВМ: загрузка → выравнивание → габариты → МП-столбцы → XML-заполнение (проход 1: существующие + проход 2: новые артикулы) → сохранение
+- Порядок синхронизации МВМ: загрузка → выравнивание (включая XML-артикулы) → габариты → МП-столбцы → XML-заполнение → сохранение
+- `resolved_wb_dims` возвращается из `DimensionsSynchronizer.sync_dimensions()` и передаётся в `ColumnSyncer` и `XmlSyncer` — не вычислять повторно
 - FSM states должны быть последовательными
 - AI-логи обязательны для каждой валидации
 - `AccessControlMiddleware` должен быть зарегистрирован ПЕРЕД handlers
 - `ACCESS_OWNER_ID` в .env обязателен для работы системы доступа
 - `register_schema_create_mvm_handlers` должен регистрироваться ПОСЛЕ `register_schema_create_handlers`
-- XML-данные передаются в `DataSynchronizer` через параметры конструктора (`xml_offer_data`, `xml_categories`, `selected_category_ids`)
-- `selected_category_ids` хранятся в `full_comparison_json` и извлекаются через `await db.get_schema_category_ids()`
 - `from bot import storage` (модуль) — НЕ `from bot.storage import db` (переменная), иначе получишь `None` на момент импорта
+- Методы с внутренними `await` (`sync_all_matches`, `sync_from_xml`, `save_results`) нельзя оборачивать в `asyncio.to_thread()` — внутри потока нет event loop
 
 ## Типичные сценарии работы
 
 ### Добавление нового уровня валидации
 
-1. Добавить метод в `DataSynchronizer` (`services/data_synchronizer.py`)
-2. Вставить в цепочку валидации перед AI
-3. Обновить формат AI_Логов в `excel_writer.py`
+1. Добавить метод в `AiValidator` (`services/sync/ai_validator.py`)
+2. Вставить в каскад внутри `_validate_with_ai()` между нужными шагами
+3. Обновить формат AI_Логов в `excel_io.py` если нужен новый столбец
 
 ### Добавление нового маркетплейса
 
 1. Расширить `FILE_CONFIGS` в `config/config.py`
 2. Добавить `MANDATORY_MATCHES` для нового файла
-3. Обновить логику `sync_three_columns` → `sync_four_columns`
-4. Адаптировать `AIComparator` для 4 файлов
+3. Добавить пару в `_PAIR_CONFIGS` в `services/sync/column_syncer.py`
+4. Добавить запись в `_ARTICLE_COLUMNS` в `DataSynchronizer` и `ArticleAligner`
+5. Адаптировать `AIComparator` для нового файла
 
 ### Добавление новой миграции БД
 
@@ -789,9 +965,12 @@ columns = reader.get_column_names(filepath, sheet_name, header_row)
 ### Запись (utils/excel_writer.py)
 
 - Создаёт 3 листа: WB, Ozon, Яндекс
-- Добавляет лист "AI_Логи" с детализацией всех AI-валидаций
 - Форматирование (заливка заголовков, выравнивание)
 - Auto-width для колонок
+
+### AI-логи
+
+Лист «AI_Логи» создаётся отдельно через `synchronizer.create_ai_log_in_report(report_path)` после создания отчёта ExcelWriter'ом. Содержит все события AI-валидации: маркетплейс, столбец, исходное значение, найденное значение и метод сопоставления.
 
 ## FAQ
 
@@ -831,11 +1010,20 @@ Telegram Bot API ограничивает скачивание файлов до
 
 На момент импорта модуля переменная `db = None`. Нужно импортировать модуль целиком: `from bot import storage`, затем использовать `storage.db`. Это гарантирует, что обращение к `db` происходит уже после `await init_database()`.
 
+### Почему AI-логи пропадают из отчёта?
+
+`ExcelWriter.create_report_with_changes()` создаёт файл с нуля. Если вызвать `create_ai_log_in_report` до него — лог будет перезаписан. Правильный порядок: `synchronize_data` → `create_report_with_changes` → `create_ai_log_in_report`.
+
+### Где теперь логика валидации и синхронизации?
+
+После рефакторинга v4.2 `DataSynchronizer` — только оркестратор. Логика разнесена по подпакету `services/sync/`: валидация — `AiValidator`, габариты — `DimensionsSynchronizer`, синхронизация столбцов — `ColumnSyncer`, XML — `XmlSyncer`, файлы — `ExcelFileManager`.
+
 ---
 
-**Версия документации**: 4.1
+**Версия документации**: 4.2
 **Дата обновления**: Май 2026
 **Последние изменения**:
+- v4.2: Рефакторинг `DataSynchronizer` — вынесен в оркестратор (Facade). Создан подпакет `services/sync/` с 7 компонентами: `ValueConverter`, `AiValidator`, `ArticleAligner`, `DimensionsSynchronizer`, `ColumnSyncer`, `XmlSyncer`, `ExcelFileManager`. Исправлен порядок создания AI-лога: теперь `create_ai_log_in_report()` вызывается после `ExcelWriter.create_report_with_changes()`. `DimensionsSynchronizer.sync_dimensions()` возвращает `Tuple[int, resolved_wb_dims]` вместо просто `int` — устранено скрытое глобальное состояние.
 - v4.1: AccessManager — in-memory кэш с TTL 60 сек (admin_id, whitelist, user_roles) с инвалидацией при мутациях. AIComparator — миграция на AsyncOpenAI с asyncio.Semaphore(5) для ограничения параллельных запросов. DataSynchronizer — полная асинхронизация цепочки AI-валидации.
 - v4.0: Миграция с SQLite на PostgreSQL (asyncpg, connection pool), полностью асинхронная архитектура, async AccessManager, отдельный модуль миграций, новые переменные конфигурации (DATABASE_URL, REDIS_URL, LOG_FILE_PATH, LOG_LEVEL)
 - v3.2: Добавление сопоставлений в МВМ-схемах (кнопка "➕ Добавить сопоставление"), защита от Telegram Flood control при отображении списков столбцов

@@ -9,7 +9,7 @@ Telegram-бот для автоматической синхронизации �
 - **Миграции**: отдельный модуль `database/migrations.py`, идемпотентные
 - **AI Integration**: OpenRouter API (настраиваемые модели через .env)
 - **File Processing**: pandas + openpyxl
-- **State Management**: FSM (Finite State Machine), хранилище — MemoryStorage
+- **State Management**: FSM (Finite State Machine), хранилище — RedisStorage (с fallback на MemoryStorage при недоступности Redis)
 - **Access Control**: Многоуровневая система прав доступа (async)
 
 ## Структура проекта
@@ -21,7 +21,8 @@ Telegram-бот для автоматической синхронизации �
 │
 ├── /bot/
 │   ├── bot.py                       # Инициализация бота и диспетчера, жизненный цикл
-│   ├── storage.py                   # Глобальный экземпляр Database + init/shutdown
+│   ├── storage.py                   # Глобальный экземпляр Database + SessionStorage + init/shutdown
+│   ├── session_storage.py           # Абстракция над Redis (TTL 30 мин) с in-memory fallback
 │   ├── security.py -> access.py     # Псевдоним для AccessManager
 │   │
 │   ├── /handlers/                   # Обработчики команд бота
@@ -74,14 +75,15 @@ Telegram-бот для автоматической синхронизации �
 
 Порядок запуска в `bot/bot.py → start_bot()`:
 
-1. **Валидация конфигурации** — `Config.validate()` бросает `ValueError` при отсутствии обязательных переменных (fail-fast)
-2. **Инициализация БД** — `await init_database()` из `bot/storage.py`:
+1. **Валидация конфигурации** — `Config.validate()` бросает `ValueError` при отсутствии обязательных переменных (fail-fast). Дополнительно проверяет формат `REDIS_URL` (опционально, с предупреждением)
+2. **Инициализация хранилищ** — `await init_storage()` из `bot/storage.py`:
    - Создаёт экземпляр `Database(database_url, pool_min, pool_max)`
-   - `await db.connect()` — открывает connection pool
+   - `await db.connect()` — открывает connection pool PostgreSQL
    - `await run_migrations(db.pool)` — создаёт таблицы и применяет миграции
-3. **Создание бота** — `create_bot()` регистрирует middleware и хендлеры
+   - `await session_storage.connect()` — подключает Redis для сессий (или fallback на in-memory)
+3. **Создание бота** — `create_bot()` регистрирует middleware и хендлеры. FSM-хранилище: RedisStorage (fallback MemoryStorage)
 4. **Polling** — `await dp.start_polling(bot)`
-5. **Graceful shutdown** — `await shutdown_database()` закрывает pool при остановке
+5. **Graceful shutdown** — `await shutdown_storage()` закрывает pool PostgreSQL и соединение Redis
 
 ## Система прав доступа
 
@@ -164,6 +166,10 @@ db = Database(
     pool_max_size=Config.DATABASE_POOL_MAX_SIZE,
 )
 await db.connect()
+
+# SessionStorage — для временных данных FSM-сессий
+session_storage = SessionStorage(redis_url=Config.REDIS_URL)
+await session_storage.connect()  # Redis или in-memory fallback
 ```
 
 Все методы `Database` асинхронны и берут соединение из пула через `async with self.pool.acquire() as conn`.
@@ -696,8 +702,9 @@ DATABASE_URL=postgresql://user:password@localhost:5432/marketplace_sync
 DATABASE_POOL_MIN_SIZE=2
 DATABASE_POOL_MAX_SIZE=10
 
-# Redis (зарезервировано для FSM-хранилища)
+# Redis — хранилище FSM-состояний и сессий загрузки (опционально, есть fallback)
 REDIS_URL=redis://localhost:6379/0
+# Если не задан — бот работает на MemoryStorage (FSM теряются при перезапуске)
 
 # Права доступа
 ACCESS_OWNER_ID=123456789          # Обязательно! ID владельца
@@ -779,7 +786,8 @@ python main.py
 - [x] Кэширование данных доступа в AccessManager с TTL 60 сек (v4.1)
 - [x] AsyncOpenAI + Semaphore(5) для неблокирующих AI-запросов (v4.1)
 - [x] Рефакторинг DataSynchronizer: подпакет services/sync/ с 7 компонентами (v4.2)
-- [ ] Перевод FSM-хранилища с MemoryStorage на RedisStorage (REDIS_URL уже в конфиге)
+- [x] Перевод FSM-хранилища с MemoryStorage на RedisStorage с fallback (v4.4)
+- [x] Устранение утечки памяти: глобальные dict user_files/user_schemas заменены на SessionStorage с TTL (v4.4)
 - [x] asyncio.to_thread() для CPU-тяжёлых операций pandas/openpyxl (v4.3)
 - [ ] Добавление unit-тестов (pytest)
 - [ ] CI/CD pipeline
@@ -794,7 +802,8 @@ python main.py
 - XML-файлы > 20 МБ не скачиваются через Telegram API (нужна прямая ссылка)
 - Скачивание по URL: лимит 200 МБ, таймаут 5 минут
 - OpenRouter API rate limits
-- FSM-состояния теряются при перезапуске бота (MemoryStorage)
+- FSM-состояния сохраняются в Redis (если доступен), иначе теряются при перезапуске (MemoryStorage fallback)
+- Сессии загрузки файлов (user_files, user_schemas) хранятся в Redis с TTL 30 минут — автоочистка "забытых" сессий
 
 ## Важные предостережения
 
@@ -807,7 +816,9 @@ python main.py
 - Префиксы XML-полей (`[XML]` и `[XML param]`)
 - Порядок этапов синхронизации (габариты → МП → XML)
 - Привязку XML по vendorCode
-- Порядок инициализации: `Config.validate()` → `init_database()` → `create_bot()` → `polling`
+- Порядок инициализации: `Config.validate()` → `init_storage()` → `create_bot()` → `polling`
+- Порядок записи AI-лога: `synchronize_data` → `create_report_with_changes` → `create_ai_log_in_report`
+- Импорт сессий: `from bot import storage` → `storage.session_storage` (модуль, не переменная)
 - Порядок записи AI-лога: `synchronize_data` → `create_report_with_changes` → `create_ai_log_in_report`
 
 ### Критичные зависимости
@@ -1018,11 +1029,22 @@ Telegram Bot API ограничивает скачивание файлов до
 
 После рефакторинга v4.2 `DataSynchronizer` — только оркестратор. Логика разнесена по подпакету `services/sync/`: валидация — `AiValidator`, габариты — `DimensionsSynchronizer`, синхронизация столбцов — `ColumnSyncer`, XML — `XmlSyncer`, файлы — `ExcelFileManager`.
 
+### Почему бот использует Redis?
+
+Redis используется для двух целей:
+1. **FSM-состояния** — переживают перезапуск бота, доступны из нескольких процессов
+2. **Сессии загрузки** — временные данные (пути к файлам) с TTL 30 минут, предотвращает утечку памяти
+
+При недоступности Redis бот автоматически переключается на in-memory fallback с предупреждением в логах.
+
 ---
 
-**Версия документации**: 4.2
+**Версия документации**: 4.4
 **Дата обновления**: Май 2026
 **Последние изменения**:
+- v4.4: Рефакторинг хранения сессий — устранена утечка памяти в глобальных dict user_files/user_schemas. 
+  Добавлен SessionStorage (bot/session_storage.py) с поддержкой Redis (TTL 30 мин) и in-memory fallback.
+  FSM-хранилище переведено с MemoryStorage на RedisStorage. Обновлена валидация REDIS_URL в Config.
 - v4.2: Рефакторинг `DataSynchronizer` — вынесен в оркестратор (Facade). Создан подпакет `services/sync/` с 7 компонентами: `ValueConverter`, `AiValidator`, `ArticleAligner`, `DimensionsSynchronizer`, `ColumnSyncer`, `XmlSyncer`, `ExcelFileManager`. Исправлен порядок создания AI-лога: теперь `create_ai_log_in_report()` вызывается после `ExcelWriter.create_report_with_changes()`. `DimensionsSynchronizer.sync_dimensions()` возвращает `Tuple[int, resolved_wb_dims]` вместо просто `int` — устранено скрытое глобальное состояние.
 - v4.1: AccessManager — in-memory кэш с TTL 60 сек (admin_id, whitelist, user_roles) с инвалидацией при мутациях. AIComparator — миграция на AsyncOpenAI с asyncio.Semaphore(5) для ограничения параллельных запросов. DataSynchronizer — полная асинхронизация цепочки AI-валидации.
 - v4.0: Миграция с SQLite на PostgreSQL (asyncpg, connection pool), полностью асинхронная архитектура, async AccessManager, отдельный модуль миграций, новые переменные конфигурации (DATABASE_URL, REDIS_URL, LOG_FILE_PATH, LOG_LEVEL)

@@ -11,9 +11,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import logging
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.redis import RedisStorage
 
 from config.config import Config, TELEGRAM_BOT_TOKEN
-from bot.storage import init_database, shutdown_database
+from bot.storage import init_storage, shutdown_storage
 from utils.logger_config import setup_logger
 
 # Импорт регистраторов обработчиков
@@ -42,11 +43,40 @@ def create_bot() -> tuple[Bot, Dispatcher]:
         2. Handlers — в порядке приоритета (common → специфичные)
         3. schema_create_mvm — ПОСЛЕ schema_create
 
+    FSM Storage:
+        - RedisStorage (при доступном Redis) — состояния переживают перезапуск
+        - MemoryStorage (fallback) — состояния теряются при перезапуске
+
     Returns:
         Кортеж (bot, dispatcher)
     """
     bot = Bot(token=TELEGRAM_BOT_TOKEN)
-    dp = Dispatcher(storage=MemoryStorage())
+
+    # ===================================================================
+    # Выбор FSM-хранилища: Redis (предпочтительно) или Memory (fallback)
+    # ===================================================================
+    # RedisStorage позволяет:
+    #   - Сохранять FSM-состояния при перезапуске бота
+    #   - Работать с несколькими инстансами бота (horizontal scaling)
+    #   - Иметь единый источник состояний для всех процессов
+    #
+    # Fallback на MemoryStorage если Redis недоступен — бот продолжит работу.
+    # ===================================================================
+    dp: Dispatcher
+    try:
+        storage = RedisStorage.from_url(Config.REDIS_URL)
+        logger.info(
+            "FSM-хранилище: Redis (%s). Состояния переживают перезапуск.",
+            Config.REDIS_URL,
+        )
+        dp = Dispatcher(storage=storage)
+    except Exception as e:
+        logger.warning(
+            "Не удалось подключиться к Redis для FSM: %s. "
+            "Используем MemoryStorage (состояния будут потеряны при перезапуске).",
+            e,
+        )
+        dp = Dispatcher(storage=MemoryStorage())
 
     # Регистрация middleware (ПЕРЕД handlers!)
     dp.message.middleware(AccessControlMiddleware())
@@ -72,10 +102,10 @@ async def start_bot() -> None:
 
     Порядок выполнения:
         1. Валидация конфигурации (fail fast)
-        2. Инициализация PostgreSQL (pool + миграции)
+        2. Инициализация хранилищ (PostgreSQL + Redis session storage)
         3. Создание бота и диспетчера
         4. Запуск polling
-        5. При остановке — graceful shutdown (закрытие pool)
+        5. При остановке — graceful shutdown (закрытие всех ресурсов)
 
     Raises:
         ValueError: если обязательные параметры конфигурации не заданы
@@ -91,11 +121,12 @@ async def start_bot() -> None:
         logger.error("Ошибка конфигурации: %s", e)
         raise
 
-    # Шаг 2: Инициализация базы данных
-    # Создаёт connection pool и запускает миграции.
-    # После этого шага глобальная переменная db в bot/storage.py
-    # содержит готовый к работе экземпляр Database.
-    await init_database()
+    # Шаг 2: Инициализация хранилищ
+    # Создаёт connection pool PostgreSQL, запускает миграции,
+    # подключает Redis для сессий (или fallback на in-memory).
+    # После этого шага глобальные переменные db и session_storage
+    # в bot/storage.py содержат готовые к работе экземпляры.
+    await init_storage()
 
     # Шаг 3: Создание бота и диспетчера
     bot, dp = create_bot()
@@ -108,8 +139,8 @@ async def start_bot() -> None:
         await dp.start_polling(bot)
     finally:
         # Шаг 5: Корректное завершение
-        # Закрываем connection pool PostgreSQL,
+        # Закрываем connection pool PostgreSQL, Redis-соединения,
         # ожидая завершения всех активных запросов
         logger.info("Остановка бота, закрытие ресурсов...")
-        await shutdown_database()
+        await shutdown_storage()
         logger.info("Все ресурсы освобождены.")

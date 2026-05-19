@@ -31,7 +31,6 @@ from bot.keyboards import (
     get_category_search_keyboard,
     get_category_selection_inline_keyboard,
 )
-from bot.storage import user_schemas
 from bot import storage
 from bot.utils import download_file, download_xml_from_telegram, download_file_by_url
 from bot.handlers.common import schema_management
@@ -43,6 +42,9 @@ from utils.xml_reader import XmlReader
 from services.ai_comparator import AIComparator
 
 logger = logging.getLogger('schema_create_mvm')
+
+# Ключ для хранения путей к файлам в сессионном хранилище
+_SESSION_KEY_SCHEMA_MVM: str = 'schema_mvm'
 
 
 # ===== ШАГ 1: ВВОД НАЗВАНИЯ =====
@@ -82,7 +84,7 @@ async def mvm_schema_name_entered(message: types.Message, state: FSMContext) -> 
             return
 
     await state.update_data(schema_name=schema_name, mp_files_processed=False)
-    user_schemas[user_id] = {}
+    await storage.session_storage.set(user_id, _SESSION_KEY_SCHEMA_MVM, {})
     await state.set_state(SchemaMvmStates.waiting_mp_files)
 
     await message.answer(
@@ -105,9 +107,6 @@ async def handle_mvm_mp_file(
     """Обработка файла маркетплейса для МВМ-схемы."""
     user_id = message.from_user.id
 
-    if user_id not in user_schemas:
-        user_schemas[user_id] = {}
-
     data = await state.get_data()
     if data.get('mp_files_processed'):
         return
@@ -118,12 +117,14 @@ async def handle_mvm_mp_file(
         await message.answer("❌ Переименуй файл (добавь wb/ozon/yandex в название)")
         return
 
-    if marketplace in user_schemas[user_id]:
+    user_schemas = await storage.session_storage.get_files_dict(user_id, _SESSION_KEY_SCHEMA_MVM)
+    if marketplace in user_schemas:
         await message.answer(f"⚠️ {marketplace.upper()} уже загружен")
         return
 
-    user_schemas[user_id][marketplace] = file_path
-    loaded = len(user_schemas[user_id])
+    user_schemas[marketplace] = file_path
+    await storage.session_storage.set_files_dict(user_id, _SESSION_KEY_SCHEMA_MVM, user_schemas)
+    loaded = len(user_schemas)
     await message.answer(f"✅ {marketplace.upper()} ({loaded}/3)")
 
     if loaded == 3:
@@ -145,8 +146,7 @@ async def handle_mvm_mp_text(message: types.Message, state: FSMContext) -> None:
     """Обработка текста в состоянии загрузки МП файлов (отмена)."""
     if message.text == "❌ Отмена":
         user_id = message.from_user.id
-        if user_id in user_schemas:
-            user_schemas[user_id] = {}
+        await storage.session_storage.clear(user_id)
         await state.clear()
         await schema_management(message, state)
     else:
@@ -289,8 +289,7 @@ async def handle_mvm_xml_text(message: types.Message, state: FSMContext) -> None
     """Обработка текста в состоянии ожидания XML (отмена или URL)."""
     if message.text == "❌ Отмена":
         user_id = message.from_user.id
-        if user_id in user_schemas:
-            user_schemas[user_id] = {}
+        await storage.session_storage.clear(user_id)
         await state.clear()
         await schema_management(message, state)
         return
@@ -313,8 +312,7 @@ async def handle_category_search(message: types.Message, state: FSMContext) -> N
     """Обработка поискового запроса по категориям XML."""
     if message.text == "❌ Отмена":
         user_id = message.from_user.id
-        if user_id in user_schemas:
-            user_schemas[user_id] = {}
+        await storage.session_storage.clear(user_id)
         await state.clear()
         await schema_management(message, state)
         return
@@ -451,8 +449,7 @@ async def handle_category_cancel(
 ) -> None:
     """Отмена выбора категорий."""
     user_id = callback.from_user.id
-    if user_id in user_schemas:
-        user_schemas[user_id] = {}
+    await storage.session_storage.clear(user_id)
     await state.clear()
 
     await callback.message.answer(
@@ -469,8 +466,7 @@ async def handle_category_selection_text(
     """Обработка текста в состоянии выбора категорий."""
     if message.text == "❌ Отмена":
         user_id = message.from_user.id
-        if user_id in user_schemas:
-            user_schemas[user_id] = {}
+        await storage.session_storage.clear(user_id)
         await state.clear()
         await schema_management(message, state)
     else:
@@ -487,8 +483,7 @@ async def finalize_mvm_schema(message: types.Message, state: FSMContext) -> None
     user_id = message.from_user.id
 
     if message.text == "❌ Отмена":
-        if user_id in user_schemas:
-            user_schemas[user_id] = {}
+        await storage.session_storage.clear(user_id)
         await state.clear()
         await schema_management(message, state)
         return
@@ -500,7 +495,8 @@ async def finalize_mvm_schema(message: types.Message, state: FSMContext) -> None
         )
         return
 
-    if user_id not in user_schemas or len(user_schemas[user_id]) != 3:
+    user_schemas = await storage.session_storage.get_files_dict(user_id, _SESSION_KEY_SCHEMA_MVM)
+    if len(user_schemas) != 3:
         await message.answer("❌ Не хватает файлов МП. Начни заново.")
         return
 
@@ -527,12 +523,10 @@ async def finalize_mvm_schema(message: types.Message, state: FSMContext) -> None
     )
 
     try:
-        file_paths = user_schemas[user_id]
-
         reader = ExcelReader()
         columns = {}
 
-        for marketplace, file_path in file_paths.items():
+        for marketplace, file_path in user_schemas.items():
             config = FILE_CONFIGS[marketplace]
             columns[marketplace] = reader.get_column_names(
                 file_path,
@@ -578,8 +572,8 @@ async def finalize_mvm_schema(message: types.Message, state: FSMContext) -> None
         # Сохраняем сопоставления (полный JSON включая selected_category_ids)
         await storage.db.save_schema_matches(schema_id, comparison_result)
 
-        user_schemas[user_id] = {}
         await state.clear()
+        await storage.session_storage.clear(user_id)
 
         text = _build_result_message(
             schema_name, stats, selected_category_ids, xml_reader, xml_file_path
@@ -589,6 +583,9 @@ async def finalize_mvm_schema(message: types.Message, state: FSMContext) -> None
     except Exception as e:
         await message.answer(f"❌ Ошибка: {str(e)}")
         logger.error("Ошибка создания МВМ-схемы: %s", e, exc_info=True)
+    finally:
+        # Гарантированная очистка сессии при любом исходе
+        await storage.session_storage.clear(user_id)
 
 
 # ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====

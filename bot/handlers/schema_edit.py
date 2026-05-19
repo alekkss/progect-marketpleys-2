@@ -32,7 +32,6 @@ from bot.keyboards import (
     get_filter_matches_mvm_keyboard,
     get_mvm_waiting_xml_keyboard,
 )
-from bot.storage import user_schemas
 from bot import storage
 from bot.utils import download_file
 from bot.handlers.common import cmd_start
@@ -43,6 +42,9 @@ from utils.excel_reader import ExcelReader
 from utils.xml_reader import XmlReader
 
 logger = logging.getLogger('schema_edit')
+
+# Ключ для хранения путей к файлам в сессионном хранилище
+_SESSION_KEY_EDIT: str = 'schema_edit'
 
 
 # =====================================================================
@@ -136,7 +138,7 @@ def _get_group_key(match_type: str, schema_type: str) -> str:
     return fallback.get(match_type, 'matches_all_three')
 
 
-def _format_type(match_type: str, schema_type: str) -> str:
+def _format_type(match_type: str, schema_type: str) -> str | None:
     """Форматирует внутренний тип для отображения пользователю."""
     groups = _get_match_groups(schema_type)
     for _, mt, display_name, _ in groups:
@@ -509,7 +511,7 @@ async def schema_selected_for_edit(message: types.Message, state: FSMContext) ->
         edit_matches_data=matches_data,
     )
 
-    user_schemas[user_id] = {}
+    await storage.session_storage.set(user_id, _SESSION_KEY_EDIT, {})
     await state.update_data(files_processed=False)
 
     stats_text = _get_stats_text(all_matches, schema_type)
@@ -538,9 +540,6 @@ async def handle_edit_validation_file(
     """Загрузка файлов МП для валидации при редактировании."""
     user_id = message.from_user.id
 
-    if user_id not in user_schemas:
-        user_schemas[user_id] = {}
-
     data = await state.get_data()
     if data.get('files_processed'):
         return
@@ -551,14 +550,16 @@ async def handle_edit_validation_file(
         await message.answer("❌ Переименуй файл (добавь wb/ozon/yandex)")
         return
 
-    if marketplace in user_schemas[user_id]:
+    user_schemas = await storage.session_storage.get_files_dict(user_id, _SESSION_KEY_EDIT)
+    if marketplace in user_schemas:
         await message.answer(f"⚠️ {marketplace.upper()} уже загружен")
         return
 
-    user_schemas[user_id][marketplace] = file_path
-    await message.answer(f"✅ {marketplace.upper()} ({len(user_schemas[user_id])}/3)")
+    user_schemas[marketplace] = file_path
+    await storage.session_storage.set_files_dict(user_id, _SESSION_KEY_EDIT, user_schemas)
+    await message.answer(f"✅ {marketplace.upper()} ({len(user_schemas)}/3)")
 
-    if len(user_schemas[user_id]) == 3:
+    if len(user_schemas) == 3:
         data = await state.get_data()
         if data.get('files_processed'):
             return
@@ -569,7 +570,7 @@ async def handle_edit_validation_file(
             reader = ExcelReader()
             available_columns = {}
 
-            for mp, fp in user_schemas[user_id].items():
+            for mp, fp in user_schemas.items():
                 config = FILE_CONFIGS[mp]
                 available_columns[mp] = reader.get_column_names(
                     fp, config['sheet_name'], config['header_row']
@@ -603,8 +604,7 @@ async def handle_edit_xml_file(
     if not message.document:
         if message.text == "❌ Отмена":
             user_id = message.from_user.id
-            if user_id in user_schemas:
-                user_schemas[user_id] = {}
+            await storage.session_storage.clear(user_id)
             await state.clear()
             await edit_schema_start(message, state)
             return
@@ -664,8 +664,7 @@ async def handle_edit_xml_text(message: types.Message, state: FSMContext) -> Non
     """Обработка текста в состоянии ожидания XML при редактировании."""
     if message.text == "❌ Отмена":
         user_id = message.from_user.id
-        if user_id in user_schemas:
-            user_schemas[user_id] = {}
+        await storage.session_storage.clear(user_id)
         await state.clear()
         await edit_schema_start(message, state)
     else:
@@ -703,8 +702,7 @@ async def edit_action_selected(message: types.Message, state: FSMContext) -> Non
     """Обработка действия после загрузки файлов (фильтры / редактирование / добавление)."""
     if message.text == "❌ Отмена":
         user_id = message.from_user.id
-        if user_id in user_schemas:
-            user_schemas[user_id] = {}
+        await storage.session_storage.clear(user_id)
         await edit_schema_start(message, state)
         return
 
@@ -988,10 +986,7 @@ async def new_column_value_entered(message: types.Message, state: FSMContext) ->
     # Сохраняем в БД (await!)
     await storage.db.save_schema_matches(schema_id, matches_data)
 
-    user_id = message.from_user.id
-    if user_id in user_schemas:
-        user_schemas[user_id] = {}
-
+    await storage.session_storage.clear(message.from_user.id)
     await state.clear()
 
     text = (
@@ -1379,10 +1374,7 @@ async def _finalize_new_match(
         edit_all_matches=all_matches,
     )
 
-    user_id = message.from_user.id
-    if user_id in user_schemas:
-        user_schemas[user_id] = {}
-
+    await storage.session_storage.clear(message.from_user.id)
     await state.clear()
 
     total_count = sum(

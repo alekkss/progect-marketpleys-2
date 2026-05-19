@@ -20,11 +20,11 @@ async def cmd_start(message: types.Message, state: FSMContext) -> None:
     """Команда /start — очистка состояния и главное меню."""
     await state.clear()
 
-    # Сбрасываем in-memory хранилища для этого пользователя,
-    # чтобы не оставались пути к файлам от прерванных сессий
+    # Очищаем все сессионные данные пользователя из Redis/in-memory.
+    # Это гарантирует, что прерванные загрузки/создания схем
+    # не оставят "мусор" в хранилище.
     user_id = message.from_user.id
-    storage.user_files[user_id] = {}
-    storage.user_schemas[user_id] = {}
+    await storage.session_storage.clear(user_id)
 
     # Регистрируем или обновляем данные пользователя в БД
     await storage.db.add_user(

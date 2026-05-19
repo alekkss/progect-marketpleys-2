@@ -3,6 +3,7 @@
 """
 
 import os
+import re
 from typing import Dict, List, Any
 from dotenv import load_dotenv
 import sys
@@ -12,14 +13,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # Загрузка переменных окружения
 load_dotenv()
 
+
 def _safe_int_env(name: str, default: int = 0) -> int:
     """
     Безопасное чтение int из переменной окружения
-    
+
     Args:
         name: Имя переменной окружения
         default: Значение по умолчанию если парсинг не удался
-    
+
     Returns:
         int: Числовое значение или default
     """
@@ -30,9 +32,26 @@ def _safe_int_env(name: str, default: int = 0) -> int:
         return default
 
 
+def _validate_redis_url(url: str) -> bool:
+    """
+    Проверяет формат URL Redis.
+
+    Args:
+        url: Строка подключения к Redis
+
+    Returns:
+        True если формат корректный (redis://host:port/db)
+    """
+    if not url:
+        return False
+    # Допустимые схемы: redis://, rediss:// (TLS)
+    pattern = r'^redis(s)?://[^\s/]+:\d+(/\d+)?$'
+    return bool(re.match(pattern, url))
+
+
 class Config:
     """Класс конфигурации приложения, следующий принципу Single Responsibility"""
-    
+
     # OpenRouter API настройки
     OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
     OPENROUTER_BASE_URL: str = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
@@ -42,7 +61,7 @@ class Config:
     # Права доступа
     ACCESS_OWNER_ID: int = _safe_int_env("ACCESS_OWNER_ID", 0)
     ACCESS_ADMIN_ID: int = _safe_int_env("ACCESS_ADMIN_ID", 0)
-    
+
     # Telegram Bot
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
@@ -57,10 +76,11 @@ class Config:
     DATABASE_POOL_MAX_SIZE: int = _safe_int_env("DATABASE_POOL_MAX_SIZE", 10)
 
     # ===================================================================
-    # Redis — хранилище FSM-состояний и кэш
+    # Redis — хранилище FSM-состояний и сессий
     # ===================================================================
     # Формат: redis://host:port/db_number
     # Пример: redis://localhost:6379/0
+    # По умолчанию: redis://localhost:6379/0
     # ===================================================================
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
@@ -69,7 +89,7 @@ class Config:
     # ===================================================================
     LOG_FILE_PATH: str = os.getenv("LOG_FILE_PATH", "./logs/app.log")
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
-    
+
     # Конфигурация файлов для каждого маркетплейса
     FILE_CONFIGS: Dict[str, Dict[str, Any]] = {
         "wildberries": {
@@ -158,7 +178,7 @@ class Config:
         'Вес без упаковки (кг)': 'kg',
         'Вес, кг': 'kg',
     }
-    
+
     # Обязательные совпадения (всегда должны быть сопоставлены)
     MANDATORY_MATCHES: List[Dict[str, str]] = [
         {
@@ -233,9 +253,9 @@ class Config:
             "column_3": "Название цвета от производителя",
             "description": "Цвет товара"
         }
-        
+
     ]
-    
+
     # Список столбцов-исключений (не сравнивать и не синхронизировать)
     EXCLUDED_COLUMNS: List[str] = [
         # Цены (каждый маркетплейс устанавливает свои цены)
@@ -251,19 +271,19 @@ class Config:
         "SKU на Маркете",
         "Артикул WB",
     ]
-    
+
     @classmethod
     def validate(cls) -> bool:
         """
         Валидация обязательных параметров конфигурации.
-        
+
         Проверяет наличие всех критически важных переменных окружения.
         Вызывается при старте приложения. При отсутствии обязательного
         параметра выбрасывает ValueError с понятным описанием.
-        
+
         Returns:
             bool: True если все обязательные параметры заполнены
-        
+
         Raises:
             ValueError: если обязательный параметр отсутствует
         """
@@ -273,27 +293,51 @@ class Config:
                 "Не задан TELEGRAM_BOT_TOKEN в .env. "
                 "Бот не может работать без токена Telegram."
             )
-        
+
         if not cls.OPENROUTER_API_KEY:
             raise ValueError(
                 "Не задан OPENROUTER_API_KEY в .env. "
                 "AI-сопоставление и валидация не будут работать."
             )
-        
+
         if not cls.DATABASE_URL:
             raise ValueError(
                 "Не задан DATABASE_URL в .env. "
                 "Формат: postgresql://user:password@host:port/dbname"
             )
-        
+
         if not cls.ACCESS_OWNER_ID:
             raise ValueError(
                 "Не задан ACCESS_OWNER_ID в .env. "
                 "Система доступа не может работать без ID владельца."
             )
-        
+
+        # ===================================================================
+        # Опциональная проверка Redis (не критичная — есть fallback)
+        # ===================================================================
+        # Redis используется для хранения FSM-состояний и сессий загрузки.
+        # Если Redis недоступен — бот автоматически переключается на
+        # in-memory fallback (данные сессий будут потеряны при перезапуске).
+        # ===================================================================
+        if not cls.REDIS_URL:
+            import logging
+            logging.getLogger('config').warning(
+                "REDIS_URL не задан в .env. "
+                "FSM-состояния и сессии загрузки будут храниться в памяти "
+                "(потеряются при перезапуске бота). "
+                "Установите REDIS_URL=redis://localhost:6379/0 для сохранения состояний."
+            )
+        elif not _validate_redis_url(cls.REDIS_URL):
+            import logging
+            logging.getLogger('config').warning(
+                "REDIS_URL имеет некорректный формат: %s. "
+                "Ожидается: redis://host:port/db или rediss://host:port/db. "
+                "FSM-состояния и сессии будут храниться в памяти.",
+                cls.REDIS_URL,
+            )
+
         return True
-    
+
     # Прокси настройки
     PROXY_ENABLED: bool = os.getenv("PROXY_ENABLED", "false").lower() == "true"
     PROXY_URL: str = os.getenv("PROXY_URL", "")
@@ -301,31 +345,31 @@ class Config:
 
 class ColumnValidator:
     """Класс для валидации столбцов (Single Responsibility Principle)"""
-    
+
     @staticmethod
     def is_excluded_column(column_name: str) -> bool:
         """
         Проверяет, находится ли столбец в списке исключений
-        
+
         Args:
             column_name: название столбца
-            
+
         Returns:
             True если столбец исключен, False в противном случае
         """
         if not column_name:
             return False
-        
+
         column_lower = column_name.strip().lower()
-        
+
         for excluded in Config.EXCLUDED_COLUMNS:
             if excluded.strip().lower() == column_lower:
                 return True
-        
+
         return False
 
 
-# Экспортируем для обратной совместимости
+# Экспорты для обратной совместимости
 OPENROUTER_API_KEY = Config.OPENROUTER_API_KEY
 OPENROUTER_BASE_URL = Config.OPENROUTER_BASE_URL
 AI_MODEL = Config.AI_MODEL

@@ -2,65 +2,66 @@
 Глобальное хранилище данных бота.
 
 Модуль предоставляет единую точку доступа к экземпляру Database
-и временным in-memory хранилищам для всех хендлеров бота.
+и сессионному хранилищу SessionStorage для всех хендлеров бота.
 
-Жизненный цикл Database:
-    1. При импорте: db = None (заглушка до инициализации)
-    2. При старте бота: await init_database() → db = Database(...)
-    3. При работе: хендлеры используют db напрямую
-    4. При остановке: await shutdown_database() → pool.close()
+Жизненный цикл:
+    1. При импорте: db = None, session_storage = SessionStorage() (не подключён)
+    2. При старте бота: await init_storage() → db.connect() + session_storage.connect()
+    3. При работе: хендлеры используют db и session_storage напрямую
+    4. При остановке: await shutdown_storage() → закрытие всех соединений
 
-Временные хранилища (user_files, user_schemas):
-    - Живут только в оперативной памяти
-    - Сбрасываются при перезапуске бота
-    - Ключ: user_id (int), значение: dict с путями к файлам
-    - Очищаются хендлером после завершения FSM-сессии
+Важно:
+    До вызова init_storage() переменные db и session_storage не готовы
+    к полноценному использованию (db = None, Redis не подключён).
+    Порядок гарантируется тем, что init_storage() вызывается в start_bot()
+    ДО регистрации хендлеров и начала polling.
 """
 
-from typing import Optional, Dict
+from typing import Optional
 
 from database.database import Database
 from database.migrations import run_migrations
 from config.config import Config
 from utils.logger_config import setup_logger
+from bot.session_storage import SessionStorage
 
 logger = setup_logger('storage')
 
 # ===================================================================
-# Экземпляр базы данных (инициализируется через init_database)
+# Экземпляр базы данных (инициализируется через init_storage)
 # ===================================================================
-# ВАЖНО: до вызова init_database() значение равно None.
+# ВАЖНО: до вызова init_storage() значение равно None.
 # Все хендлеры импортируют db и используют его ПОСЛЕ инициализации.
-# Порядок гарантируется тем, что init_database() вызывается
+# Порядок гарантируется тем, что init_storage() вызывается
 # в start_bot() ДО регистрации хендлеров и начала polling.
 # ===================================================================
 db: Optional[Database] = None
 
 # ===================================================================
-# Временные in-memory хранилища для FSM-сессий
+# Сессионное хранилище (Redis с fallback на in-memory)
 # ===================================================================
-# user_files: временное хранение путей к загруженным Excel/XML файлам
-#   при обработке (upload.py). Формат: {user_id: {'wildberries': path, ...}}
+# Используется для временных данных FSM-сессий:
+#   - пути к загруженным файлам при обработке (upload.py)
+#   - пути к файлам при создании схем (schema_create.py, schema_create_mvm.py)
 #
-# user_schemas: временное хранение путей к файлам при создании
-#   и редактировании схем (schema_create.py, schema_edit.py и др.).
-#   Формат: {user_id: {'wildberries': path, 'ozon': path, 'yandex': path}}
-#
-# Оба словаря очищаются хендлером после завершения FSM-сессии
-# (state.clear() + user_files[user_id] = {}).
+# Преимущества перед глобальным dict:
+#   - TTL 30 минут — автоочистка "забытых" сессий
+#   - Persistence (при настроенном Redis) — данные переживают перезапуск
+#   - Shared state — доступно из нескольких процессов бота
+#   - Graceful fallback — если Redis недоступен, работает на dict с предупреждением
 # ===================================================================
-user_files: Dict[int, Dict] = {}
-user_schemas: Dict[int, Dict] = {}
+session_storage: SessionStorage = SessionStorage()
 
 
-async def init_database() -> Database:
+async def init_storage() -> Database:
     """
-    Асинхронная инициализация базы данных.
+    Асинхронная инициализация всех хранилищ приложения.
 
-    Выполняет три действия в строгом порядке:
+    Выполняет действия в строгом порядке:
         1. Создаёт экземпляр Database с параметрами из конфигурации
-        2. Создаёт connection pool (await db.connect())
+        2. Создаёт connection pool PostgreSQL (await db.connect())
         3. Запускает миграции (создание таблиц, обновление структуры)
+        4. Подключается к Redis (session_storage.connect())
 
     Функция должна вызываться ОДИН РАЗ при старте приложения,
     до регистрации хендлеров и начала polling.
@@ -86,26 +87,45 @@ async def init_database() -> Database:
         pool_max_size=Config.DATABASE_POOL_MAX_SIZE,
     )
 
-    # Создаём connection pool
+    # Шаг 1: Создаём connection pool PostgreSQL
     await db.connect()
 
-    # Запускаем миграции (создание таблиц + обновление структуры)
+    # Шаг 2: Запускаем миграции (создание таблиц + обновление структуры)
     await run_migrations(db.pool)
 
     logger.info("База данных инициализирована и готова к работе.")
+
+    # Шаг 3: Подключаем сессионное хранилище (Redis или fallback)
+    try:
+        await session_storage.connect()
+    except Exception as e:
+        logger.warning(
+            "Сессионное хранилище не удалось инициализировать: %s. "
+            "Бот продолжит работу с in-memory fallback.",
+            e,
+        )
+
     return db
 
 
-async def shutdown_database() -> None:
+async def shutdown_storage() -> None:
     """
-    Корректное завершение работы с базой данных.
+    Корректное завершение работы всех хранилищ.
 
-    Закрывает connection pool, ожидая завершения всех
-    активных запросов. Вызывается при остановке бота
-    (graceful shutdown).
+    Закрывает connection pool PostgreSQL и соединение с Redis,
+    ожидая завершения всех активных запросов.
+    Вызывается при остановке бота (graceful shutdown).
     """
     global db
 
+    # Шаг 1: Закрываем Redis-соединение
+    try:
+        await session_storage.close()
+        logger.info("Сессионное хранилище закрыто.")
+    except Exception as e:
+        logger.warning("Ошибка при закрытии сессионного хранилища: %s", e)
+
+    # Шаг 2: Закрываем PostgreSQL
     if db is None:
         logger.warning("База данных не была инициализирована, закрытие пропущено.")
         return

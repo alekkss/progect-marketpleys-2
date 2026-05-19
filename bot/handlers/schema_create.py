@@ -16,8 +16,7 @@ from bot.keyboards import (
     get_create_schema_keyboard,
     get_schema_type_keyboard,
 )
-from bot.storage import user_schemas
-from bot import storage  # ✅ Импортируем модуль, а не переменную
+from bot import storage
 from bot.utils import download_file
 from bot.handlers.common import schema_management
 from bot.security import AccessManager
@@ -26,6 +25,10 @@ from utils.excel_reader import ExcelReader
 from services.ai_comparator import AIComparator
 
 logger = logging.getLogger('schema_create')
+
+# Ключ для хранения путей к файлам в сессионном хранилище
+_SESSION_KEY_SCHEMA: str = 'schema'
+
 
 async def create_schema_start(message: types.Message, state: FSMContext) -> None:
     """Начало создания схемы — выбор типа."""
@@ -61,7 +64,7 @@ async def schema_name_entered(message: types.Message, state: FSMContext) -> None
     if message.text == "❌ Отмена":
         await schema_management(message, state)
         return
-    
+
     schema_name = message.text.strip()
     user_id = message.from_user.id
     can_see_all = await AccessManager.can_see_all_schemas(user_id)
@@ -85,7 +88,7 @@ async def schema_name_entered(message: types.Message, state: FSMContext) -> None
             return
 
     await state.update_data(schema_name=schema_name)
-    user_schemas[user_id] = {}
+    await storage.session_storage.set(user_id, _SESSION_KEY_SCHEMA, {})
     await state.set_state(SchemaStates.waiting_schema_files)
 
     await message.answer(
@@ -97,8 +100,6 @@ async def schema_name_entered(message: types.Message, state: FSMContext) -> None
 async def handle_schema_file(message: types.Message, state: FSMContext, bot) -> None:
     """Обработка загруженного файла для схемы."""
     user_id = message.from_user.id
-    if user_id not in user_schemas:
-        user_schemas[user_id] = {}
 
     data = await state.get_data()
     if data.get('files_processed'):
@@ -108,14 +109,17 @@ async def handle_schema_file(message: types.Message, state: FSMContext, bot) -> 
     if not marketplace:
         await message.answer("❌ Переименуй файл (добавь wb/ozon/yandex)")
         return
-    if marketplace in user_schemas[user_id]:
+
+    user_schemas = await storage.session_storage.get_files_dict(user_id, _SESSION_KEY_SCHEMA)
+    if marketplace in user_schemas:
         await message.answer(f"⚠️ {marketplace.upper()} уже загружен")
         return
 
-    user_schemas[user_id][marketplace] = file_path
-    await message.answer(f"✅ {marketplace.upper()} ({len(user_schemas[user_id])}/3)")
+    user_schemas[marketplace] = file_path
+    await storage.session_storage.set_files_dict(user_id, _SESSION_KEY_SCHEMA, user_schemas)
+    await message.answer(f"✅ {marketplace.upper()} ({len(user_schemas)}/3)")
 
-    if len(user_schemas[user_id]) == 3:
+    if len(user_schemas) == 3:
         data = await state.get_data()
         if data.get('files_processed'):
             return
@@ -128,9 +132,11 @@ async def finalize_schema_creation(message: types.Message, state: FSMContext) ->
     if current_state != SchemaStates.waiting_schema_files:
         await message.answer("❌ Сначала начни создание схемы через '➕ Создать схему'")
         return
-    
+
     user_id = message.from_user.id
-    if user_id not in user_schemas or len(user_schemas[user_id]) != 3:
+    user_schemas = await storage.session_storage.get_files_dict(user_id, _SESSION_KEY_SCHEMA)
+
+    if len(user_schemas) != 3:
         await message.answer("❌ Загрузи 3 файла!")
         return
 
@@ -143,11 +149,10 @@ async def finalize_schema_creation(message: types.Message, state: FSMContext) ->
     await message.answer("⏳ Анализирую столбцы...")
 
     try:
-        file_paths = user_schemas[user_id]
         reader = ExcelReader()
         columns = {}
 
-        for marketplace, file_path in file_paths.items():
+        for marketplace, file_path in user_schemas.items():
             config = FILE_CONFIGS[marketplace]
             columns[marketplace] = reader.get_column_names(
                 file_path, config['sheet_name'], config['header_row']
@@ -175,8 +180,8 @@ async def finalize_schema_creation(message: types.Message, state: FSMContext) ->
         # Сохраняем сопоставления
         await storage.db.save_schema_matches(schema_id, comparison_result)
 
-        user_schemas[user_id] = {}
         await state.clear()
+        await storage.session_storage.clear(user_id)
 
         text = f"✅ Схема '{schema_name}' создана!\n\n"
         text += f"📊 Сохранено совпадений: {matches_count}"
@@ -188,6 +193,9 @@ async def finalize_schema_creation(message: types.Message, state: FSMContext) ->
     except Exception as e:
         await message.answer(f"❌ Ошибка: {str(e)}")
         logger.error("Ошибка создания схемы: %s", e, exc_info=True)
+    finally:
+        # Гарантированная очистка сессии при любом исходе
+        await storage.session_storage.clear(user_id)
 
 def register_schema_create_handlers(dp, bot) -> None:
     """Регистрация обработчиков создания схем."""

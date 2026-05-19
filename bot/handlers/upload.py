@@ -22,7 +22,6 @@ from bot.keyboards import (
     get_schema_list_keyboard,
     get_mvm_waiting_xml_keyboard,
 )
-from bot.storage import user_files
 from bot import storage
 from bot.utils import download_file, download_xml_from_telegram, download_file_by_url
 from bot.handlers.common import cmd_start
@@ -35,6 +34,10 @@ from services.ai_comparator import AIComparator
 from utils.logger_config import setup_logger
 
 logger = setup_logger('upload')
+
+# Ключ для хранения путей к файлам в сессионном хранилище
+_SESSION_KEY_UPLOAD: str = 'upload'
+
 
 # =====================================================================
 # ОБЩИЙ ВХОД: ВЫБОР СХЕМЫ
@@ -90,7 +93,7 @@ async def schema_selected(message: types.Message, state: FSMContext, bot) -> Non
             selected_schema_type='mvm',
             mvm_mp_files_processed=False
         )
-        user_files[user_id] = {}
+        await storage.session_storage.set(user_id, _SESSION_KEY_UPLOAD, {})
         await state.set_state(UploadMvmStates.waiting_for_mp_files)
         await message.answer(
             f"📦 МВМ-схема '{message.text}' выбрана\n\n"
@@ -102,7 +105,7 @@ async def schema_selected(message: types.Message, state: FSMContext, bot) -> Non
             selected_schema_id=schema_id,
             selected_schema_type='standard'
         )
-        user_files[user_id] = {}
+        await storage.session_storage.set(user_id, _SESSION_KEY_UPLOAD, {})
         await state.set_state(UploadStates.waiting_for_files)
         await message.answer(
             f"✅ Схема '{message.text}' выбрана\n\nОтправь 3 файла Excel",
@@ -115,8 +118,6 @@ async def schema_selected(message: types.Message, state: FSMContext, bot) -> Non
 async def handle_file(message: types.Message, state: FSMContext, bot) -> None:
     """Обработка загруженного файла (стандартная схема)."""
     user_id = message.from_user.id
-    if user_id not in user_files:
-        user_files[user_id] = {}
 
     data = await state.get_data()
     if data.get('files_processed'):
@@ -126,14 +127,17 @@ async def handle_file(message: types.Message, state: FSMContext, bot) -> None:
     if not marketplace:
         await message.answer("❌ Переименуй файл (добавь wb/ozon/yandex)")
         return
-    if marketplace in user_files[user_id]:
+
+    user_files = await storage.session_storage.get_files_dict(user_id, _SESSION_KEY_UPLOAD)
+    if marketplace in user_files:
         await message.answer(f"⚠️ {marketplace.upper()} уже загружен")
         return
 
-    user_files[user_id][marketplace] = file_path
-    await message.answer(f"✅ {marketplace.upper()} ({len(user_files[user_id])}/3)")
+    user_files[marketplace] = file_path
+    await storage.session_storage.set_files_dict(user_id, _SESSION_KEY_UPLOAD, user_files)
+    await message.answer(f"✅ {marketplace.upper()} ({len(user_files)}/3)")
 
-    if len(user_files[user_id]) == 3:
+    if len(user_files) == 3:
         data = await state.get_data()
         if data.get('files_processed'):
             return
@@ -143,7 +147,9 @@ async def handle_file(message: types.Message, state: FSMContext, bot) -> None:
 async def process_files(message: types.Message, state: FSMContext, bot) -> None:
     """Обработка файлов по стандартной схеме."""
     user_id = message.from_user.id
-    if user_id not in user_files or len(user_files[user_id]) != 3:
+    user_files = await storage.session_storage.get_files_dict(user_id, _SESSION_KEY_UPLOAD)
+
+    if len(user_files) != 3:
         await message.answer("❌ Загрузи 3 файла!")
         return
 
@@ -157,8 +163,7 @@ async def process_files(message: types.Message, state: FSMContext, bot) -> None:
     await message.answer("⏳ Обработка по схеме...")
 
     try:
-        file_paths = user_files[user_id]
-        for marketplace, file_path in file_paths.items():
+        for marketplace, file_path in user_files.items():
             await storage.db.add_file(
                 user_id, processing_id, marketplace,
                 os.path.basename(file_path), file_path
@@ -185,7 +190,7 @@ async def process_files(message: types.Message, state: FSMContext, bot) -> None:
 
         synchronizer = DataSynchronizer(comparison_result, ai_comparator=comparator)
         synced_dfs, changes_log = await synchronizer.synchronize_data(
-            file_paths, output_sync_paths
+            user_files, output_sync_paths
         )
 
         # Шаг 1: создаём файл отчёта через ExcelWriter
@@ -210,8 +215,8 @@ async def process_files(message: types.Message, state: FSMContext, bot) -> None:
             await message.answer_document(FSInputFile(path))
         await message.answer_document(FSInputFile(report_path), caption="📊 Отчет")
 
-        user_files[user_id] = {}
         await state.clear()
+        await storage.session_storage.clear(user_id)
         await message.answer(
             f"✅ Готово!\n\n📦 Обработка товаров:\n"
             f"• WB: {wb_count}\n• Ozon: {ozon_count}\n• Яндекс: {yandex_count}\n\n"
@@ -223,6 +228,9 @@ async def process_files(message: types.Message, state: FSMContext, bot) -> None:
         await storage.db.fail_processing(processing_id, str(e))
         await message.answer(f"❌ Ошибка: {str(e)}")
         logger.error("Ошибка обработки: %s", e, exc_info=True)
+    finally:
+        # Гарантированная очистка сессии при любом исходе
+        await storage.session_storage.clear(user_id)
 
 # =====================================================================
 # МВМ-ФЛОУ (3 МП + XML)
@@ -230,21 +238,24 @@ async def process_files(message: types.Message, state: FSMContext, bot) -> None:
 async def handle_mvm_upload_mp_file(message: types.Message, state: FSMContext, bot) -> None:
     """Загрузка файла МП при обработке по МВМ-схеме."""
     user_id = message.from_user.id
-    if user_id not in user_files:
-        user_files[user_id] = {}
-    if (await state.get_data()).get('mvm_mp_files_processed'):
+
+    data = await state.get_data()
+    if data.get('mvm_mp_files_processed'):
         return
 
     file_path, file_name, marketplace = await download_file(bot, message, user_id)
     if not marketplace:
         await message.answer("❌ Переименуй файл (добавь wb/ozon/yandex)")
         return
-    if marketplace in user_files[user_id]:
+
+    user_files = await storage.session_storage.get_files_dict(user_id, _SESSION_KEY_UPLOAD)
+    if marketplace in user_files:
         await message.answer(f"⚠️ {marketplace.upper()} уже загружен")
         return
 
-    user_files[user_id][marketplace] = file_path
-    loaded = len(user_files[user_id])
+    user_files[marketplace] = file_path
+    await storage.session_storage.set_files_dict(user_id, _SESSION_KEY_UPLOAD, user_files)
+    loaded = len(user_files)
     await message.answer(f"✅ {marketplace.upper()} ({loaded}/3)")
 
     if loaded == 3:
@@ -261,8 +272,7 @@ async def handle_mvm_upload_mp_file(message: types.Message, state: FSMContext, b
 async def handle_mvm_upload_mp_text(message: types.Message, state: FSMContext) -> None:
     if message.text == "❌ Отмена":
         u = message.from_user.id
-        if u in user_files:
-            user_files[u] = {}
+        await storage.session_storage.clear(u)
         await state.clear()
         await cmd_start(message, state)
         return
@@ -272,8 +282,7 @@ async def handle_mvm_upload_xml_file(message: types.Message, state: FSMContext, 
     if not message.document:
         if message.text == "❌ Отмена":
             u = message.from_user.id
-            if u in user_files:
-                user_files[u] = {}
+            await storage.session_storage.clear(u)
             await state.clear()
             await cmd_start(message, state)
             return
@@ -307,8 +316,7 @@ async def handle_mvm_upload_xml_file(message: types.Message, state: FSMContext, 
 async def handle_mvm_upload_xml_text(message: types.Message, state: FSMContext) -> None:
     if message.text == "❌ Отмена":
         u = message.from_user.id
-        if u in user_files:
-            user_files[u] = {}
+        await storage.session_storage.clear(u)
         await state.clear()
         await cmd_start(message, state)
         return
@@ -371,7 +379,9 @@ async def _validate_and_save_upload_xml(
 
 async def process_files_mvm(message: types.Message, state: FSMContext, bot) -> None:
     user_id = message.from_user.id
-    if user_id not in user_files or len(user_files[user_id]) != 3:
+    user_files = await storage.session_storage.get_files_dict(user_id, _SESSION_KEY_UPLOAD)
+
+    if len(user_files) != 3:
         await message.answer("❌ Загрузи 3 файла МП!")
         return
 
@@ -389,8 +399,7 @@ async def process_files_mvm(message: types.Message, state: FSMContext, bot) -> N
     await message.answer("⏳ Обработка по МВМ-схеме...", reply_markup=ReplyKeyboardRemove())
 
     try:
-        file_paths = user_files[user_id]
-        for marketplace, file_path in file_paths.items():
+        for marketplace, file_path in user_files.items():
             await storage.db.add_file(
                 user_id, processing_id, marketplace,
                 os.path.basename(file_path), file_path
@@ -435,7 +444,7 @@ async def process_files_mvm(message: types.Message, state: FSMContext, bot) -> N
             selected_category_ids=selected_category_ids,
         )
         synced_dfs, changes_log = await synchronizer.synchronize_data(
-            file_paths, output_sync_paths
+            user_files, output_sync_paths
         )
 
         # Шаг 1: создаём файл отчёта через ExcelWriter
@@ -464,8 +473,8 @@ async def process_files_mvm(message: types.Message, state: FSMContext, bot) -> N
             await message.answer_document(FSInputFile(path))
         await message.answer_document(FSInputFile(report_path), caption="📊 Отчет МВМ")
 
-        user_files[user_id] = {}
         await state.clear()
+        await storage.session_storage.clear(user_id)
 
         result_text = (
             f"✅ Готово!\n\n📦 Обработка товаров:\n"
@@ -480,6 +489,9 @@ async def process_files_mvm(message: types.Message, state: FSMContext, bot) -> N
         await storage.db.fail_processing(processing_id, str(e))
         await message.answer(f"❌ Ошибка: {str(e)}")
         logger.error("Ошибка обработки МВМ: %s", e, exc_info=True)
+    finally:
+        # Гарантированная очистка сессии при любом исходе
+        await storage.session_storage.clear(user_id)
 
 def register_upload_handlers(dp, bot) -> None:
     from functools import partial

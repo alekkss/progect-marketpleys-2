@@ -85,6 +85,17 @@ class Config:
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
     # ===================================================================
+    # Очередь задач (фоновая обработка синхронизации)
+    # ===================================================================
+    # MAX_CONCURRENT_TASKS — максимум одновременных обработок (Semaphore).
+    # При 5 пользователях одновременно — 5 задач в параллели, остальные
+    # ждут в очереди. Это предотвращает перегрузку CPU и AI API.
+    # TASK_QUEUE_KEY — ключ Redis List для хранения ID задач.
+    # ===================================================================
+    MAX_CONCURRENT_TASKS: int = _safe_int_env("MAX_CONCURRENT_TASKS", 5)
+    TASK_QUEUE_KEY: str = os.getenv("TASK_QUEUE_KEY", "bot:task_queue")
+
+    # ===================================================================
     # Логирование
     # ===================================================================
     LOG_FILE_PATH: str = os.getenv("LOG_FILE_PATH", "./logs/app.log")
@@ -313,6 +324,24 @@ class Config:
             )
 
         # ===================================================================
+        # Валидация параметров очереди задач
+        # ===================================================================
+        if cls.MAX_CONCURRENT_TASKS <= 0:
+            raise ValueError(
+                f"MAX_CONCURRENT_TASKS должен быть положительным числом, "
+                f"получено: {cls.MAX_CONCURRENT_TASKS}. "
+                f"Установите значение от 1 до 10 (рекомендуется 5)."
+            )
+        if cls.MAX_CONCURRENT_TASKS > 20:
+            import logging
+            logging.getLogger('config').warning(
+                "MAX_CONCURRENT_TASKS=%s слишком высокое. "
+                "Это может привести к перегрузке CPU и AI API. "
+                "Рекомендуется значение 5.",
+                cls.MAX_CONCURRENT_TASKS,
+            )
+
+        # ===================================================================
         # Опциональная проверка Redis (не критичная — есть fallback)
         # ===================================================================
         # Redis используется для хранения FSM-состояний и сессий загрузки.
@@ -398,3 +427,5 @@ DATABASE_POOL_MAX_SIZE = Config.DATABASE_POOL_MAX_SIZE
 REDIS_URL = Config.REDIS_URL
 LOG_FILE_PATH = Config.LOG_FILE_PATH
 LOG_LEVEL = Config.LOG_LEVEL
+MAX_CONCURRENT_TASKS = Config.MAX_CONCURRENT_TASKS
+TASK_QUEUE_KEY = Config.TASK_QUEUE_KEY

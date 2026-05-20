@@ -1,8 +1,9 @@
 """
 Обработчики загрузки и обработки файлов.
 Поддерживает два типа схем:
-- standard (3 МП): загрузка 3 Excel → синхронизация между МП
-- mvm (3 МП + XML): загрузка 3 Excel + XML → синхронизация + заполнение из XML
+- standard (3 МП): загрузка 3 Excel → задача в очередь
+- mvm (3 МП + XML): загрузка 3 Excel + XML → задача в очередь
+
 Принцип Open/Closed: МВМ-логика добавлена через отдельные StatesGroup
 и хендлеры, стандартный флоу не модифицирован.
 """
@@ -12,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 import os
 from datetime import datetime
 from aiogram import types, F
-from aiogram.types import FSInputFile, ReplyKeyboardRemove
+from aiogram.types import ReplyKeyboardRemove
 from aiogram.fsm.context import FSMContext
 from bot.states import UploadStates, UploadMvmStates
 from bot.keyboards import (
@@ -26,11 +27,8 @@ from bot import storage
 from bot.utils import download_file, download_xml_from_telegram, download_file_by_url
 from bot.handlers.common import cmd_start
 from bot.security import AccessManager
-from config.config import FILE_CONFIGS
-from utils.excel_writer import ExcelWriter
+from services.task_queue import Task, TaskQueue
 from utils.xml_reader import XmlReader
-from services.data_synchronizer import DataSynchronizer
-from services.ai_comparator import AIComparator
 from utils.logger_config import setup_logger
 
 logger = setup_logger('upload')
@@ -144,8 +142,13 @@ async def handle_file(message: types.Message, state: FSMContext, bot) -> None:
         await state.update_data(files_processed=True)
         await message.answer("✅ Все файлы загружены!", reply_markup=get_process_keyboard())
 
-async def process_files(message: types.Message, state: FSMContext, bot) -> None:
-    """Обработка файлов по стандартной схеме."""
+async def process_files(message: types.Message, state: FSMContext, bot, task_queue: TaskQueue) -> None:
+    """
+    Постановка стандартной задачи в очередь на обработку.
+
+    Вместо inline-синхронизации создаёт Task и передаёт её в TaskQueue.
+    Результат придёт пользователю автоматически от TaskWorker.
+    """
     user_id = message.from_user.id
     user_files = await storage.session_storage.get_files_dict(user_id, _SESSION_KEY_UPLOAD)
 
@@ -159,78 +162,40 @@ async def process_files(message: types.Message, state: FSMContext, bot) -> None:
         await message.answer("❌ Схема не выбрана!")
         return
 
-    processing_id = await storage.db.start_processing(user_id)
-    await message.answer("⏳ Обработка по схеме...")
+    # Формируем пути для выходных файлов
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = f"output/{user_id}_{timestamp}"
+    os.makedirs(output_dir, exist_ok=True)
 
-    try:
-        for marketplace, file_path in user_files.items():
-            await storage.db.add_file(
-                user_id, processing_id, marketplace,
-                os.path.basename(file_path), file_path
-            )
+    report_path = f"{output_dir}/результат_{timestamp}.xlsx"
 
-        await message.answer("📖 Читаю файлы...")
-        comparison_result = await storage.db.get_schema_matches(schema_id)
-        await message.answer(
-            f"🔄 Синхронизирую по схеме "
-            f"({len(comparison_result.get('matches_all_three', []))} столбцов)..."
-        )
+    # Создаём задачу и ставим в очередь
+    task = Task(
+        user_id=user_id,
+        chat_id=message.chat.id,
+        task_type="standard",
+        schema_id=schema_id,
+        file_paths=user_files,
+        output_dir=output_dir,
+        report_path=report_path,
+    )
+    await task_queue.enqueue(task)
 
-        comparator = AIComparator()
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = f"output/{user_id}_{timestamp}"
-        os.makedirs(output_dir, exist_ok=True)
+    # Очищаем сессию и состояние
+    await state.clear()
+    await storage.session_storage.clear(user_id)
 
-        output_sync_paths = {
-            'wildberries': f"{output_dir}/WB_синхронизировано.xlsx",
-            'ozon':        f"{output_dir}/Ozon_синхронизировано.xlsx",
-            'yandex':      f"{output_dir}/Яндекс_синхронизировано.xlsx",
-        }
-        report_path = f"{output_dir}/результат_{timestamp}.xlsx"
+    # Сообщаем пользователю о постановке в очередь
+    queue_length = await task_queue.get_queue_length()
+    position_text = ""
+    if queue_length > 1:
+        position_text = f"\n\n📊 Задач в очереди: {queue_length}"
 
-        synchronizer = DataSynchronizer(comparison_result, ai_comparator=comparator)
-        synced_dfs, changes_log = await synchronizer.synchronize_data(
-            user_files, output_sync_paths
-        )
-
-        # Шаг 1: создаём файл отчёта через ExcelWriter
-        await message.answer("📊 Создаю отчет...")
-        writer = ExcelWriter()
-        writer.create_report_with_changes(comparison_result, changes_log, report_path)
-
-        # Шаг 2: добавляем AI-лог в уже готовый файл отчёта
-        synchronizer.create_ai_log_in_report(report_path)
-
-        wb_count     = len(synced_dfs['wildberries'])
-        ozon_count   = len(synced_dfs['ozon'])
-        yandex_count = len(synced_dfs['yandex'])
-        total_synced = sum(len(changes_log[mp]) for mp in changes_log)
-
-        await storage.db.complete_processing(
-            processing_id, wb_count, ozon_count, yandex_count, total_synced
-        )
-
-        await message.answer("📤 Отправляю результаты...")
-        for path in output_sync_paths.values():
-            await message.answer_document(FSInputFile(path))
-        await message.answer_document(FSInputFile(report_path), caption="📊 Отчет")
-
-        await state.clear()
-        await storage.session_storage.clear(user_id)
-        await message.answer(
-            f"✅ Готово!\n\n📦 Обработка товаров:\n"
-            f"• WB: {wb_count}\n• Ozon: {ozon_count}\n• Яндекс: {yandex_count}\n\n"
-            f"🔄 Синхронизировано ячеек: {total_synced}",
-            reply_markup=get_main_menu_keyboard()
-        )
-
-    except Exception as e:
-        await storage.db.fail_processing(processing_id, str(e))
-        await message.answer(f"❌ Ошибка: {str(e)}")
-        logger.error("Ошибка обработки: %s", e, exc_info=True)
-    finally:
-        # Гарантированная очистка сессии при любом исходе
-        await storage.session_storage.clear(user_id)
+    await message.answer(
+        f"✅ Задача принята в обработку!{position_text}\n\n"
+        f"⏳ Результат придёт автоматически по завершении.",
+        reply_markup=get_main_menu_keyboard()
+    )
 
 # =====================================================================
 # МВМ-ФЛОУ (3 МП + XML)
@@ -321,7 +286,7 @@ async def handle_mvm_upload_xml_text(message: types.Message, state: FSMContext) 
         await cmd_start(message, state)
         return
     if message.text == "🚀 Обработать":
-        await process_files_mvm(message, state, None)
+        await process_files_mvm(message, state, None, None)
         return
 
     text = message.text.strip()
@@ -377,7 +342,13 @@ async def _validate_and_save_upload_xml(
         reply_markup=get_process_keyboard()
     )
 
-async def process_files_mvm(message: types.Message, state: FSMContext, bot) -> None:
+async def process_files_mvm(message: types.Message, state: FSMContext, bot, task_queue: TaskQueue) -> None:
+    """
+    Постановка МВМ-задачи в очередь на обработку.
+
+    Вместо inline-синхронизации создаёт Task и передаёт её в TaskQueue.
+    Результат придёт пользователю автоматически от TaskWorker.
+    """
     user_id = message.from_user.id
     user_files = await storage.session_storage.get_files_dict(user_id, _SESSION_KEY_UPLOAD)
 
@@ -386,7 +357,7 @@ async def process_files_mvm(message: types.Message, state: FSMContext, bot) -> N
         return
 
     data = await state.get_data()
-    schema_id     = data.get('selected_schema_id')
+    schema_id = data.get('selected_schema_id')
     xml_file_path = data.get('mvm_xml_file_path')
     if not schema_id:
         await message.answer("❌ Схема не выбрана!")
@@ -395,112 +366,50 @@ async def process_files_mvm(message: types.Message, state: FSMContext, bot) -> N
         await message.answer("❌ XML файл не загружен!")
         return
 
-    processing_id = await storage.db.start_processing(user_id)
-    await message.answer("⏳ Обработка по МВМ-схеме...", reply_markup=ReplyKeyboardRemove())
+    # Формируем пути для выходных файлов
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = f"output/{user_id}_{timestamp}"
+    os.makedirs(output_dir, exist_ok=True)
 
-    try:
-        for marketplace, file_path in user_files.items():
-            await storage.db.add_file(
-                user_id, processing_id, marketplace,
-                os.path.basename(file_path), file_path
-            )
+    report_path = f"{output_dir}/результат_{timestamp}.xlsx"
 
-        await message.answer("📖 Читаю файлы МП и XML каталог...")
-        comparison_result = await storage.db.get_schema_matches(schema_id)
+    # Создаём задачу и ставим в очередь
+    task = Task(
+        user_id=user_id,
+        chat_id=message.chat.id,
+        task_type="mvm",
+        schema_id=schema_id,
+        file_paths=user_files,
+        output_dir=output_dir,
+        report_path=report_path,
+        xml_file_path=xml_file_path,
+    )
+    await task_queue.enqueue(task)
 
-        xml_reader    = XmlReader()
-        xml_offer_data = xml_reader.get_offer_data(xml_file_path)
-        xml_categories = xml_reader.get_categories(xml_file_path)
-        logger.info("XML: %d офферов, %d категорий", len(xml_offer_data), len(xml_categories))
+    # Очищаем сессию и состояние
+    await state.clear()
+    await storage.session_storage.clear(user_id)
 
-        total_matches = sum(
-            len(v) for k, v in comparison_result.items()
-            if isinstance(v, list) and k.startswith('match')
-        )
-        await message.answer(
-            f"🔄 Синхронизирую по МВМ-схеме\n"
-            f"📊 Сопоставлений: {total_matches}\n"
-            f"📦 XML офферов: {len(xml_offer_data)}"
-        )
+    # Сообщаем пользователю о постановке в очередь
+    queue_length = await task_queue.get_queue_length()
+    position_text = ""
+    if queue_length > 1:
+        position_text = f"\n\n📊 Задач в очереди: {queue_length}"
 
-        comparator = AIComparator()
-        timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = f"output/{user_id}_{timestamp}"
-        os.makedirs(output_dir, exist_ok=True)
+    await message.answer(
+        f"✅ МВМ-задача принята в обработку!{position_text}\n\n"
+        f"⏳ Результат придёт автоматически по завершении.",
+        reply_markup=get_main_menu_keyboard()
+    )
 
-        output_sync_paths = {
-            'wildberries': f"{output_dir}/WB_синхронизировано.xlsx",
-            'ozon':        f"{output_dir}/Ozon_синхронизировано.xlsx",
-            'yandex':      f"{output_dir}/Яндекс_синхронизировано.xlsx",
-        }
-        report_path = f"{output_dir}/результат_{timestamp}.xlsx"
-        selected_category_ids = await storage.db.get_schema_category_ids(schema_id)
-
-        synchronizer = DataSynchronizer(
-            comparison_result,
-            ai_comparator=comparator,
-            xml_offer_data=xml_offer_data,
-            xml_categories=xml_categories,
-            selected_category_ids=selected_category_ids,
-        )
-        synced_dfs, changes_log = await synchronizer.synchronize_data(
-            user_files, output_sync_paths
-        )
-
-        # Шаг 1: создаём файл отчёта через ExcelWriter
-        await message.answer("📊 Создаю отчет...")
-        writer = ExcelWriter()
-        writer.create_report_with_changes(comparison_result, changes_log, report_path)
-
-        # Шаг 2: добавляем AI-лог в уже готовый файл отчёта
-        synchronizer.create_ai_log_in_report(report_path)
-
-        wb_count     = len(synced_dfs['wildberries'])
-        ozon_count   = len(synced_dfs['ozon'])
-        yandex_count = len(synced_dfs['yandex'])
-        total_synced = sum(len(changes_log[mp]) for mp in changes_log)
-        xml_filled   = sum(
-            1 for mp in changes_log
-            for change in changes_log[mp]
-            if change.get('source_marketplace') == 'xml'
-        )
-
-        await storage.db.complete_processing(
-            processing_id, wb_count, ozon_count, yandex_count, total_synced
-        )
-        await message.answer("📤 Отправляю результаты...")
-        for path in output_sync_paths.values():
-            await message.answer_document(FSInputFile(path))
-        await message.answer_document(FSInputFile(report_path), caption="📊 Отчет МВМ")
-
-        await state.clear()
-        await storage.session_storage.clear(user_id)
-
-        result_text = (
-            f"✅ Готово!\n\n📦 Обработка товаров:\n"
-            f"• WB: {wb_count}\n• Ozon: {ozon_count}\n• Яндекс: {yandex_count}\n\n"
-            f"🔄 Синхронизировано ячеек: {total_synced}"
-        )
-        if xml_filled > 0:
-            result_text += f"\n📦 Из XML каталога: {xml_filled}"
-        await message.answer(result_text, reply_markup=get_main_menu_keyboard())
-
-    except Exception as e:
-        await storage.db.fail_processing(processing_id, str(e))
-        await message.answer(f"❌ Ошибка: {str(e)}")
-        logger.error("Ошибка обработки МВМ: %s", e, exc_info=True)
-    finally:
-        # Гарантированная очистка сессии при любом исходе
-        await storage.session_storage.clear(user_id)
-
-def register_upload_handlers(dp, bot) -> None:
+def register_upload_handlers(dp, bot, task_queue: TaskQueue) -> None:
     from functools import partial
     dp.message.register(select_schema_for_upload, F.text == "📤 Загрузить файлы")
     dp.message.register(partial(schema_selected, bot=bot), UploadStates.selecting_schema)
     dp.message.register(partial(handle_file, bot=bot), UploadStates.waiting_for_files, F.document)
-    dp.message.register(partial(process_files, bot=bot), UploadStates.waiting_for_files, F.text == "🚀 Обработать")
+    dp.message.register(partial(process_files, bot=bot, task_queue=task_queue), UploadStates.waiting_for_files, F.text == "🚀 Обработать")
     dp.message.register(partial(handle_mvm_upload_mp_file, bot=bot), UploadMvmStates.waiting_for_mp_files, F.document)
     dp.message.register(handle_mvm_upload_mp_text, UploadMvmStates.waiting_for_mp_files, F.text)
     dp.message.register(partial(handle_mvm_upload_xml_file, bot=bot), UploadMvmStates.waiting_for_xml_file, F.document)
-    dp.message.register(partial(process_files_mvm, bot=bot), UploadMvmStates.waiting_for_xml_file, F.text == "🚀 Обработать")
+    dp.message.register(partial(process_files_mvm, bot=bot, task_queue=task_queue), UploadMvmStates.waiting_for_xml_file, F.text == "🚀 Обработать")
     dp.message.register(handle_mvm_upload_xml_text, UploadMvmStates.waiting_for_xml_file, F.text)

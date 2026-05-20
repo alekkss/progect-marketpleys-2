@@ -9,12 +9,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import logging
+from typing import Optional
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.storage.redis import RedisStorage
 
 from config.config import Config, TELEGRAM_BOT_TOKEN
 from bot.storage import init_storage, shutdown_storage
+from services.task_queue import create_task_queue, TaskQueue
+from services.task_worker import TaskWorker
 from utils.logger_config import setup_logger
 
 # Импорт регистраторов обработчиков
@@ -33,7 +36,7 @@ logger = setup_logger('bot')
 logging.basicConfig(level=logging.INFO)
 
 
-def create_bot() -> tuple[Bot, Dispatcher]:
+def create_bot(task_queue: Optional[TaskQueue] = None) -> tuple[Bot, Dispatcher]:
     """
     Создание и настройка бота.
 
@@ -46,6 +49,10 @@ def create_bot() -> tuple[Bot, Dispatcher]:
     FSM Storage:
         - RedisStorage (при доступном Redis) — состояния переживают перезапуск
         - MemoryStorage (fallback) — состояния теряются при перезапуске
+
+    Args:
+        task_queue: Очередь задач для фоновой обработки. Передаётся
+            в хендлеры загрузки файлов для постановки задач в очередь.
 
     Returns:
         Кортеж (bot, dispatcher)
@@ -85,7 +92,7 @@ def create_bot() -> tuple[Bot, Dispatcher]:
     # Регистрация всех обработчиков (БЕЗ дубликатов)
     register_common_handlers(dp)
     register_access_management_handlers(dp)
-    register_upload_handlers(dp, bot)
+    register_upload_handlers(dp, bot, task_queue)
     register_schema_create_handlers(dp, bot)
     register_schema_create_mvm_handlers(dp, bot)
     register_schema_edit_handlers(dp, bot)
@@ -103,9 +110,11 @@ async def start_bot() -> None:
     Порядок выполнения:
         1. Валидация конфигурации (fail fast)
         2. Инициализация хранилищ (PostgreSQL + Redis session storage)
-        3. Создание бота и диспетчера
-        4. Запуск polling
-        5. При остановке — graceful shutdown (закрытие всех ресурсов)
+        3. Подключение очереди задач (Redis или in-memory)
+        4. Создание бота и диспетчера
+        5. Запуск фонового воркера обработки задач
+        6. Запуск polling
+        7. При остановке — graceful shutdown (воркер → очередь → ресурсы)
 
     Raises:
         ValueError: если обязательные параметры конфигурации не заданы
@@ -128,19 +137,45 @@ async def start_bot() -> None:
     # в bot/storage.py содержат готовые к работе экземпляры.
     await init_storage()
 
-    # Шаг 3: Создание бота и диспетчера
-    bot, dp = create_bot()
+    # Шаг 3: Инициализация очереди задач
+    # Очередь использует тот же Redis, что и FSM (если доступен),
+    # или in-memory fallback. TaskQueue — абстракция, детали скрыты.
+    task_queue = create_task_queue(Config.REDIS_URL, Config.TASK_QUEUE_KEY)
+    try:
+        await task_queue.connect()
+        logger.info("Очередь задач инициализирована.")
+    except Exception as e:
+        logger.warning(
+            "Не удалось подключить Redis-очередь (%s). "
+            "Используем in-memory очередь (задачи будут потеряны при перезапуске).",
+            e,
+        )
+        # Фабрика create_task_queue уже вернёт InMemoryTaskQueue при ошибке,
+        # но если connect() упал после создания — пересоздаём.
+        task_queue = create_task_queue(None, Config.TASK_QUEUE_KEY)
+        await task_queue.connect()
 
-    # Шаг 4: Запуск polling с graceful shutdown
+    # Шаг 4: Создание бота и диспетчера
+    bot, dp = create_bot(task_queue)
+
+    # Шаг 5: Запуск фонового воркера
+    # Воркер читает задачи из очереди и обрабатывает их с ограничением
+    # на количество одновременных обработок (Semaphore).
+    task_worker = TaskWorker(task_queue, Config.MAX_CONCURRENT_TASKS)
+    await task_worker.start(bot)
+
+    # Шаг 6: Запуск polling с graceful shutdown
     logger.info("Telegram бот запущен!")
     print("🚀 Telegram бот запущен!")
 
     try:
         await dp.start_polling(bot)
     finally:
-        # Шаг 5: Корректное завершение
-        # Закрываем connection pool PostgreSQL, Redis-соединения,
-        # ожидая завершения всех активных запросов
+        # Шаг 7: Корректное завершение
+        # Порядок важен: сначала останавливаем воркер (ждём активных задач),
+        # затем отключаем очередь, затем закрываем основные ресурсы.
         logger.info("Остановка бота, закрытие ресурсов...")
+        await task_worker.stop()
+        await task_queue.disconnect()
         await shutdown_storage()
         logger.info("Все ресурсы освобождены.")

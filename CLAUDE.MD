@@ -11,6 +11,9 @@ Telegram-бот для автоматической синхронизации �
 - **File Processing**: pandas + openpyxl
 - **State Management**: FSM (Finite State Machine), хранилище — RedisStorage (с fallback на MemoryStorage при недоступности Redis)
 - **Access Control**: Многоуровневая система прав доступа (async)
+- **Task Queue**: Фоновая очередь задач на Redis List (с fallback на in-memory Queue).
+  TaskWorker с asyncio.Semaphore(MAX_CONCURRENT_TASKS) ограничивает параллельные
+  тяжёлые обработки (pandas + AI), предотвращая перегрузку CPU.
 
 ## Структура проекта
 
@@ -46,6 +49,10 @@ Telegram-бот для автоматической синхронизации �
 ├── /services/
 │   ├── data_synchronizer.py         # Оркестратор синхронизации (Facade)
 │   ├── ai_comparator.py             # AI-сопоставление столбцов (3 МП + МВМ 4 источника)
+│   ├── task_queue.py                # Очередь задач: Task (dataclass), TaskQueue (Repository),
+│   │                                # RedisTaskQueue, InMemoryTaskQueue, фабрика create_task_queue()
+│   ├── task_worker.py               # Фоновый воркер: читает очередь, обрабатывает Task через
+│   │                                # DataSynchronizer, отправляет результат пользователю через Bot
 │   └── /sync/                       # Подпакет компонентов синхронизации (v4.2)
 │       ├── __init__.py              # Экспорты подпакета
 │       ├── value_converter.py       # ValueConverter — единицы измерения и конвертация
@@ -75,15 +82,26 @@ Telegram-бот для автоматической синхронизации �
 
 Порядок запуска в `bot/bot.py → start_bot()`:
 
-1. **Валидация конфигурации** — `Config.validate()` бросает `ValueError` при отсутствии обязательных переменных (fail-fast). Дополнительно проверяет формат `REDIS_URL` (опционально, с предупреждением)
+1. **Валидация конфигурации** — `Config.validate()` бросает `ValueError`...
 2. **Инициализация хранилищ** — `await init_storage()` из `bot/storage.py`:
-   - Создаёт экземпляр `Database(database_url, pool_min, pool_max)`
+   - Создаёт экземпляр `Database(...)`
    - `await db.connect()` — открывает connection pool PostgreSQL
-   - `await run_migrations(db.pool)` — создаёт таблицы и применяет миграции
-   - `await session_storage.connect()` — подключает Redis для сессий (или fallback на in-memory)
-3. **Создание бота** — `create_bot()` регистрирует middleware и хендлеры. FSM-хранилище: RedisStorage (fallback MemoryStorage)
-4. **Polling** — `await dp.start_polling(bot)`
-5. **Graceful shutdown** — `await shutdown_storage()` закрывает pool PostgreSQL и соединение Redis
+   - `await run_migrations(db.pool)` — создаёт таблицы
+   - `await session_storage.connect()` — подключает Redis для сессий
+3. **Инициализация очереди задач** — `await task_queue.connect()`:
+   - RedisTaskQueue (основная) или InMemoryTaskQueue (fallback)
+   - Хранит задачи в Redis List + Hash, индекс по пользователю
+4. **Создание бота** — `create_bot(task_queue)` регистрирует middleware и хендлеры.
+   Хендлеры upload.py получают `task_queue` через dependency injection.
+5. **Запуск фонового воркера** — `await task_worker.start(bot)`:
+   - Запускает цикл `while running: task = await queue.dequeue()`
+   - Ограничивает обработку `asyncio.Semaphore(Config.MAX_CONCURRENT_TASKS)`
+   - Worker сам отправляет результаты через `Bot.send_message/document`
+6. **Polling** — `await dp.start_polling(bot)`
+7. **Graceful shutdown** — строгий порядок освобождения ресурсов:
+   - `await task_worker.stop()` — ждёт завершения активных задач (до 5 шт.)
+   - `await task_queue.disconnect()` — закрывает соединение с Redis
+   - `await shutdown_storage()` — закрывает pool PostgreSQL
 
 ## Система прав доступа
 
@@ -714,6 +732,10 @@ ACCESS_ADMIN_ID=987654321          # Опционально (можно чере
 LOG_FILE_PATH=./logs/app.log
 LOG_LEVEL=INFO
 
+# Очередь задач (опционально)
+MAX_CONCURRENT_TASKS=5          # Максимум одновременных обработок (Semaphore)
+TASK_QUEUE_KEY=bot:task_queue  # Ключ Redis List для хранения ID задач
+
 # Прокси (опционально)
 PROXY_ENABLED=false
 PROXY_URL=http://user:pass@host:port
@@ -789,6 +811,7 @@ python main.py
 - [x] Перевод FSM-хранилища с MemoryStorage на RedisStorage с fallback (v4.4)
 - [x] Устранение утечки памяти: глобальные dict user_files/user_schemas заменены на SessionStorage с TTL (v4.4)
 - [x] asyncio.to_thread() для CPU-тяжёлых операций pandas/openpyxl (v4.3)
+- [x] Фоновая очередь задач с ограничением параллельных обработок (v4.5)
 - [ ] Добавление unit-тестов (pytest)
 - [ ] CI/CD pipeline
 - [ ] Поддержка 5-го маркетплейса (расширение архитектуры)
@@ -802,8 +825,12 @@ python main.py
 - XML-файлы > 20 МБ не скачиваются через Telegram API (нужна прямая ссылка)
 - Скачивание по URL: лимит 200 МБ, таймаут 5 минут
 - OpenRouter API rate limits
-- FSM-состояния сохраняются в Redis (если доступен), иначе теряются при перезапуске (MemoryStorage fallback)
-- Сессии загрузки файлов (user_files, user_schemas) хранятся в Redis с TTL 30 минут — автоочистка "забытых" сессий
+- FSM-состояния сохраняются в Redis (если доступен), иначе теряются при перезапуске
+- Сессии загрузки файлов (user_files, user_schemas) хранятся в Redis с TTL 30 минут
+- Задачи в очереди (pending) хранятся в Redis. При недоступности Redis используется
+  in-memory очередь — задачи будут потеряны при перезапуске бота.
+- Максимум `MAX_CONCURRENT_TASKS` (default=5) одновременных обработок. 6-я задача
+  ждёт в очереди до освобождения слота.
 
 ## Важные предостережения
 
@@ -816,8 +843,12 @@ python main.py
 - Префиксы XML-полей (`[XML]` и `[XML param]`)
 - Порядок этапов синхронизации (габариты → МП → XML)
 - Привязку XML по vendorCode
-- Порядок инициализации: `Config.validate()` → `init_storage()` → `create_bot()` → `polling`
+- Порядок инициализации: `Config.validate()` → `init_storage()` → `task_queue.connect()`
+  → `create_bot(task_queue)` → `task_worker.start(bot)` → `polling`
+- Порядок shutdown: `task_worker.stop()` → `task_queue.disconnect()` → `shutdown_storage()`
 - Порядок записи AI-лога: `synchronize_data` → `create_report_with_changes` → `create_ai_log_in_report`
+- Хендлеры upload.py НЕ вызывают `synchronize_data()` inline — только `task_queue.enqueue()`
+- `create_bot()` теперь принимает `task_queue: TaskQueue` и передаёт его в `register_upload_handlers()`
 - Импорт сессий: `from bot import storage` → `storage.session_storage` (модуль, не переменная)
 - Порядок записи AI-лога: `synchronize_data` → `create_report_with_changes` → `create_ai_log_in_report`
 
@@ -835,6 +866,47 @@ python main.py
 - Методы с внутренними `await` (`sync_all_matches`, `sync_from_xml`, `save_results`) нельзя оборачивать в `asyncio.to_thread()` — внутри потока нет event loop
 
 ## Типичные сценарии работы
+
+### TaskQueue и TaskWorker (v4.5)
+
+#### TaskQueue (`services/task_queue.py`)
+Абстракция над брокером задач (паттерн Repository). Поддерживает:
+- `enqueue(task)` — постановка задачи в очередь (Redis LPUSH)
+- `dequeue()` — блокирующее извлечение (Redis BRPOP, таймаут 5 сек)
+- `update_status()` — обновление статуса и метаданных в Hash
+- `get_user_tasks()` — история задач пользователя
+
+#### Task (`services/task_queue.py`)
+Dataclass-модель задачи. Поля: `user_id`, `chat_id`, `task_type` (standard/mvm),
+`schema_id`, `file_paths`, `output_dir`, `report_path`, `xml_file_path`,
+`status` (pending/processing/completed/failed), `created_at`, статистика результатов.
+
+#### TaskWorker (`services/task_worker.py`)
+Фоновый сервис (паттерн Service Layer):
+- Читает задачи из очереди по одной
+- Выполняет полный цикл: `DataSynchronizer` → `ExcelWriter` → отправка файлов
+- Ограничение параллелизма: `asyncio.Semaphore(5)` — максимум 5 одновременных обработок
+- При shutdown корректно дожидается завершения активных задач
+
+#### Поток обработки (новый)
+
+Пользователь нажимает "🚀 Обработать"
+↓
+Хендлер upload.py создаёт Task и вызывает task_queue.enqueue(task)
+↓
+Пользователь получает: "✅ Задача принята. Задач в очереди: N"
+↓
+TaskWorker извлекает задачу из очереди
+↓
+Semaphore(5) → DataSynchronizer.synchronize_data()
+↓
+Worker отправляет результат пользователю через Bot
+
+
+#### Почему это решает проблему #7
+Раньше 5 пользователей одновременно запускали 5×N AI-запросов + 5 процессов pandas inline.
+Теперь максимум 5 задач обрабатываются параллельно, остальные ждут в очереди.
+Event loop бота остаётся свободным — бот отвечает на сообщения даже во время обработки.
 
 ### Добавление нового уровня валидации
 
@@ -1042,6 +1114,11 @@ Redis используется для двух целей:
 **Версия документации**: 4.4
 **Дата обновления**: Май 2026
 **Последние изменения**:
+- v4.5: Добавлена фоновая очередь задач (Redis-backed / in-memory fallback).
+  TaskWorker ограничивает количество одновременных обработок через Semaphore(5).
+  Хендлеры upload.py больше не выполняют синхронизацию inline — только ставят
+  задачу в очередь. Результат приходит пользователю автоматически от воркера.
+  Новые переменные окружения: MAX_CONCURRENT_TASKS, TASK_QUEUE_KEY.
 - v4.4: Рефакторинг хранения сессий — устранена утечка памяти в глобальных dict user_files/user_schemas. 
   Добавлен SessionStorage (bot/session_storage.py) с поддержкой Redis (TTL 30 мин) и in-memory fallback.
   FSM-хранилище переведено с MemoryStorage на RedisStorage. Обновлена валидация REDIS_URL в Config.

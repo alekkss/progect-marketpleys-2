@@ -4,13 +4,14 @@
 
 import asyncio
 import json
+import random
 import re
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
 import httpx
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, RateLimitError, APIStatusError
 
 from config.config import (
     AI_MODEL,
@@ -36,6 +37,12 @@ class AIComparator:
     SCHEMA_COMPARISON_PROMPT = PROMPTS_DIR / "schema_comparison.txt"
     VALUE_VALIDATION_PROMPT = PROMPTS_DIR / "value_validation.txt"
     MVM_MATCHING_PROMPT = PROMPTS_DIR / "mvm_column_matching.txt"
+
+    # Параметры retry для AI-запросов
+    _RETRY_MAX_ATTEMPTS: int = 3       # максимум попыток
+    _RETRY_BASE_DELAY: float = 2.0     # базовая задержка в секундах
+    _RETRY_MAX_DELAY: float = 30.0     # максимальная задержка в секундах
+    _RETRY_JITTER: float = 0.3         # ±30% случайного отклонения
 
     def __init__(self):
         """Инициализация AI компаратора с поддержкой прокси"""
@@ -970,14 +977,90 @@ class AIComparator:
         )
 
     async def _call_ai(self, prompt: str) -> str:
-        """Вызывает AI API с ограничением параллельных запросов"""
+        """
+        Вызывает AI API с ограничением параллельных запросов и retry.
+
+        При временных ошибках (rate limit, 5xx, таймаут сети) повторяет
+        запрос с экспоненциальным backoff и jitter ±30%.
+
+        Retry применяется:
+            - RateLimitError (429) — временный rate limit OpenRouter
+            - APIStatusError 5xx   — временная недоступность сервера
+            - httpx.TimeoutException / httpx.NetworkError — сетевые сбои
+
+        Retry НЕ применяется:
+            - APIStatusError 4xx (кроме 429) — ошибка запроса, повтор бесполезен
+            - AuthenticationError            — неверный ключ API
+
+        Returns:
+            Текст ответа от AI.
+
+        Raises:
+            Exception: если все попытки исчерпаны или ошибка не подлежит retry.
+        """
         async with self._semaphore:
-            response = await self.client.chat.completions.create(
-                model=AI_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=AI_TEMPERATURE,
-            )
-            return response.choices[0].message.content
+            last_exception: Optional[Exception] = None
+
+            for attempt in range(self._RETRY_MAX_ATTEMPTS):
+                try:
+                    response = await self.client.chat.completions.create(
+                        model=AI_MODEL,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=AI_TEMPERATURE,
+                    )
+                    return response.choices[0].message.content
+
+                except RateLimitError as e:
+                    # 429 — временный rate limit, всегда retry
+                    last_exception = e
+                    logger.warning(
+                        "OpenRouter rate limit (попытка %d/%d): %s",
+                        attempt + 1, self._RETRY_MAX_ATTEMPTS, e,
+                    )
+
+                except APIStatusError as e:
+                    # 5xx — серверная ошибка, retry
+                    # 4xx (кроме 429) — ошибка клиента, повтор не поможет
+                    if e.status_code < 500:
+                        logger.error(
+                            "Ошибка AI API %d, retry не применяется: %s",
+                            e.status_code, e,
+                        )
+                        raise
+                    last_exception = e
+                    logger.warning(
+                        "Ошибка сервера AI %d (попытка %d/%d): %s",
+                        e.status_code, attempt + 1, self._RETRY_MAX_ATTEMPTS, e,
+                    )
+
+                except (httpx.TimeoutException, httpx.NetworkError) as e:
+                    # Сетевые сбои — retry
+                    last_exception = e
+                    logger.warning(
+                        "Сетевая ошибка AI (попытка %d/%d): %s",
+                        attempt + 1, self._RETRY_MAX_ATTEMPTS, e,
+                    )
+
+                # На последней попытке не ждём — сразу выходим из цикла
+                if attempt >= self._RETRY_MAX_ATTEMPTS - 1:
+                    break
+
+                # Экспоненциальный backoff: 2с → 4с → (не дойдёт до 3-й паузы)
+                delay = min(
+                    self._RETRY_BASE_DELAY * (2 ** attempt),
+                    self._RETRY_MAX_DELAY,
+                )
+                # Jitter ±30% — предотвращает одновременный retry нескольких задач
+                jitter = delay * self._RETRY_JITTER * (random.random() * 2 - 1)
+                wait = max(0.1, delay + jitter)
+
+                logger.info(
+                    "Повтор AI-запроса через %.1f сек (попытка %d/%d)...",
+                    wait, attempt + 1, self._RETRY_MAX_ATTEMPTS,
+                )
+                await asyncio.sleep(wait)
+
+            raise last_exception
 
     def _parse_response(self, response_text: str) -> Dict:
         """Парсит ответ от AI"""

@@ -622,9 +622,7 @@ class ExcelFileManager:
                     cell = ws.cell(
                         row=excel_row_idx, column=excel_col_idx
                     )
-                    allowed_values = self._get_validation_list_values(
-                        ws, excel_row_idx, excel_col_idx
-                    )
+                    allowed_values = self.column_validations.get(marketplace, {}).get(df_col_name, [])
 
                     if allowed_values and self._ai_comparator:
                         matched = await self._ai_comparator.match_value_with_list(

@@ -2,53 +2,59 @@
 Вспомогательные функции бота
 """
 import os
-import logging
 from pathlib import Path
 from typing import Optional, Tuple
 
+import aiohttp
 from aiogram.exceptions import TelegramBadRequest
 
-logger = logging.getLogger('bot_utils')
+from utils.logger_config import setup_logger
+
+logger = setup_logger('bot_utils')
+
+# Максимальный размер файла для скачивания по URL
+_MAX_DOWNLOAD_SIZE = 200 * 1024 * 1024  # 200 МБ
+_CHUNK_SIZE = 8192  # 8 КБ
 
 
 def detect_marketplace(filename: str) -> str:
     """
-    Определяет маркетплейс по имени файла
-    
+    Определяет маркетплейс по имени файла.
+
     Args:
-        filename: имя файла
-        
+        filename: имя файла.
+
     Returns:
-        marketplace или None
+        Ключ маркетплейса или None.
     """
     fn = filename.lower()
-    
+
     if 'wb' in fn or 'wildberries' in fn:
         return 'wildberries'
     elif 'ozon' in fn or 'озон' in fn:
         return 'ozon'
     elif 'yandex' in fn or 'яндекс' in fn or 'market' in fn:
         return 'yandex'
-    
+
     return None
 
 
 async def download_file(bot, message, user_id: int) -> tuple:
     """
-    Скачивает файл от пользователя
-    
+    Скачивает файл от пользователя.
+
     Returns:
-        (file_path, file_name, marketplace) или (None, None, None) при ошибке
+        (file_path, file_name, marketplace) или (None, None, None) при ошибке.
     """
     file = await bot.get_file(message.document.file_id)
     file_name = message.document.file_name
-    
+
     os.makedirs(f"uploads/{user_id}", exist_ok=True)
     file_path = f"uploads/{user_id}/{file_name}"
     await bot.download_file(file.file_path, file_path)
-    
+
     marketplace = detect_marketplace(file_name)
-    
+
     return file_path, file_name, marketplace
 
 
@@ -61,9 +67,9 @@ async def download_xml_from_telegram(
     Скачивает XML-документ из Telegram с обработкой ошибки большого файла.
 
     Args:
-        bot: экземпляр Bot
-        message: сообщение с документом
-        user_id: ID пользователя
+        bot:     экземпляр Bot.
+        message: сообщение с документом.
+        user_id: ID пользователя.
 
     Returns:
         (file_path, error_message):
@@ -85,16 +91,17 @@ async def download_xml_from_telegram(
         error_text = str(e)
         if "file is too big" in error_text.lower():
             logger.warning(
-                f"XML файл слишком большой для Telegram API (user={user_id}, "
-                f"file={file_name}, size={message.document.file_size} байт)"
+                "XML файл слишком большой для Telegram API "
+                "(user=%s, file=%s, size=%s байт)",
+                user_id, file_name, message.document.file_size,
             )
             return None, "file_too_big"
         else:
-            logger.error(f"Ошибка Telegram при скачивании XML: {e}", exc_info=True)
+            logger.error("Ошибка Telegram при скачивании XML: %s", e, exc_info=True)
             return None, f"Ошибка Telegram: {e}"
 
     except Exception as e:
-        logger.error(f"Неожиданная ошибка скачивания XML: {e}", exc_info=True)
+        logger.error("Неожиданная ошибка скачивания XML: %s", e, exc_info=True)
         return None, f"Ошибка: {e}"
 
 
@@ -109,18 +116,21 @@ async def download_file_by_url(
     Используется как альтернатива для файлов > 20 МБ,
     которые Telegram Bot API не может отдать через get_file().
 
+    Лимит 200 МБ применяется по фактически скачанным байтам —
+    независимо от наличия заголовка Content-Length. Это защищает
+    от серверов с chunked encoding (Google Drive, Dropbox и др.),
+    которые не отдают Content-Length заранее.
+
     Args:
-        url: прямая ссылка на файл
-        user_id: ID пользователя (для папки downloads)
-        filename: имя для сохранения файла
+        url:      прямая ссылка на файл.
+        user_id:  ID пользователя (для папки downloads).
+        filename: имя для сохранения файла.
 
     Returns:
         (file_path, error_message):
             - (путь_к_файлу, None) при успехе
             - (None, текст_ошибки) при ошибке
     """
-    import aiohttp
-
     downloads_dir = Path("downloads") / str(user_id)
     downloads_dir.mkdir(parents=True, exist_ok=True)
     file_path = str(downloads_dir / filename)
@@ -135,15 +145,34 @@ async def download_file_by_url(
                         f"Проверь ссылку и попробуй снова."
                     )
 
-                # Проверяем размер (лимит 200 МБ)
+                # Быстрая проверка по Content-Length если сервер его отдал
                 content_length = response.content_length
-                if content_length and content_length > 200 * 1024 * 1024:
+                if content_length and content_length > _MAX_DOWNLOAD_SIZE:
                     return None, "Файл слишком большой (> 200 МБ)."
 
-                # Скачиваем чанками
+                # Скачиваем чанками и считаем реально полученные байты.
+                # Content-Length может отсутствовать (chunked encoding, Google Drive,
+                # Dropbox) — поэтому проверка по заголовку выше недостаточна.
+                downloaded_bytes = 0
+                size_exceeded = False
+
                 with open(file_path, 'wb') as f:
-                    async for chunk in response.content.iter_chunked(8192):
+                    async for chunk in response.content.iter_chunked(_CHUNK_SIZE):
+                        downloaded_bytes += len(chunk)
+                        if downloaded_bytes > _MAX_DOWNLOAD_SIZE:
+                            size_exceeded = True
+                            break
                         f.write(chunk)
+
+                if size_exceeded:
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                    logger.warning(
+                        "Превышен лимит 200 МБ при скачивании по URL "
+                        "(user=%s, url=%s, скачано=%d байт)",
+                        user_id, url, downloaded_bytes,
+                    )
+                    return None, "Файл слишком большой (> 200 МБ)."
 
         # Проверяем что файл не пустой
         if os.path.getsize(file_path) == 0:
@@ -151,15 +180,15 @@ async def download_file_by_url(
             return None, "Скачанный файл пуст. Проверь ссылку."
 
         logger.info(
-            f"Файл скачан по URL: {file_path} "
-            f"({os.path.getsize(file_path)} байт)"
+            "Файл скачан по URL: %s (%d байт)",
+            file_path, os.path.getsize(file_path),
         )
         return file_path, None
 
     except aiohttp.ClientError as e:
-        logger.error(f"Ошибка скачивания по URL '{url}': {e}", exc_info=True)
+        logger.error("Ошибка скачивания по URL '%s': %s", url, e, exc_info=True)
         return None, f"Не удалось скачать файл: {e}"
 
     except Exception as e:
-        logger.error(f"Неожиданная ошибка скачивания по URL: {e}", exc_info=True)
+        logger.error("Неожиданная ошибка скачивания по URL: %s", e, exc_info=True)
         return None, f"Ошибка: {e}"

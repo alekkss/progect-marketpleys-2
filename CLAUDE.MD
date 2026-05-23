@@ -14,6 +14,8 @@ Telegram-бот для автоматической синхронизации �
 - **Task Queue**: Фоновая очередь задач на Redis List (с fallback на in-memory Queue).
   TaskWorker с asyncio.Semaphore(MAX_CONCURRENT_TASKS) ограничивает параллельные
   тяжёлые обработки (pandas + AI), предотвращая перегрузку CPU.
+  `AIComparator` создаётся **один раз** при инициализации `TaskWorker` и
+  переиспользуется для всех задач — промпты читаются с диска только при старте.
 
 ## Структура проекта
 
@@ -68,7 +70,7 @@ Telegram-бот для автоматической синхронизации �
 │   ├── xml_reader.py                # Чтение XML файлов каталога (YML-фид)
 │   ├── excel_writer.py              # Создание отчётов Excel
 │   ├── logger_config.py             # Конфигурация логирования
-│   └── utils.py                     # Вспомогательные функции
+│   └── utils.py                     # Вспомогательные функции (download_file_by_url и др.)
 │
 ├── /database/
 │   ├── database.py                  # PostgreSQL ORM (asyncpg, connection pool)
@@ -94,12 +96,14 @@ Telegram-бот для автоматической синхронизации �
 4. **Создание бота** — `create_bot(task_queue)` регистрирует middleware и хендлеры.
    Хендлеры upload.py получают `task_queue` через dependency injection.
 5. **Запуск фонового воркера** — `await task_worker.start(bot)`:
+   - `AIComparator` создаётся один раз в `TaskWorker.__init__` — промпты читаются здесь
    - Запускает цикл `while running: task = await queue.dequeue()`
    - Ограничивает обработку `asyncio.Semaphore(Config.MAX_CONCURRENT_TASKS)`
+   - Семафор AIComparator становится глобальным — максимум 5 AI-запросов суммарно по всем задачам
    - Worker сам отправляет результаты через `Bot.send_message/document`
 6. **Polling** — `await dp.start_polling(bot)`
 7. **Graceful shutdown** — строгий порядок освобождения ресурсов:
-   - `await task_worker.stop()` — ждёт завершения активных задач (до 5 шт.)
+   - `await task_worker.stop()` — ждёт завершения активных задач, закрывает `AIComparator` (`await comparator.close()`)
    - `await task_queue.disconnect()` — закрывает соединение с Redis
    - `await shutdown_storage()` — закрывает pool PostgreSQL
 
@@ -252,7 +256,14 @@ whitelist_users         # Белый список (без лимитов)
 
 Каждая миграция обёрнута в `DO $$ BEGIN IF NOT EXISTS ... END $$` — безопасный повторный запуск.
 
-Нумерация: `001_`, `002_`, ... — добавлять новые миграции ТОЛЬКО В КОНЕЦ списка.
+Нумерация: `001_`, `002_`, `003_`, ... — добавлять новые миграции ТОЛЬКО В КОНЕЦ списка.
+**ВАЖНО**: нумерация должна быть уникальной и последовательной. Дублирующийся номер
+(например, две миграции `001_`) не вызовет ошибку сейчас, но сломает любой механизм
+отслеживания применённых миграций в будущем.
+
+Текущие миграции:
+- `001_add_role_column` — добавляет столбец `role` в `whitelist_users`
+- `002_add_schema_type_column` — добавляет столбец `schema_type` в `schemas`
 
 ### Ключевые особенности реализации
 
@@ -467,6 +478,12 @@ manager.create_ai_log_in_report(report_path, ai_validation_log)
 
 Обрабатывает дублирующиеся заголовки: добавляет числовой суффикс при загрузке («Вес (кг)1») и восстанавливает оригинальные имена при сохранении.
 
+**Важно — validation-списки при сохранении (v4.6):**
+`save_results` использует `self.column_validations` (заполняется при `load_all_dataframes`)
+для проверки допустимых значений ячеек. Это O(1) dict-lookup вместо повторного
+сканирования всех DV-правил листа для каждой ячейки. `_get_validation_list_values`
+используется только внутри `_load_column_validations` — не вызывать в цикле по ячейкам.
+
 ### 3. Схемы сопоставлений (Schema)
 
 Поддерживаются два типа схем:
@@ -664,11 +681,17 @@ AI_MODEL=google/gemini-2.5-flash-preview-09-2025
 AI_TEMPERATURE=0.1
 ```
 
-### Асинхронный клиент и ограничение нагрузки (v4.1)
+### Асинхронный клиент и ограничение нагрузки (v4.1, обновлено v4.6)
 
 - **Клиент**: `AsyncOpenAI` из библиотеки `openai` (вместо синхронного `OpenAI`)
-- **Семафор**: `asyncio.Semaphore(5)` в `AIComparator` — максимум 5 параллельных AI-запросов к OpenRouter
-- **HTTP-клиент**: `httpx.AsyncClient` для поддержки прокси
+- **Семафор**: `asyncio.Semaphore(5)` в `AIComparator` — максимум 5 параллельных AI-запросов к OpenRouter.
+  С v4.6 семафор стал **глобальным** — `AIComparator` создаётся один раз в `TaskWorker`,
+  семафор ограничивает 5 AI-запросов суммарно по всем задачам (раньше каждая задача
+  имела свой семафор и могла запускать до 5 запросов независимо).
+- **HTTP-клиент**: `httpx.AsyncClient` для поддержки прокси — хранится в `self._http_client`,
+  корректно закрывается через `await comparator.close()` при остановке воркера.
+- **Метод `close()`**: освобождает HTTP-соединения. Вызывается в `TaskWorker.stop()`
+  после завершения всех активных задач.
 - **Преимущества**:
   - AI-запросы (5–30 сек) не блокируют event loop бота
   - Бот продолжает обрабатывать сообщения других пользователей во время ожидания ответа от OpenRouter
@@ -771,6 +794,7 @@ openpyxl
 openai (для OpenRouter)
 python-dotenv
 aiohttp (для загрузки XML по URL)
+httpx (для прокси в AIComparator)
 ```
 
 ### Запуск
@@ -808,10 +832,15 @@ python main.py
 - [x] Кэширование данных доступа в AccessManager с TTL 60 сек (v4.1)
 - [x] AsyncOpenAI + Semaphore(5) для неблокирующих AI-запросов (v4.1)
 - [x] Рефакторинг DataSynchronizer: подпакет services/sync/ с 7 компонентами (v4.2)
+- [x] asyncio.to_thread() для CPU-тяжёлых операций pandas/openpyxl (v4.3)
 - [x] Перевод FSM-хранилища с MemoryStorage на RedisStorage с fallback (v4.4)
 - [x] Устранение утечки памяти: глобальные dict user_files/user_schemas заменены на SessionStorage с TTL (v4.4)
-- [x] asyncio.to_thread() для CPU-тяжёлых операций pandas/openpyxl (v4.3)
 - [x] Фоновая очередь задач с ограничением параллельных обработок (v4.5)
+- [x] AIComparator singleton в TaskWorker — промпты читаются один раз при старте (v4.6)
+- [x] Устранение утечки httpx.AsyncClient в AIComparator (v4.6)
+- [x] Оптимизация save_results: validation-списки из кэша вместо сканирования DV-правил на ячейку (v4.6)
+- [x] Исправлен обход лимита 200 МБ в download_file_by_url при chunked encoding (v4.6)
+- [x] Исправлена нумерация миграций (дублирующийся 001_) (v4.6)
 - [ ] Добавление unit-тестов (pytest)
 - [ ] CI/CD pipeline
 - [ ] Поддержка 5-го маркетплейса (расширение архитектуры)
@@ -823,7 +852,7 @@ python main.py
 - XML-файлы только .xml формата (YML-фид)
 - XML-файл должен содержать элементы `<offer>` с vendorCode
 - XML-файлы > 20 МБ не скачиваются через Telegram API (нужна прямая ссылка)
-- Скачивание по URL: лимит 200 МБ, таймаут 5 минут
+- Скачивание по URL: лимит 200 МБ по фактически скачанным байтам, таймаут 5 минут
 - OpenRouter API rate limits
 - FSM-состояния сохраняются в Redis (если доступен), иначе теряются при перезапуске
 - Сессии загрузки файлов (user_files, user_schemas) хранятся в Redis с TTL 30 минут
@@ -850,7 +879,8 @@ python main.py
 - Хендлеры upload.py НЕ вызывают `synchronize_data()` inline — только `task_queue.enqueue()`
 - `create_bot()` теперь принимает `task_queue: TaskQueue` и передаёт его в `register_upload_handlers()`
 - Импорт сессий: `from bot import storage` → `storage.session_storage` (модуль, не переменная)
-- Порядок записи AI-лога: `synchronize_data` → `create_report_with_changes` → `create_ai_log_in_report`
+- `AIComparator` создаётся в `TaskWorker.__init__` — НЕ пересоздавать на каждую задачу
+- `await comparator.close()` вызывается в `TaskWorker.stop()` — НЕ вызывать раньше (активные задачи ещё используют компаратор)
 
 ### Критичные зависимости
 
@@ -867,7 +897,7 @@ python main.py
 
 ## Типичные сценарии работы
 
-### TaskQueue и TaskWorker (v4.5)
+### TaskQueue и TaskWorker (v4.5, обновлено v4.6)
 
 #### TaskQueue (`services/task_queue.py`)
 Абстракция над брокером задач (паттерн Repository). Поддерживает:
@@ -883,13 +913,16 @@ Dataclass-модель задачи. Поля: `user_id`, `chat_id`, `task_type`
 
 #### TaskWorker (`services/task_worker.py`)
 Фоновый сервис (паттерн Service Layer):
+- `AIComparator` создаётся **один раз** в `__init__` — промпты читаются с диска при старте воркера, не на каждую задачу
 - Читает задачи из очереди по одной
 - Выполняет полный цикл: `DataSynchronizer` → `ExcelWriter` → отправка файлов
 - Ограничение параллелизма: `asyncio.Semaphore(5)` — максимум 5 одновременных обработок
-- При shutdown корректно дожидается завершения активных задач
+- Семафор `AIComparator` теперь глобальный: максимум 5 AI-запросов суммарно по всем задачам
+- При shutdown корректно дожидается завершения активных задач, затем закрывает `AIComparator`
 
-#### Поток обработки (новый)
+#### Поток обработки
 
+```
 Пользователь нажимает "🚀 Обработать"
 ↓
 Хендлер upload.py создаёт Task и вызывает task_queue.enqueue(task)
@@ -898,12 +931,12 @@ Dataclass-модель задачи. Поля: `user_id`, `chat_id`, `task_type`
 ↓
 TaskWorker извлекает задачу из очереди
 ↓
-Semaphore(5) → DataSynchronizer.synchronize_data()
+Semaphore(5) → DataSynchronizer.synchronize_data() с self._comparator
 ↓
 Worker отправляет результат пользователю через Bot
+```
 
-
-#### Почему это решает проблему #7
+#### Почему это решает проблему параллельных обработок
 Раньше 5 пользователей одновременно запускали 5×N AI-запросов + 5 процессов pandas inline.
 Теперь максимум 5 задач обрабатываются параллельно, остальные ждут в очереди.
 Event loop бота остаётся свободным — бот отвечает на сообщения даже во время обработки.
@@ -926,7 +959,8 @@ Event loop бота остаётся свободным — бот отвеча�
 
 1. Добавить кортеж `("003_название", "SQL...")` В КОНЕЦ списка `MIGRATIONS` в `database/migrations.py`
 2. SQL должен быть идемпотентным (`IF NOT EXISTS` или `DO $$ IF NOT EXISTS ... END $$`)
-3. Миграция применится автоматически при следующем старте
+3. Нумерация должна быть уникальной и строго последовательной — `003_`, `004_` и т.д.
+4. Миграция применится автоматически при следующем старте
 
 ### Работа с МВМ-схемами (3 МП + XML каталог)
 
@@ -965,7 +999,9 @@ Telegram Bot API ограничивает скачивание файлов до
 
 **Вспомогательные функции** (`bot/utils.py`):
 - `download_xml_from_telegram(bot, message, user_id)` — скачивание через Telegram API с обработкой ошибки "file too big"
-- `download_file_by_url(url, user_id, filename)` — скачивание по HTTP/HTTPS ссылке (лимит 200 МБ)
+- `download_file_by_url(url, user_id, filename)` — скачивание по HTTP/HTTPS ссылке (лимит 200 МБ).
+  Лимит применяется по **фактически скачанным байтам** — защищает от серверов с chunked encoding
+  (Google Drive, Dropbox, Яндекс.Диск), которые не отдают заголовок `Content-Length`.
 
 Работает в обоих флоу: создание МВМ-схемы (`schema_create_mvm.py`) и обработка (`upload.py`).
 
@@ -1109,17 +1145,34 @@ Redis используется для двух целей:
 
 При недоступности Redis бот автоматически переключается на in-memory fallback с предупреждением в логах.
 
+### Почему AIComparator создаётся один раз, а не на каждую задачу?
+
+С v4.6 `AIComparator` инициализируется в `TaskWorker.__init__` и переиспользуется для всех задач.
+Это даёт два эффекта: промпты читаются с диска один раз при старте (не на каждую задачу),
+а семафор `asyncio.Semaphore(5)` внутри компаратора становится глобальным — ограничивает
+суммарное число AI-запросов по всем параллельным задачам, а не по каждой в отдельности.
+
 ---
 
-**Версия документации**: 4.4
+**Версия документации**: 4.6
 **Дата обновления**: Май 2026
 **Последние изменения**:
+- v4.6: Оптимизация и исправление ошибок.
+  `AIComparator` вынесен в `TaskWorker.__init__` — промпты читаются один раз при старте,
+  семафор стал глобальным (max 5 AI-запросов суммарно по всем задачам).
+  Добавлен метод `AIComparator.close()` — корректно закрывает `httpx.AsyncClient`
+  при остановке воркера, устраняя утечку соединений при включённом прокси.
+  `ExcelFileManager.save_results` теперь использует `self.column_validations` (O(1))
+  вместо повторного сканирования DV-правил листа для каждой ячейки.
+  `download_file_by_url` теперь считает фактически скачанные байты — лимит 200 МБ
+  работает корректно для серверов с chunked encoding (Google Drive, Dropbox).
+  Исправлена нумерация миграций: `001_add_schema_type_column` переименована в `002_`.
 - v4.5: Добавлена фоновая очередь задач (Redis-backed / in-memory fallback).
   TaskWorker ограничивает количество одновременных обработок через Semaphore(5).
   Хендлеры upload.py больше не выполняют синхронизацию inline — только ставят
   задачу в очередь. Результат приходит пользователю автоматически от воркера.
   Новые переменные окружения: MAX_CONCURRENT_TASKS, TASK_QUEUE_KEY.
-- v4.4: Рефакторинг хранения сессий — устранена утечка памяти в глобальных dict user_files/user_schemas. 
+- v4.4: Рефакторинг хранения сессий — устранена утечка памяти в глобальных dict user_files/user_schemas.
   Добавлен SessionStorage (bot/session_storage.py) с поддержкой Redis (TTL 30 мин) и in-memory fallback.
   FSM-хранилище переведено с MemoryStorage на RedisStorage. Обновлена валидация REDIS_URL в Config.
 - v4.2: Рефакторинг `DataSynchronizer` — вынесен в оркестратор (Facade). Создан подпакет `services/sync/` с 7 компонентами: `ValueConverter`, `AiValidator`, `ArticleAligner`, `DimensionsSynchronizer`, `ColumnSyncer`, `XmlSyncer`, `ExcelFileManager`. Исправлен порядок создания AI-лога: теперь `create_ai_log_in_report()` вызывается после `ExcelWriter.create_report_with_changes()`. `DimensionsSynchronizer.sync_dimensions()` возвращает `Tuple[int, resolved_wb_dims]` вместо просто `int` — устранено скрытое глобальное состояние.

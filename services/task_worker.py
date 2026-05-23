@@ -9,7 +9,7 @@ import asyncio
 import os
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Optional, Set
 
 from aiogram import Bot
 from aiogram.types import FSInputFile
@@ -34,6 +34,11 @@ class TaskWorker:
     Читает задачи из очереди и обрабатывает их с ограничением
     на количество одновременных обработок (по умолчанию 5).
 
+    AIComparator создаётся один раз при инициализации воркера —
+    промпты читаются с диска только при старте, а не на каждую задачу.
+    Семафор внутри AIComparator становится глобальным для всех задач,
+    что корректно ограничивает суммарное число AI-запросов.
+
     Паттерн: Service Layer — бизнес-логика обработки задач.
     """
 
@@ -44,6 +49,10 @@ class TaskWorker:
         self._worker_task: Optional[asyncio.Task] = None
         self._bot: Optional[Bot] = None
         self._active_tasks: Set[asyncio.Task] = set()
+
+        # Создаём один раз — промпты читаются с диска только здесь,
+        # при каждой задаче переиспользуется тот же экземпляр
+        self._comparator = AIComparator()
 
     async def start(self, bot: Bot) -> None:
         """Запускает фоновый цикл обработки задач."""
@@ -67,7 +76,7 @@ class TaskWorker:
         logger.info("Остановка TaskWorker...")
         self._running = False
 
-        # Ждем завершения цикла извлечения задач (dequeue имеет таймаут)
+        # Ждём завершения цикла извлечения задач (dequeue имеет таймаут)
         if self._worker_task and not self._worker_task.done():
             try:
                 await asyncio.wait_for(self._worker_task, timeout=10.0)
@@ -78,7 +87,7 @@ class TaskWorker:
                 except asyncio.CancelledError:
                     pass
 
-        # Ждем завершения активных обработок
+        # Ждём завершения активных обработок
         if self._active_tasks:
             logger.info(
                 "Ожидание завершения %d активных задач...", len(self._active_tasks)
@@ -86,6 +95,9 @@ class TaskWorker:
             pending = list(self._active_tasks)
             self._active_tasks.clear()
             await asyncio.gather(*pending, return_exceptions=True)
+
+        # Закрываем HTTP-клиент компаратора после завершения всех задач
+        await self._comparator.close()
 
         logger.info("TaskWorker остановлен")
 
@@ -107,7 +119,7 @@ class TaskWorker:
             process_task.add_done_callback(self._active_tasks.discard)
 
     async def _process_task(self, task: Task) -> None:
-        """Обрабатывает одну задачу с учетом семафора."""
+        """Обрабатывает одну задачу с учётом семафора."""
         async with self._semaphore:
             await self._execute_task(task)
 
@@ -143,9 +155,6 @@ class TaskWorker:
             # Получаем схему сопоставлений
             comparison_result = await storage.db.get_schema_matches(task.schema_id)
 
-            # Создаем AI компаратор
-            comparator = AIComparator()
-
             # Подготовка DataSynchronizer
             xml_offer_data = None
             xml_categories = None
@@ -164,9 +173,10 @@ class TaskWorker:
                     len(xml_categories),
                 )
 
+            # Используем общий экземпляр компаратора вместо создания нового
             synchronizer = DataSynchronizer(
                 comparison_result,
-                ai_comparator=comparator,
+                ai_comparator=self._comparator,
                 xml_offer_data=xml_offer_data,
                 xml_categories=xml_categories,
                 selected_category_ids=selected_category_ids,
@@ -187,7 +197,7 @@ class TaskWorker:
                 task.file_paths, output_sync_paths
             )
 
-            # Создание отчета
+            # Создание отчёта
             writer = ExcelWriter()
             writer.create_report_with_changes(
                 comparison_result, changes_log, task.report_path
@@ -222,7 +232,7 @@ class TaskWorker:
             await self._bot.send_document(
                 task.chat_id,
                 FSInputFile(task.report_path),
-                caption="📊 Отчет",
+                caption="📊 Отчёт",
             )
 
             # Формируем текст результата

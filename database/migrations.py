@@ -125,6 +125,8 @@ CREATE INDEX IF NOT EXISTS idx_whitelist_users_role
 # Каждая миграция — кортеж (название, SQL-запрос).
 # Все миграции идемпотентны (IF NOT EXISTS / ADD COLUMN IF NOT EXISTS).
 # Новые миграции ВСЕГДА добавляются В КОНЕЦ списка.
+# ВАЖНО: нумерация должна быть уникальной и последовательной —
+# 001_, 002_, 003_ и т.д.
 # ===================================================================
 
 MIGRATIONS: list[tuple[str, str]] = [
@@ -147,7 +149,7 @@ MIGRATIONS: list[tuple[str, str]] = [
         """
     ),
     (
-        "001_add_schema_type_column",
+        "002_add_schema_type_column",  # ← было "001_add_schema_type_column", исправлено на "002_"
         """
         DO $$
         BEGIN

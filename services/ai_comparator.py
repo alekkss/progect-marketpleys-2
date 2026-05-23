@@ -42,17 +42,18 @@ class AIComparator:
         # Создаем HTTP клиент с прокси если включено
         if Config.PROXY_ENABLED and Config.PROXY_URL:
             print(f"[🔒] Используется прокси для OpenRouter API")
-            http_client = httpx.AsyncClient(
+            self._http_client = httpx.AsyncClient(  # ← сохраняем в self, чтобы можно было закрыть
                 proxy=Config.PROXY_URL,
                 timeout=120.0
             )
             self.client = AsyncOpenAI(
                 api_key=Config.OPENROUTER_API_KEY,
                 base_url=Config.OPENROUTER_BASE_URL,
-                http_client=http_client
+                http_client=self._http_client
             )
         else:
             print("[⚠️] Прокси не настроен, прямое подключение")
+            self._http_client = None  # ← явно None, чтобы close() мог проверить
             self.client = AsyncOpenAI(
                 api_key=Config.OPENROUTER_API_KEY,
                 base_url=Config.OPENROUTER_BASE_URL
@@ -93,6 +94,18 @@ class AIComparator:
         except FileNotFoundError:
             self.mvm_matching_template = None
             print("[i] МВМ промпт не найден (будет загружен при первом использовании)")
+    
+    async def close(self) -> None:
+        """
+        Закрывает HTTP-клиент и освобождает сетевые соединения.
+
+        Вызывать при завершении работы воркера или при уничтожении
+        экземпляра класса. Безопасен при повторном вызове.
+        """
+        if self._http_client is not None:
+            await self._http_client.aclose()
+            self._http_client = None
+            logger.info("HTTP-клиент AIComparator закрыт")
 
     async def compare_columns(
         self,

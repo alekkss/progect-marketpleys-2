@@ -18,6 +18,7 @@ from config.config import Config, TELEGRAM_BOT_TOKEN
 from bot.storage import init_storage, shutdown_storage
 from services.task_queue import create_task_queue, TaskQueue
 from services.task_worker import TaskWorker
+from services.ai_comparator import AIComparator
 from utils.logger_config import setup_logger
 
 # Импорт регистраторов обработчиков
@@ -36,7 +37,10 @@ logger = setup_logger('bot')
 logging.basicConfig(level=logging.INFO)
 
 
-def create_bot(task_queue: Optional[TaskQueue] = None) -> tuple[Bot, Dispatcher]:
+def create_bot(
+    task_queue: Optional[TaskQueue] = None,
+    ai_comparator: Optional[AIComparator] = None,
+) -> tuple[Bot, Dispatcher]:
     """
     Создание и настройка бота.
 
@@ -53,6 +57,9 @@ def create_bot(task_queue: Optional[TaskQueue] = None) -> tuple[Bot, Dispatcher]
     Args:
         task_queue: Очередь задач для фоновой обработки. Передаётся
             в хендлеры загрузки файлов для постановки задач в очередь.
+        ai_comparator: Общий экземпляр AIComparator. Передаётся
+            в dispatcher workflow data для инъекции в хендлеры через
+            aiogram DI (параметр ai_comparator в функциях-хендлерах).
 
     Returns:
         Кортеж (bot, dispatcher)
@@ -71,12 +78,12 @@ def create_bot(task_queue: Optional[TaskQueue] = None) -> tuple[Bot, Dispatcher]
     # ===================================================================
     dp: Dispatcher
     try:
-        storage = RedisStorage.from_url(Config.REDIS_URL)
+        fsm_storage = RedisStorage.from_url(Config.REDIS_URL)
         logger.info(
             "FSM-хранилище: Redis (%s). Состояния переживают перезапуск.",
             Config.REDIS_URL,
         )
-        dp = Dispatcher(storage=storage)
+        dp = Dispatcher(storage=fsm_storage)
     except Exception as e:
         logger.warning(
             "Не удалось подключиться к Redis для FSM: %s. "
@@ -84,6 +91,16 @@ def create_bot(task_queue: Optional[TaskQueue] = None) -> tuple[Bot, Dispatcher]
             e,
         )
         dp = Dispatcher(storage=MemoryStorage())
+
+    # =================================================================
+    # Dependency Injection через aiogram workflow data
+    # =================================================================
+    # Значения, установленные в dp["key"], автоматически инжектируются
+    # в хендлеры как именованные параметры с тем же именем.
+    # Например: dp["ai_comparator"] → async def handler(..., ai_comparator)
+    # =================================================================
+    if ai_comparator is not None:
+        dp["ai_comparator"] = ai_comparator
 
     # Регистрация middleware (ПЕРЕД handlers!)
     dp.message.middleware(AccessControlMiddleware())
@@ -111,10 +128,11 @@ async def start_bot() -> None:
         1. Валидация конфигурации (fail fast)
         2. Инициализация хранилищ (PostgreSQL + Redis session storage)
         3. Подключение очереди задач (Redis или in-memory)
-        4. Создание бота и диспетчера
-        5. Запуск фонового воркера обработки задач
-        6. Запуск polling
-        7. При остановке — graceful shutdown (воркер → очередь → ресурсы)
+        4. Создание AIComparator (один экземпляр на весь жизненный цикл)
+        5. Создание бота и диспетчера (с DI через workflow data)
+        6. Запуск фонового воркера обработки задач
+        7. Запуск polling
+        8. При остановке — graceful shutdown (воркер → очередь → ресурсы)
 
     Raises:
         ValueError: если обязательные параметры конфигурации не заданы
@@ -155,23 +173,32 @@ async def start_bot() -> None:
         task_queue = create_task_queue(None, Config.TASK_QUEUE_KEY)
         await task_queue.connect()
 
-    # Шаг 4: Создание бота и диспетчера
-    bot, dp = create_bot(task_queue)
+    # Шаг 4: Создание AIComparator (единственный экземпляр)
+    # Промпты читаются с диска один раз. Семафор внутри ограничивает
+    # суммарное число AI-запросов по всем задачам и хендлерам.
+    # Этот экземпляр используется и в TaskWorker, и в хендлерах
+    # создания/обновления схем через aiogram DI.
+    ai_comparator = AIComparator()
 
-    # Шаг 5: Запуск фонового воркера
-    # Воркер читает задачи из очереди и обрабатывает их с ограничением
-    # на количество одновременных обработок (Semaphore).
-    task_worker = TaskWorker(task_queue, Config.MAX_CONCURRENT_TASKS)
+    # Шаг 5: Создание бота и диспетчера
+    # ai_comparator передаётся в dp["ai_comparator"] для автоматической
+    # инъекции в хендлеры, которые объявляют параметр ai_comparator.
+    bot, dp = create_bot(task_queue, ai_comparator)
+
+    # Шаг 6: Запуск фонового воркера
+    # Воркер получает тот же ai_comparator — НЕ создаёт свой.
+    # Семафор общий: максимум 5 AI-запросов суммарно.
+    task_worker = TaskWorker(task_queue, Config.MAX_CONCURRENT_TASKS, ai_comparator)
     await task_worker.start(bot)
 
-    # Шаг 6: Запуск polling с graceful shutdown
+    # Шаг 7: Запуск polling с graceful shutdown
     logger.info("Telegram бот запущен!")
     print("🚀 Telegram бот запущен!")
 
     try:
         await dp.start_polling(bot)
     finally:
-        # Шаг 7: Корректное завершение
+        # Шаг 8: Корректное завершение
         # Порядок важен: сначала останавливаем воркер (ждём активных задач),
         # затем отключаем очередь, затем закрываем основные ресурсы.
         logger.info("Остановка бота, закрытие ресурсов...")

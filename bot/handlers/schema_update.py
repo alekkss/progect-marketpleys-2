@@ -90,7 +90,8 @@ async def schema_selected_for_update(message: types.Message, state: FSMContext):
 async def handle_update_file(message: types.Message, state: FSMContext, bot):
     user_id = message.from_user.id
     data = await state.get_data()
-    if data.get('files_processed'): return
+    if data.get('files_processed'):
+        return
 
     file_path, file_name, marketplace = await download_file(bot, message, user_id)
     if not marketplace:
@@ -110,7 +111,17 @@ async def handle_update_file(message: types.Message, state: FSMContext, bot):
         await state.update_data(files_processed=True)
         await message.answer("✅ Все файлы загружены!", reply_markup=get_update_schema_keyboard())
 
-async def finalize_schema_update(message: types.Message, state: FSMContext):
+async def finalize_schema_update(
+    message: types.Message,
+    state: FSMContext,
+    ai_comparator: AIComparator,
+) -> None:
+    """
+    Финализация обновления стандартной схемы — AI-сопоставление несопоставленных столбцов.
+
+    ai_comparator инжектируется автоматически через aiogram DI
+    из dp["ai_comparator"] — общий экземпляр на весь жизненный цикл бота.
+    """
     if await state.get_state() != SchemaStates.waiting_update_files:
         await message.answer("❌ Сначала выбери схему для обновления")
         return
@@ -151,7 +162,7 @@ async def finalize_schema_update(message: types.Message, state: FSMContext):
             return
 
         await message.answer(f"🔍 Несопоставленных: WB:{len(remaining['wildberries'])} Ozon:{len(remaining['ozon'])} Я:{len(remaining['yandex'])}\n\n🤖 AI ищет новые совпадения...")
-        new_result = await AIComparator().compare_columns(remaining['wildberries'], remaining['ozon'], remaining['yandex'])
+        new_result = await ai_comparator.compare_columns(remaining['wildberries'], remaining['ozon'], remaining['yandex'])
         new_count, skipped = _merge_new_standard_matches(existing_matches, new_result)
 
         if new_count > 0:
@@ -162,7 +173,7 @@ async def finalize_schema_update(message: types.Message, state: FSMContext):
         await message.answer(_build_update_result_text(schema_name, new_count, skipped, len(existing_matches.get('matches_all_three', [])), total_remaining), reply_markup=get_main_menu_keyboard())
     except Exception as e:
         await message.answer(f"❌ Ошибка: {str(e)}")
-        logger.error(f"Ошибка обновления стандартной схемы: {e}", exc_info=True)
+        logger.error("Ошибка обновления стандартной схемы: %s", e, exc_info=True)
     finally:
         # Гарантированная очистка сессии при любом исходе
         await storage.session_storage.clear(user_id)
@@ -171,13 +182,17 @@ async def finalize_schema_update(message: types.Message, state: FSMContext):
 # МВМ-ФЛОУ (3 МП + XML)
 # =====================================================================
 async def handle_mvm_update_mp_file(message: types.Message, state: FSMContext, bot):
+    """Обработка файла МП для обновления МВМ-схемы."""
     user_id = message.from_user.id
-    if (await state.get_data()).get('mvm_mp_files_processed'): return
+    if (await state.get_data()).get('mvm_mp_files_processed'):
+        return
 
     fp, fn, mp = await download_file(bot, message, user_id)
-    if not mp: await message.answer("❌ Переименуй файл (добавь wb/ozon/yandex)"); return
-    if mp in user_schemas: await message.answer(f"⚠️ {mp.upper()} уже загружен"); return
+    if not mp:
+        await message.answer("❌ Переименуй файл (добавь wb/ozon/yandex)")
+        return
 
+    # ИСПРАВЛЕН БАГ 1.6: get_files_dict вызывается ДО проверки на дубликат
     user_schemas = await storage.session_storage.get_files_dict(user_id, _SESSION_KEY_UPDATE)
     if mp in user_schemas:
         await message.answer(f"⚠️ {mp.upper()} уже загружен")
@@ -204,8 +219,8 @@ async def handle_mvm_update_mp_text(message: types.Message, state: FSMContext):
 async def handle_mvm_update_xml_file(message: types.Message, state: FSMContext, bot):
     if not message.document:
         if message.text == "❌ Отмена":
-            u = message.from_user.id
-            await storage.session_storage.clear(u)
+            user_id = message.from_user.id
+            await storage.session_storage.clear(user_id)
             await state.clear()
             await schema_management(message, state)
         else:
@@ -214,7 +229,8 @@ async def handle_mvm_update_xml_file(message: types.Message, state: FSMContext, 
 
     fn = message.document.file_name or ""
     if not fn.lower().endswith('.xml'):
-        await message.answer("❌ Нужен файл с расширением .xml"); return
+        await message.answer("❌ Нужен файл с расширением .xml")
+        return
 
     file = await bot.get_file(message.document.file_id)
     dl_dir = Path("downloads") / str(message.from_user.id)
@@ -225,34 +241,55 @@ async def handle_mvm_update_xml_file(message: types.Message, state: FSMContext, 
     try:
         xr = XmlReader()
         cnt = xr.get_offer_count(xml_path)
-        if cnt == 0: await message.answer("❌ XML не содержит офферов."); return
+        if cnt == 0:
+            await message.answer("❌ XML не содержит офферов.")
+            return
         await state.update_data(mvm_xml_file_path=xml_path)
         await message.answer(f"✅ XML загружен! Офферов: {cnt}, полей: {len(xr.get_field_names(xml_path))}\n\nНажми кнопку:", reply_markup=get_update_schema_keyboard())
     except Exception as e:
         await message.answer(f"❌ Ошибка чтения XML: {e}")
-        logger.error(f"Ошибка XML при обновлении МВМ: {e}", exc_info=True)
+        logger.error("Ошибка XML при обновлении МВМ: %s", e, exc_info=True)
 
 async def handle_mvm_update_xml_text(message: types.Message, state: FSMContext):
+    """
+    Обработка текста в состоянии ожидания XML.
+
+    Кнопка "✅ Обновить схему" обрабатывается отдельным хендлером
+    finalize_mvm_schema_update (зарегистрирован с более высоким приоритетом).
+    Здесь обрабатываем только отмену и неизвестный текст.
+    """
     if message.text == "❌ Отмена":
-        u = message.from_user.id
-        await storage.session_storage.clear(u)
+        user_id = message.from_user.id
+        await storage.session_storage.clear(user_id)
         await state.clear()
         await schema_management(message, state)
-    elif message.text == "✅ Обновить схему":
-        await finalize_mvm_schema_update(message, state)
     else:
         await message.answer("📎 Отправь XML файл или нажми ❌ Отмена")
 
-async def finalize_mvm_schema_update(message: types.Message, state: FSMContext):
-    u = message.from_user.id
-    user_schemas = await storage.session_storage.get_files_dict(u, _SESSION_KEY_UPDATE)
+async def finalize_mvm_schema_update(
+    message: types.Message,
+    state: FSMContext,
+    ai_comparator: AIComparator,
+) -> None:
+    """
+    Финализация обновления МВМ-схемы — AI-сопоставление несопоставленных столбцов из 4 источников.
+
+    ai_comparator инжектируется автоматически через aiogram DI
+    из dp["ai_comparator"] — общий экземпляр на весь жизненный цикл бота.
+    """
+    user_id = message.from_user.id
+    user_schemas = await storage.session_storage.get_files_dict(user_id, _SESSION_KEY_UPDATE)
     if len(user_schemas) != 3:
-        await message.answer("❌ Не хватает файлов МП."); return
+        await message.answer("❌ Не хватает файлов МП.")
+        return
 
     data = await state.get_data()
-    schema_id, schema_name, xml_path = data.get('update_schema_id'), data.get('update_schema_name'), data.get('mvm_xml_file_path')
+    schema_id = data.get('update_schema_id')
+    schema_name = data.get('update_schema_name')
+    xml_path = data.get('mvm_xml_file_path')
     if not schema_id or not schema_name or not xml_path:
-        await message.answer("❌ Данные схемы потеряны."); return
+        await message.answer("❌ Данные схемы потеряны.")
+        return
 
     await message.answer(f"⏳ Анализирую столбцы для МВМ-схемы '{schema_name}'...", reply_markup=ReplyKeyboardRemove())
     try:
@@ -276,26 +313,26 @@ async def finalize_mvm_schema_update(message: types.Message, state: FSMContext):
         total_rem = sum(len(v) for v in rem.values())
         if total_rem == 0:
             await state.clear()
-            await storage.session_storage.clear(u)
+            await storage.session_storage.clear(user_id)
             await message.answer(f"ℹ️ Все столбцы уже сопоставлены!\n\nМВМ-схема '{schema_name}' не требует обновления", reply_markup=get_main_menu_keyboard())
             return
 
         await message.answer(f"🔍 Несопоставленных: WB:{len(rem['wildberries'])} Ozon:{len(rem['ozon'])} Я:{len(rem['yandex'])} XML:{len(rem['xml'])}\n\n🤖 AI ищет новые совпадения (4 источника)...")
-        new_res = await AIComparator().compare_columns_mvm(rem['wildberries'], rem['ozon'], rem['yandex'], rem['xml'])
+        new_res = await ai_comparator.compare_columns_mvm(rem['wildberries'], rem['ozon'], rem['yandex'], rem['xml'])
         new_cnt, skip = _merge_new_mvm_matches(existing, new_res)
 
         if new_cnt > 0:
             await storage.db.save_schema_matches(schema_id, existing)
 
         await state.clear()
-        await storage.session_storage.clear(u)
+        await storage.session_storage.clear(user_id)
         await message.answer(_build_mvm_update_result_text(schema_name, new_cnt, skip, existing, total_rem), reply_markup=get_main_menu_keyboard())
     except Exception as e:
         await message.answer(f"❌ Ошибка: {str(e)}")
-        logger.error(f"Ошибка обновления МВМ-схемы: {e}", exc_info=True)
+        logger.error("Ошибка обновления МВМ-схемы: %s", e, exc_info=True)
     finally:
         # Гарантированная очистка сессии при любом исходе
-        await storage.session_storage.clear(u)
+        await storage.session_storage.clear(user_id)
 
 # =====================================================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
@@ -362,12 +399,29 @@ def _build_mvm_update_result_text(sn, nc, sc, existing, tr):
     return f"{t}\n⚠️ Пропущено (<85%): {sc}" if sc > 0 else t
 
 def register_schema_update_handlers(dp, bot):
+    """
+    Регистрация обработчиков обновления схем.
+
+    ПОРЯДОК ВАЖЕН: хендлеры с конкретным фильтром текста (F.text == "...")
+    регистрируются ПЕРЕД общими текстовыми хендлерами на тот же state.
+    Aiogram проверяет хендлеры в порядке регистрации — первый подходящий срабатывает.
+    """
     from functools import partial
+
     dp.message.register(update_schema_start, F.text == "🔄 Обновить схему")
     dp.message.register(schema_selected_for_update, SchemaStates.selecting_schema_to_update)
+
+    # Стандартный флоу
     dp.message.register(partial(handle_update_file, bot=bot), SchemaStates.waiting_update_files, F.document)
-    dp.message.register(finalize_schema_update, F.text == "✅ Обновить схему")
+    dp.message.register(finalize_schema_update, SchemaStates.waiting_update_files, F.text == "✅ Обновить схему")
+
+    # МВМ-флоу: загрузка МП файлов
     dp.message.register(partial(handle_mvm_update_mp_file, bot=bot), SchemaUpdateMvmStates.waiting_mp_files, F.document)
     dp.message.register(handle_mvm_update_mp_text, SchemaUpdateMvmStates.waiting_mp_files, F.text)
+
+    # МВМ-флоу: загрузка XML и финализация
     dp.message.register(partial(handle_mvm_update_xml_file, bot=bot), SchemaUpdateMvmStates.waiting_xml_file, F.document)
+    # ВАЖНО: finalize_mvm_schema_update ПЕРЕД handle_mvm_update_xml_text —
+    # конкретный фильтр F.text == "✅ Обновить схему" имеет приоритет над общим F.text
+    dp.message.register(finalize_mvm_schema_update, SchemaUpdateMvmStates.waiting_xml_file, F.text == "✅ Обновить схему")
     dp.message.register(handle_mvm_update_xml_text, SchemaUpdateMvmStates.waiting_xml_file, F.text)

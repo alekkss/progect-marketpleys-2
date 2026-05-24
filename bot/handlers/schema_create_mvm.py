@@ -478,8 +478,17 @@ async def handle_category_selection_text(
 
 # ===== ШАГ 5: ФИНАЛИЗАЦИЯ (AI + СОХРАНЕНИЕ) =====
 
-async def finalize_mvm_schema(message: types.Message, state: FSMContext) -> None:
-    """Финализация: AI-сопоставление 4 источников и сохранение схемы в БД."""
+async def finalize_mvm_schema(
+    message: types.Message,
+    state: FSMContext,
+    ai_comparator: AIComparator,
+) -> None:
+    """
+    Финализация: AI-сопоставление 4 источников и сохранение схемы в БД.
+
+    ai_comparator инжектируется автоматически через aiogram DI
+    из dp["ai_comparator"] — общий экземпляр на весь жизненный цикл бота.
+    """
     user_id = message.from_user.id
 
     if message.text == "❌ Отмена":
@@ -550,8 +559,7 @@ async def finalize_mvm_schema(message: types.Message, state: FSMContext) -> None
             "🤖 AI сопоставляет 4 источника..."
         )
 
-        comparator = AIComparator()
-        comparison_result = await comparator.compare_columns_mvm(
+        comparison_result = await ai_comparator.compare_columns_mvm(
             columns['wildberries'],
             columns['ozon'],
             columns['yandex'],

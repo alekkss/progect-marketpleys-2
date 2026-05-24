@@ -32,20 +32,47 @@ def _safe_int_env(name: str, default: int = 0) -> int:
         return default
 
 
+def _safe_float_env(name: str, default: float = 0.0) -> float:
+    """
+    Безопасное чтение float из переменной окружения.
+
+    При невалидном значении (например, "abc") возвращает default
+    вместо падения с ValueError при импорте модуля.
+
+    Args:
+        name: Имя переменной окружения
+        default: Значение по умолчанию если парсинг не удался
+
+    Returns:
+        float: Числовое значение или default
+    """
+    raw = os.getenv(name, "")
+    try:
+        return float(str(raw).strip()) if raw.strip() else default
+    except (TypeError, ValueError):
+        return default
+
+
 def _validate_redis_url(url: str) -> bool:
     """
     Проверяет формат URL Redis.
+
+    Поддерживает:
+        - redis://host:port/db
+        - rediss://host:port/db (TLS)
+        - redis://user:password@host:port/db (аутентификация)
+        - redis://host:port (без номера БД)
+        - redis://host:port/db?timeout=5 (query params)
 
     Args:
         url: Строка подключения к Redis
 
     Returns:
-        True если формат корректный (redis://host:port/db)
+        True если формат корректный
     """
     if not url:
         return False
-    # Допустимые схемы: redis://, rediss:// (TLS)
-    pattern = r'^redis(s)?://[^\s/]+:\d+(/\d+)?$'
+    pattern = r'^redis(s)?://([^@]+@)?[^\s/:]+:\d+(/\d+)?(\?.*)?$'
     return bool(re.match(pattern, url))
 
 
@@ -56,7 +83,7 @@ class Config:
     OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
     OPENROUTER_BASE_URL: str = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
     AI_MODEL: str = os.getenv("AI_MODEL", "google/gemini-2.5-flash-preview-09-2025")
-    AI_TEMPERATURE: float = float(os.getenv("AI_TEMPERATURE", "0.1"))
+    AI_TEMPERATURE: float = _safe_float_env("AI_TEMPERATURE", 0.1)
 
     # Права доступа
     ACCESS_OWNER_ID: int = _safe_int_env("ACCESS_OWNER_ID", 0)
@@ -334,6 +361,19 @@ class Config:
             raise ValueError(
                 "Не задан ACCESS_OWNER_ID в .env. "
                 "Система доступа не может работать без ID владельца."
+            )
+
+        # ===================================================================
+        # Валидация числовых параметров, прочитанных через _safe_*_env
+        # ===================================================================
+        # _safe_float_env вернёт default при мусоре в .env, но validate()
+        # дополнительно проверяет диапазон допустимых значений.
+        # ===================================================================
+        if not (0.0 <= cls.AI_TEMPERATURE <= 2.0):
+            raise ValueError(
+                f"AI_TEMPERATURE должен быть в диапазоне [0.0, 2.0], "
+                f"получено: {cls.AI_TEMPERATURE}. "
+                f"Рекомендуемое значение: 0.1"
             )
 
         # ===================================================================

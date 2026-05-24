@@ -137,15 +137,26 @@ class TaskWorker:
     Читает задачи из очереди и обрабатывает их с ограничением
     на количество одновременных обработок (по умолчанию 5).
 
-    AIComparator создаётся один раз при инициализации воркера —
-    промпты читаются с диска только при старте, а не на каждую задачу.
-    Семафор внутри AIComparator становится глобальным для всех задач,
+    Backpressure: семафор захватывается ДО создания asyncio.Task.
+    Это гарантирует, что при всплеске задач не будет создано больше
+    корутин, чем позволяет лимит. Задачи ждут в очереди Redis/memory,
+    а не в виде висящих корутин в event loop.
+
+    AIComparator передаётся извне при создании воркера —
+    тот же экземпляр используется в хендлерах через aiogram DI.
+    Семафор внутри AIComparator глобальный для всех задач и хендлеров,
     что корректно ограничивает суммарное число AI-запросов.
 
     Паттерн: Service Layer — бизнес-логика обработки задач.
+    Паттерн: Dependency Injection — comparator инжектируется извне.
     """
 
-    def __init__(self, task_queue: TaskQueue, max_concurrent: int = 5) -> None:
+    def __init__(
+        self,
+        task_queue: TaskQueue,
+        max_concurrent: int = 5,
+        ai_comparator: Optional[AIComparator] = None,
+    ) -> None:
         self._queue = task_queue
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._running = False
@@ -153,9 +164,20 @@ class TaskWorker:
         self._bot: Optional[Bot] = None
         self._active_tasks: Set[asyncio.Task] = set()
 
-        # Создаём один раз — промпты читаются с диска только здесь,
-        # при каждой задаче переиспользуется тот же экземпляр
-        self._comparator = AIComparator()
+        # AIComparator передаётся извне (из start_bot) —
+        # один экземпляр на весь жизненный цикл приложения.
+        # Промпты читаются с диска один раз при создании comparator,
+        # семафор общий для воркера и хендлеров.
+        if ai_comparator is None:
+            # Fallback: если не передан — создаём свой (обратная совместимость)
+            self._comparator = AIComparator()
+            logger.warning(
+                "AIComparator не передан в TaskWorker — создан локальный экземпляр. "
+                "Рекомендуется передавать общий экземпляр через параметр ai_comparator."
+            )
+        else:
+            self._comparator = ai_comparator
+
         self._cleanup_service = _FileCleanupService()
 
     async def start(self, bot: Bot) -> None:
@@ -208,7 +230,18 @@ class TaskWorker:
         logger.info("TaskWorker остановлен")
 
     async def _worker_loop(self) -> None:
-        """Основной цикл: извлекает задачи и запускает их обработку."""
+        """
+        Основной цикл: извлекает задачи и запускает их обработку.
+
+        Backpressure реализован через acquire() ДО создания asyncio.Task:
+        - dequeue() достаёт задачу из очереди (блокирует до 5 сек)
+        - acquire() ждёт свободный слот семафора
+        - Только после получения слота создаётся asyncio.Task
+
+        Это гарантирует: максимум max_concurrent корутин одновременно.
+        При всплеске 100 задач — они остаются в очереди Redis, а не
+        висят как 100 корутин в памяти event loop.
+        """
         while self._running:
             try:
                 task = await self._queue.dequeue()
@@ -219,15 +252,30 @@ class TaskWorker:
                 await asyncio.sleep(1)
                 continue
 
-            # Запускаем обработку как фоновую задачу с семафором
-            process_task = asyncio.create_task(self._process_task(task))
+            # Ждём свободный слот ДО создания asyncio.Task
+            await self._semaphore.acquire()
+
+            # Проверяем: не остановились ли пока ждали семафор
+            if not self._running:
+                self._semaphore.release()
+                break
+
+            # Создаём задачу — слот уже захвачен, release() в finally
+            process_task = asyncio.create_task(self._process_with_release(task))
             self._active_tasks.add(process_task)
             process_task.add_done_callback(self._active_tasks.discard)
 
-    async def _process_task(self, task: Task) -> None:
-        """Обрабатывает одну задачу с учётом семафора."""
-        async with self._semaphore:
+    async def _process_with_release(self, task: Task) -> None:
+        """
+        Обёртка над _execute_task с гарантированным освобождением семафора.
+
+        Семафор уже захвачен в _worker_loop (acquire). Здесь гарантируем
+        release() в finally — даже при исключении или отмене задачи.
+        """
+        try:
             await self._execute_task(task)
+        finally:
+            self._semaphore.release()
 
     async def _execute_task(self, task: Task) -> None:
         """Выполняет полный цикл обработки задачи."""

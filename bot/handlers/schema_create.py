@@ -4,7 +4,6 @@
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-import os
 import logging
 from aiogram import types, F
 from aiogram.types import ReplyKeyboardRemove
@@ -126,8 +125,17 @@ async def handle_schema_file(message: types.Message, state: FSMContext, bot) -> 
         await state.update_data(files_processed=True)
         await message.answer("✅ Все файлы загружены!", reply_markup=get_create_schema_keyboard())
 
-async def finalize_schema_creation(message: types.Message, state: FSMContext) -> None:
-    """Финализация создания схемы — AI-сопоставление и сохранение в БД."""
+async def finalize_schema_creation(
+    message: types.Message,
+    state: FSMContext,
+    ai_comparator: AIComparator,
+) -> None:
+    """
+    Финализация создания схемы — AI-сопоставление и сохранение в БД.
+
+    ai_comparator инжектируется автоматически через aiogram DI
+    из dp["ai_comparator"] — общий экземпляр на весь жизненный цикл бота.
+    """
     current_state = await state.get_state()
     if current_state != SchemaStates.waiting_schema_files:
         await message.answer("❌ Сначала начни создание схемы через '➕ Создать схему'")
@@ -159,8 +167,7 @@ async def finalize_schema_creation(message: types.Message, state: FSMContext) ->
             )
 
         await message.answer("🤖 AI сравнивает столбцы...")
-        comparator = AIComparator()
-        comparison_result = await comparator.compare_columns(
+        comparison_result = await ai_comparator.compare_columns(
             columns['wildberries'], columns['ozon'], columns['yandex']
         )
 

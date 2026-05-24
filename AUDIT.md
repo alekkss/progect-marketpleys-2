@@ -24,50 +24,37 @@
 
 ---
 
-### 1.1. AIComparator создаётся заново в хендлерах (утечка соединений)
+### ✅ 1.1. AIComparator создаётся заново в хендлерах (утечка соединений) — РЕШЕНО
 
-**Файлы:** `bot/handlers/schema_create.py`, `bot/handlers/schema_update.py`
+**Файлы:** `bot/bot.py`, `services/task_worker.py`, `bot/handlers/schema_create.py`, `bot/handlers/schema_create_mvm.py`, `bot/handlers/schema_update.py`
 
-**Проблема:**
+**Было:**
 
-```python
-# schema_create.py, строка ~130
-comparator = AIComparator()
-comparison_result = await comparator.compare_columns(...)
+- `schema_create.py`: `comparator = AIComparator()` — новый экземпляр при каждом создании схемы
+- `schema_create_mvm.py`: `comparator = AIComparator()` — новый экземпляр при каждом создании МВМ-схемы
+- `schema_update.py`: `await AIComparator().compare_columns(...)` и `await AIComparator().compare_columns_mvm(...)` — два новых экземпляра при обновлении
+- `task_worker.py`: `self._comparator = AIComparator()` — создавался внутри, не связан с хендлерами
 
-# schema_update.py, строка ~95
-new_result = await AIComparator().compare_columns(...)
-```
+**Реализовано:**
 
-Каждый вызов создаёт новый `httpx.AsyncClient` (если прокси включён), который никогда не закрывается. При 10 обновлениях схем — 10 незакрытых HTTP-клиентов. Кроме того:
+Единый экземпляр `AIComparator` создаётся в `start_bot()` и передаётся через два канала:
 
-- Промпты читаются с диска заново при каждом создании.
-- Семафор в этих экземплярах локальный — обходит глобальное ограничение на 5 AI-запросов.
+1. **aiogram DI** (`dp["ai_comparator"]`) — хендлеры получают через параметр `ai_comparator: AIComparator`
+2. **Параметр конструктора** `TaskWorker(task_queue, max_concurrent, ai_comparator)` — воркер использует тот же экземпляр
 
-Это прямо противоречит архитектурному решению v4.6, где `AIComparator` должен создаваться один раз в `TaskWorker`.
-
-**Решение:**
-
-Вариант A (минимальные изменения): передавать общий экземпляр `AIComparator` через aiogram DI (workflow data):
-
-```python
-# bot/bot.py — при создании бота
-dp["ai_comparator"] = comparator  # тот же экземпляр из TaskWorker
-
-# В хендлере — получаем через параметр
-async def finalize_schema_creation(message: types.Message, state: FSMContext, ai_comparator: AIComparator):
-    result = await ai_comparator.compare_columns(...)
-```
-
-Вариант B (рефакторинг): вынести создание/обновление схем в `TaskQueue` так же, как обработку файлов — через `Task` с `type="schema_create"`.
+Результат:
+- Один `httpx.AsyncClient` на весь жизненный цикл (закрывается в `task_worker.stop()`)
+- Один `asyncio.Semaphore(5)` — глобальное ограничение для хендлеров И воркера
+- Промпты читаются с диска один раз при старте
+- `finalize_schema_creation`, `finalize_mvm_schema`, `finalize_schema_update`, `finalize_mvm_schema_update` — все получают `ai_comparator` через aiogram DI
 
 ---
 
-### 1.2. ExcelFileManager.save_results — AI-запрос на КАЖДУЮ ячейку
+### ✅ 1.2. ExcelFileManager.save_results — AI-запрос на КАЖДУЮ ячейку — РЕШЕНО
 
 **Файл:** `services/sync/excel_io.py`, метод `_write_dataframe_to_sheet`
 
-**Проблема:**
+**Было:**
 
 ```python
 for row_num, (_, row) in enumerate(df.iterrows()):
@@ -78,20 +65,9 @@ for row_num, (_, row) in enumerate(df.iterrows()):
 
 При DataFrame 10 000 строк × 50 столбцов с validation = до 500 000 потенциальных AI-вызовов. Даже при семафоре на 5 параллельных запросов — это дни работы и тысячи долларов за API.
 
-**Решение:**
+**Реализовано:**
 
-AI-валидация при сохранении должна применяться только к изменённым ячейкам. Передавать `set` изменённых координат `(row, col)` из `changes_log`:
-
-```python
-# В DataSynchronizer — собирать множество изменённых ячеек
-changed_cells: Set[Tuple[str, int, str]] = set()  # (marketplace, row_idx, col_name)
-
-# В save_results — проверять только изменённые
-if (marketplace, row_num, df_col_name) in changed_cells:
-    matched = await self._ai_comparator.match_value_with_list(...)
-else:
-    cell.value = value  # Записываем без проверки
-```
+`_build_changed_cells_set()` строит `Set[Tuple[int, str]]` из `changes_log` — множество `(row_idx, column_name)` только реально изменённых ячеек. В `_write_dataframe_to_sheet()` проверка `(row_idx, df_col_name) in changed_cells` — O(1) lookup. AI вызывается только для изменённых ячеек, все остальные пишутся напрямую без AI-запроса.
 
 ---
 
@@ -233,45 +209,35 @@ class InMemoryTaskQueue(TaskQueue):
 
 ---
 
-### 1.6. Баг в handle_mvm_update_mp_file — NameError
+### ✅ 1.6. Баг в handle_mvm_update_mp_file — NameError — РЕШЕНО
 
 **Файл:** `bot/handlers/schema_update.py`
 
-**Проблема:**
+**Было:**
 
 ```python
 async def handle_mvm_update_mp_file(message, state, bot):
     ...
-    if mp in user_schemas:  # ← user_schemas НЕ ОПРЕДЕЛЕНА в этой точке!
-        await message.answer(f"⚠️ {mp.upper()} уже загружен")
-        return
+    fp, fn, mp = await download_file(bot, message, user_id)
+    if not mp: await message.answer("❌ ..."); return
+    if mp in user_schemas: await message.answer(f"⚠️ ..."); return  # ← NameError!
 
-    user_schemas = await storage.session_storage.get_files_dict(...)  # ← определяется ЗДЕСЬ
-```
+    user_schemas = await storage.session_storage.get_files_dict(user_id, _SESSION_KEY_UPDATE)```
 
-При загрузке дублирующего файла произойдёт `NameError: name 'user_schemas' is not defined`.
+**Реализовано:**
 
-**Решение:**
-
-Переместить `get_files_dict` выше первого использования:
-
-```python
 async def handle_mvm_update_mp_file(message, state, bot):
-    user_id = message.from_user.id
-    if (await state.get_data()).get('mvm_mp_files_processed'):
-        return
-
+    ...
     fp, fn, mp = await download_file(bot, message, user_id)
     if not mp:
         await message.answer("❌ Переименуй файл (добавь wb/ozon/yandex)")
         return
 
+    # ИСПРАВЛЕН БАГ 1.6: get_files_dict вызывается ДО проверки на дубликат
     user_schemas = await storage.session_storage.get_files_dict(user_id, _SESSION_KEY_UPDATE)
     if mp in user_schemas:
         await message.answer(f"⚠️ {mp.upper()} уже загружен")
         return
-    # ...
-```
 
 ---
 
@@ -1018,7 +984,7 @@ apply_openpyxl_patch()
 
 ---
 
-### 6.1. functools.partial для DI — хрупкий паттерн
+### 6.1. functools.partial для DI — хрупкий паттерн (частично решено)
 
 **Файлы:** все `register_*_handlers` функции
 
@@ -1035,25 +1001,15 @@ dp.message.register(partial(process_files, bot=bot, task_queue=task_queue), ...)
 - При добавлении новой зависимости — правки во всех `partial(...)`
 - Нет единого места управления зависимостями
 
-**Решение:**
+Частично реализовано:
 
-Использовать встроенный DI aiogram 3 через workflow data:
+ai_comparator передаётся через aiogram DI (dp["ai_comparator"]) — хендлеры finalize_schema_creation, finalize_mvm_schema, finalize_schema_update, finalize_mvm_schema_update получают его через именованный параметр без partial.
 
-```python
-# bot/bot.py — при создании
-dp["bot_instance"] = bot
-dp["task_queue"] = task_queue
-dp["ai_comparator"] = comparator
-
-# В хендлере — получаем через keyword argument
-async def handle_file(message: types.Message, state: FSMContext, bot_instance: Bot):
-    ...
-
-async def process_files(message: types.Message, state: FSMContext, task_queue: TaskQueue):
-    ...
+bot по-прежнему передаётся через partial в хендлерах загрузки файлов. Полная миграция на DI (включая bot и task_queue) — остаётся в Фазе 3 (п.17).
 ```
 
 Aiogram автоматически инжектирует значения из `dp[key]` в handler, если имя параметра совпадает с ключом.
+
 
 ---
 
@@ -1164,10 +1120,10 @@ for gk in mvm_groups:
 
 | # | Проблема | Файл(ы) | Сложность |
 |---|---|---|---|
-| 1 | AIComparator создаётся в хендлерах | `schema_create.py`, `schema_update.py` | Средняя |
-| 2 | save_results — AI на каждую ячейку | `services/sync/excel_io.py` | Средняя |
+| 1 | AIComparator создаётся в хендлерах | `schema_create.py`, `schema_update.py`, `schema_create_mvm.py`, `bot.py, task_worker.py` | ✅ Решено |
+| ~~2~~ | ~~save_results — AI на каждую ячейку~~ | ~~`services/sync/excel_io.py`~~ | ✅ Решено |
 | 3 | sys.path.insert everywhere | 15+ файлов + `pyproject.toml` | Низкая |
-| 4 | Баг NameError в schema_update | `schema_update.py` | Низкая |
+| 4 | Баг NameError в schema_update | `schema_update.py` | ✅ Решено |
 | 5 | InMemoryTaskQueue утечка | `services/task_queue.py` | Низкая |
 | 6 | TaskWorker без backpressure | `services/task_worker.py` | Низкая |
 | 7 | Config float() при импорте | `config/config.py` | Низкая |
@@ -1217,11 +1173,11 @@ for gk in mvm_groups:
 | Метрика | Значение |
 |---|---|
 | Файлов проанализировано | 32 |
-| Критичных проблем | 7 |
+| Критичных проблем | 7 (✅ 1 решена, осталось 6) |
 | Архитектурных проблем | 8 |
 | Проблем безопасности | 3 |
 | Проблем производительности | 5 |
 | Проблем качества кода | 6 |
 | Проблем хендлеров/FSM | 4 |
-| **Итого проблем** | **33** |
+| **Итого проблем** | **33 (✅ 3 решены, осталось 30)** |
 | Оценка технического долга | ~3–6 недель работы одного разработчика |

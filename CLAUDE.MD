@@ -366,7 +366,7 @@ event loop остаётся свободным для других пользо�
 4. Синхронизация габаритов (`DimensionsSynchronizer.sync_dimensions`)
 5. Синхронизация остальных столбцов по схеме (`ColumnSyncer.sync_all_matches`)
 6. [МВМ] Заполнение МП из XML-каталога (`XmlSyncer.sync_from_xml` + `sync_dimensions_from_xml`)
-7. Сохранение МП-файлов (`ExcelFileManager.save_results`)
+7. Сохранение МП-файлов (`ExcelFileManager.save_results` с `changes_log` для точечной AI-валидации)
 
 #### Разделяемое состояние
 
@@ -475,17 +475,24 @@ dfs = manager.load_all_dataframes(file_paths)
 # manager.original_column_names — маппинг переименованных дубликатов
 # manager.original_file_paths   — пути к исходным файлам
 
-await manager.save_results(dfs, output_paths, ai_validation_log)
+await manager.save_results(dfs, output_paths, ai_validation_log, changes_log=changes_log)
 manager.create_ai_log_in_report(report_path, ai_validation_log)
 ```
 
 Обрабатывает дублирующиеся заголовки: добавляет числовой суффикс при загрузке («Вес (кг)1») и восстанавливает оригинальные имена при сохранении.
 
-**Важно — validation-списки при сохранении (v4.6):**
+**Важно — validation-списки при сохранении (v4.6, обновлено v4.8):**
 `save_results` использует `self.column_validations` (заполняется при `load_all_dataframes`)
 для проверки допустимых значений ячеек. Это O(1) dict-lookup вместо повторного
 сканирования всех DV-правил листа для каждой ячейки. `_get_validation_list_values`
 используется только внутри `_load_column_validations` — не вызывать в цикле по ячейкам.
+
+**Оптимизация AI-валидации при сохранении (v4.8):**
+`save_results` принимает опциональный параметр `changes_log`. Если передан —
+AI-валидация применяется ТОЛЬКО к ячейкам, которые были изменены ботом при
+синхронизации (определяются по `changes_log`). Ячейки, заполненные пользователем
+изначально, записываются без AI-проверки. Это устраняет избыточные AI-запросы:
+вместо проверки всех непустых ячеек (до 500 000) проверяются только изменённые (обычно 100-500).
 
 ### 3. Схемы сопоставлений (Schema)
 
@@ -854,6 +861,7 @@ python main.py
 - [x] Добавлен AppLogger с поддержкой trace_id и context (v4.7)
 - [x] Добавлены UPLOAD_DIR, DOWNLOAD_DIR, OUTPUT_DIR, FILE_MAX_AGE_DAYS в Config (v4.7)
 - [x] _FileCleanupService в TaskWorker — фоновая очистка файлов старше 7 дней раз в 24 ч (v4.7)
+- [x] Оптимизация save_results: AI-валидация только для изменённых ячеек через changes_log (v4.8)
 - [ ] Добавление unit-тестов (pytest)
 - [ ] CI/CD pipeline
 - [ ] Поддержка 5-го маркетплейса (расширение архитектуры)
@@ -1210,9 +1218,16 @@ Redis используется для двух целей:
 
 ---
 
-**Версия документации**: 4.7
+**Версия документации**: 4.8
 **Дата обновления**: Май 2026
 **Последние изменения**:
+- v4.8: Оптимизация AI-валидации при сохранении файлов.
+  `ExcelFileManager.save_results` теперь принимает опциональный `changes_log` и
+  вызывает AI-проверку (`match_value_with_list`) ТОЛЬКО для ячеек, изменённых ботом
+  при синхронизации. Ячейки, заполненные пользователем изначально, записываются
+  без AI-запросов. Это сокращает количество AI-вызовов при сохранении с потенциальных
+  сотен тысяч до нескольких сотен (только реально изменённые ячейки).
+  `DataSynchronizer` передаёт `self.changes_log` в `save_results` автоматически.
 - v4.7: Исправлен логгер — единый `logs/app.log` с `RotatingFileHandler` (10 МБ, 5 бэкапов)
   вместо нового файла `sync_YYYYMMDD_HHMMSS.log` при каждом вызове `setup_logger()`.
   Добавлен `AppLogger` — адаптер с поддержкой `trace_id` и `context`.

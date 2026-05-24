@@ -101,6 +101,19 @@ class Config:
     LOG_FILE_PATH: str = os.getenv("LOG_FILE_PATH", "./logs/app.log")
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
+    # ===================================================================
+    # Директории для временных файлов
+    # ===================================================================
+    # UPLOAD_DIR    — входные Excel/XML файлы от пользователей
+    # DOWNLOAD_DIR  — промежуточные файлы загрузки
+    # OUTPUT_DIR    — результаты синхронизации и отчёты
+    # FILE_MAX_AGE_DAYS — файлы старше этого срока удаляются уборщиком
+    # ===================================================================
+    UPLOAD_DIR: str = os.getenv("UPLOAD_DIR", "/root/progect/uploads")
+    DOWNLOAD_DIR: str = os.getenv("DOWNLOAD_DIR", "/root/progect/downloads")
+    OUTPUT_DIR: str = os.getenv("OUTPUT_DIR", "/root/progect/output")
+    FILE_MAX_AGE_DAYS: int = _safe_int_env("FILE_MAX_AGE_DAYS", 7)
+
     # Конфигурация файлов для каждого маркетплейса
     FILE_CONFIGS: Dict[str, Dict[str, Any]] = {
         "wildberries": {
@@ -429,3 +442,7 @@ LOG_FILE_PATH = Config.LOG_FILE_PATH
 LOG_LEVEL = Config.LOG_LEVEL
 MAX_CONCURRENT_TASKS = Config.MAX_CONCURRENT_TASKS
 TASK_QUEUE_KEY = Config.TASK_QUEUE_KEY
+UPLOAD_DIR = Config.UPLOAD_DIR
+DOWNLOAD_DIR = Config.DOWNLOAD_DIR
+OUTPUT_DIR = Config.OUTPUT_DIR
+FILE_MAX_AGE_DAYS = Config.FILE_MAX_AGE_DAYS

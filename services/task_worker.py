@@ -10,6 +10,8 @@ import os
 import sys
 from pathlib import Path
 from typing import Optional, Set
+import time
+from config.config import Config
 
 from aiogram import Bot
 from aiogram.types import FSInputFile
@@ -25,6 +27,107 @@ from utils.logger_config import setup_logger
 from utils.xml_reader import XmlReader
 
 logger = setup_logger("task_worker")
+
+class _FileCleanupService:
+    """
+    Фоновый сервис очистки устаревших временных файлов.
+
+    Раз в 24 часа сканирует папки uploads, downloads, output
+    и удаляет файлы старше FILE_MAX_AGE_DAYS дней.
+    Директории берёт из Config, не из захардкоженных путей.
+
+    Паттерн: Single Responsibility — отвечает только за очистку диска.
+    """
+
+    # Интервал между запусками уборки (в секундах)
+    _CLEANUP_INTERVAL_SEC: int = 24 * 60 * 60  # 24 часа
+
+    def __init__(self) -> None:
+        self._task: Optional[asyncio.Task] = None
+        self._dirs: list[Path] = [
+            Path(Config.UPLOAD_DIR),
+            Path(Config.DOWNLOAD_DIR),
+            Path(Config.OUTPUT_DIR),
+        ]
+        self._max_age_days: int = Config.FILE_MAX_AGE_DAYS
+
+    async def start(self) -> None:
+        """Запускает фоновый цикл очистки."""
+        self._task = asyncio.create_task(self._cleanup_loop())
+        logger.info(
+            "Уборщик файлов запущен — проверка каждые 24 ч, "
+            "удаляем файлы старше %d дн.",
+            self._max_age_days,
+        )
+
+    async def stop(self) -> None:
+        """Останавливает фоновый цикл очистки."""
+        if self._task and not self._task.done():
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        logger.info("Уборщик файлов остановлен")
+
+    async def _cleanup_loop(self) -> None:
+        """Основной цикл: ждёт интервал, затем запускает очистку."""
+        while True:
+            try:
+                await asyncio.sleep(self._CLEANUP_INTERVAL_SEC)
+                await asyncio.get_running_loop().run_in_executor(None, self._cleanup_sync)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Ошибка в цикле уборщика файлов: %s", e, exc_info=True)
+
+    def _cleanup_sync(self) -> None:
+        """
+        Синхронная очистка — выполняется в executor, не блокирует event loop.
+
+        Удаляет файлы (не директории) старше _max_age_days из всех папок.
+        Логирует каждый удалённый файл и итоговую статистику.
+        """
+        cutoff = time.time() - self._max_age_days * 86400
+        total_deleted = 0
+        total_freed_bytes = 0
+
+        for directory in self._dirs:
+            if not directory.exists():
+                logger.warning(
+                    "Директория не найдена, пропускаем: %s", directory
+                )
+                continue
+
+            for file_path in directory.iterdir():
+                if not file_path.is_file():
+                    continue
+                try:
+                    file_mtime = file_path.stat().st_mtime
+                    if file_mtime < cutoff:
+                        file_size = file_path.stat().st_size
+                        file_path.unlink()
+                        total_deleted += 1
+                        total_freed_bytes += file_size
+                        logger.info(
+                            "Удалён устаревший файл: %s (возраст > %d дн.)",
+                            file_path.name,
+                            self._max_age_days,
+                        )
+                except Exception as e:
+                    logger.error(
+                        "Не удалось удалить файл %s: %s", file_path, e
+                    )
+
+        if total_deleted > 0:
+            freed_mb = total_freed_bytes / (1024 * 1024)
+            logger.info(
+                "Уборка завершена: удалено %d файлов, освобождено %.1f МБ",
+                total_deleted,
+                freed_mb,
+            )
+        else:
+            logger.info("Уборка завершена: устаревших файлов не найдено")
 
 
 class TaskWorker:
@@ -53,6 +156,7 @@ class TaskWorker:
         # Создаём один раз — промпты читаются с диска только здесь,
         # при каждой задаче переиспользуется тот же экземпляр
         self._comparator = AIComparator()
+        self._cleanup_service = _FileCleanupService()
 
     async def start(self, bot: Bot) -> None:
         """Запускает фоновый цикл обработки задач."""
@@ -63,6 +167,7 @@ class TaskWorker:
         self._bot = bot
         self._running = True
         self._worker_task = asyncio.create_task(self._worker_loop())
+        await self._cleanup_service.start()
         logger.info(
             "TaskWorker запущен (максимум %d параллельных обработок)",
             self._semaphore._value,
@@ -98,6 +203,7 @@ class TaskWorker:
 
         # Закрываем HTTP-клиент компаратора после завершения всех задач
         await self._comparator.close()
+        await self._cleanup_service.stop()
 
         logger.info("TaskWorker остановлен")
 

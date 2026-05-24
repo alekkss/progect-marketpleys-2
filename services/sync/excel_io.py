@@ -15,7 +15,7 @@
 """
 
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 from openpyxl import load_workbook
@@ -129,9 +129,14 @@ class ExcelFileManager:
         dfs: Dict[str, pd.DataFrame],
         output_paths: Dict[str, str],
         ai_validation_log: List[Dict],
+        changes_log: Optional[Dict[str, List]] = None,
     ) -> None:
         """
         Сохраняет синхронизированные DataFrame обратно в xlsx-файлы.
+
+        AI-валидация применяется ТОЛЬКО к ячейкам, которые были изменены
+        ботом при синхронизации (определяются по changes_log). Ячейки,
+        заполненные пользователем изначально, записываются без проверки.
 
         Открывает оригинальный файл, расширяет лист при необходимости,
         записывает данные с учётом дубликатов столбцов и сохраняет.
@@ -141,6 +146,8 @@ class ExcelFileManager:
             output_paths:      словарь {маркетплейс: путь к выходному файлу}.
             ai_validation_log: список записей AI-валидации (принимается для
                                совместимости сигнатуры, лог в МП-файлы не пишется).
+            changes_log:       лог изменений из DataSynchronizer. Если None —
+                               AI-валидация при сохранении не применяется.
         """
         logger.info("\n[*] Сохраняю синхронизированные данные...")
 
@@ -161,6 +168,11 @@ class ExcelFileManager:
 
             df = df.reset_index(drop=True)
 
+            # Строим множество изменённых ячеек для этого маркетплейса
+            changed_cells = self._build_changed_cells_set(
+                df, marketplace, changes_log
+            )
+
             wb = load_workbook(original_file)
             ws = wb[config["sheet_name"]]
 
@@ -175,7 +187,8 @@ class ExcelFileManager:
 
             await self._write_dataframe_to_sheet(
                 ws, df, data_start_row,
-                df_to_excel_mapping, marketplace, stats
+                df_to_excel_mapping, marketplace, stats,
+                changed_cells,
             )
 
             wb.save(output_path)
@@ -201,6 +214,81 @@ class ExcelFileManager:
         logger.info(
             f"📊 AI_Логи в отчёте: {len(ai_validation_log)} записей"
         )
+
+    # ------------------------------------------------------------------
+    # Построение множества изменённых ячеек
+    # ------------------------------------------------------------------
+
+    def _build_changed_cells_set(
+        self,
+        df: pd.DataFrame,
+        marketplace: str,
+        changes_log: Optional[Dict[str, List]],
+    ) -> Set[Tuple[int, str]]:
+        """
+        Строит множество (row_index, column_name) для ячеек,
+        изменённых ботом при синхронизации.
+
+        Использует changes_log для определения артикулов и столбцов,
+        которые были заполнены. Затем находит соответствующий row_index
+        в DataFrame по артикулу.
+
+        Args:
+            df:          DataFrame маркетплейса (после синхронизации).
+            marketplace: ключ маркетплейса ('wildberries', 'ozon', 'yandex').
+            changes_log: лог изменений из DataSynchronizer или None.
+
+        Returns:
+            Множество кортежей (row_index, column_name). Пустое если
+            changes_log не передан или нет изменений для этого МП.
+        """
+        if not changes_log:
+            return set()
+
+        mp_changes = changes_log.get(marketplace, [])
+        if not mp_changes:
+            return set()
+
+        # Определяем столбец артикула для этого маркетплейса
+        article_columns = {
+            "wildberries": "Артикул продавца",
+            "ozon":        "Артикул*",
+            "yandex":      "Ваш SKU *",
+        }
+        article_col = article_columns.get(marketplace)
+
+        if not article_col or article_col not in df.columns:
+            logger.warning(
+                f"[{marketplace}] Столбец артикула '{article_col}' "
+                f"не найден — AI-валидация при сохранении пропущена"
+            )
+            return set()
+
+        # Строим индекс {артикул: row_index} для быстрого поиска
+        article_to_row: Dict[str, int] = {}
+        for idx, val in df[article_col].items():
+            if pd.notna(val) and str(val).strip():
+                article_to_row[str(val).strip()] = idx
+
+        # Собираем множество изменённых ячеек
+        changed: Set[Tuple[int, str]] = set()
+
+        for change in mp_changes:
+            article = change.get("article", "").strip()
+            column = change.get("column", "")
+
+            if not article or not column:
+                continue
+
+            row_idx = article_to_row.get(article)
+            if row_idx is not None:
+                changed.add((row_idx, column))
+
+        logger.info(
+            f"[{marketplace}] Изменённых ячеек для AI-валидации: {len(changed)}"
+        )
+
+        return changed
 
     # ------------------------------------------------------------------
     # Загрузка заголовков и validation
@@ -593,11 +681,15 @@ class ExcelFileManager:
         df_to_excel_mapping: Dict[str, List[int]],
         marketplace: str,
         stats: Dict[str, int],
+        changed_cells: Set[Tuple[int, str]],
     ) -> None:
         """
         Записывает DataFrame в лист openpyxl построчно.
 
-        Для каждой ячейки с data validation запускает AI-проверку.
+        AI-валидация применяется ТОЛЬКО к ячейкам из changed_cells —
+        тем, что были заполнены ботом при синхронизации. Остальные
+        ячейки записываются как есть, без AI-проверки.
+
         Пропускает NaN-значения. Дублирующиеся столбцы записываются
         во все соответствующие Excel-столбцы.
 
@@ -608,8 +700,10 @@ class ExcelFileManager:
             df_to_excel_mapping: маппинг {df_столбец: [excel_индексы]}.
             marketplace:         ключ МП (для логирования).
             stats:               счётчик статистики (изменяется на месте).
+            changed_cells:       множество (row_index, column_name) изменённых
+                                 ботом ячеек. Только для них запускается AI.
         """
-        for row_num, (_, row) in enumerate(df.iterrows()):
+        for row_num, (row_idx, row) in enumerate(df.iterrows()):
             excel_row_idx = data_start_row + row_num
 
             for df_col_name, value in row.items():
@@ -622,19 +716,28 @@ class ExcelFileManager:
                     cell = ws.cell(
                         row=excel_row_idx, column=excel_col_idx
                     )
-                    allowed_values = self.column_validations.get(marketplace, {}).get(df_col_name, [])
 
-                    if allowed_values and self._ai_comparator:
-                        matched = await self._ai_comparator.match_value_with_list(
-                            str(value), allowed_values
-                        )
-                        if matched:
-                            cell.value = matched
-                            stats["ai_matched"] += 1
+                    # AI-валидация только для ячеек, изменённых ботом
+                    is_changed = (row_idx, df_col_name) in changed_cells
+
+                    if is_changed and self._ai_comparator:
+                        allowed_values = self.column_validations.get(
+                            marketplace, {}
+                        ).get(df_col_name, [])
+
+                        if allowed_values:
+                            matched = await self._ai_comparator.match_value_with_list(
+                                str(value), allowed_values
+                            )
+                            if matched:
+                                cell.value = matched
+                                stats["ai_matched"] += 1
+                            else:
+                                stats["validation_conflicts"] += 1
+                                stats["skipped"] += 1
+                                continue
                         else:
-                            stats["validation_conflicts"] += 1
-                            stats["skipped"] += 1
-                            continue
+                            cell.value = value
                     else:
                         cell.value = value
 

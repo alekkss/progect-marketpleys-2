@@ -54,7 +54,8 @@ Telegram-бот для автоматической синхронизации �
 │   ├── task_queue.py                # Очередь задач: Task (dataclass), TaskQueue (Repository),
 │   │                                # RedisTaskQueue, InMemoryTaskQueue, фабрика create_task_queue()
 │   ├── task_worker.py               # Фоновый воркер: читает очередь, обрабатывает Task через
-│   │                                # DataSynchronizer, отправляет результат пользователю через Bot
+│   │                                # DataSynchronizer, отправляет результат пользователю через Bot.
+│   │                                # _FileCleanupService — раз в 24 ч удаляет файлы старше FILE_MAX_AGE_DAYS
 │   └── /sync/                       # Подпакет компонентов синхронизации (v4.2)
 │       ├── __init__.py              # Экспорты подпакета
 │       ├── value_converter.py       # ValueConverter — единицы измерения и конвертация
@@ -97,13 +98,15 @@ Telegram-бот для автоматической синхронизации �
    Хендлеры upload.py получают `task_queue` через dependency injection.
 5. **Запуск фонового воркера** — `await task_worker.start(bot)`:
    - `AIComparator` создаётся один раз в `TaskWorker.__init__` — промпты читаются здесь
+   - `_FileCleanupService` создаётся в `TaskWorker.__init__` — директории и срок хранения читаются из `Config`
    - Запускает цикл `while running: task = await queue.dequeue()`
+   - Запускает фоновый цикл очистки файлов (каждые 24 ч, файлы старше `FILE_MAX_AGE_DAYS` дней)
    - Ограничивает обработку `asyncio.Semaphore(Config.MAX_CONCURRENT_TASKS)`
    - Семафор AIComparator становится глобальным — максимум 5 AI-запросов суммарно по всем задачам
    - Worker сам отправляет результаты через `Bot.send_message/document`
 6. **Polling** — `await dp.start_polling(bot)`
 7. **Graceful shutdown** — строгий порядок освобождения ресурсов:
-   - `await task_worker.stop()` — ждёт завершения активных задач, закрывает `AIComparator` (`await comparator.close()`)
+   - `await task_worker.stop()` — ждёт завершения активных задач, закрывает `AIComparator` (`await comparator.close()`), останавливает `_FileCleanupService`
    - `await task_queue.disconnect()` — закрывает соединение с Redis
    - `await shutdown_storage()` — закрывает pool PostgreSQL
 
@@ -759,6 +762,12 @@ LOG_LEVEL=INFO
 MAX_CONCURRENT_TASKS=5          # Максимум одновременных обработок (Semaphore)
 TASK_QUEUE_KEY=bot:task_queue  # Ключ Redis List для хранения ID задач
 
+# Директории для временных файлов
+UPLOAD_DIR=/root/progect/uploads       # Входные Excel/XML файлы от пользователей
+DOWNLOAD_DIR=/root/progect/downloads   # Промежуточные файлы загрузки
+OUTPUT_DIR=/root/progect/output        # Результаты синхронизации и отчёты
+FILE_MAX_AGE_DAYS=7                    # Файлы старше этого срока удаляются уборщиком
+
 # Прокси (опционально)
 PROXY_ENABLED=false
 PROXY_URL=http://user:pass@host:port
@@ -841,6 +850,10 @@ python main.py
 - [x] Оптимизация save_results: validation-списки из кэша вместо сканирования DV-правил на ячейку (v4.6)
 - [x] Исправлен обход лимита 200 МБ в download_file_by_url при chunked encoding (v4.6)
 - [x] Исправлена нумерация миграций (дублирующийся 001_) (v4.6)
+- [x] Исправлен логгер: единый app.log с RotatingFileHandler вместо нового файла при каждом вызове (v4.7)
+- [x] Добавлен AppLogger с поддержкой trace_id и context (v4.7)
+- [x] Добавлены UPLOAD_DIR, DOWNLOAD_DIR, OUTPUT_DIR, FILE_MAX_AGE_DAYS в Config (v4.7)
+- [x] _FileCleanupService в TaskWorker — фоновая очистка файлов старше 7 дней раз в 24 ч (v4.7)
 - [ ] Добавление unit-тестов (pytest)
 - [ ] CI/CD pipeline
 - [ ] Поддержка 5-го маркетплейса (расширение архитектуры)
@@ -860,6 +873,8 @@ python main.py
   in-memory очередь — задачи будут потеряны при перезапуске бота.
 - Максимум `MAX_CONCURRENT_TASKS` (default=5) одновременных обработок. 6-я задача
   ждёт в очереди до освобождения слота.
+- Временные файлы (uploads, downloads, output) хранятся на диске и удаляются
+  фоновым уборщиком раз в 24 часа. Файлы старше `FILE_MAX_AGE_DAYS` (default=7 дней) удаляются автоматически.
 
 ## Важные предостережения
 
@@ -875,6 +890,9 @@ python main.py
 - Порядок инициализации: `Config.validate()` → `init_storage()` → `task_queue.connect()`
   → `create_bot(task_queue)` → `task_worker.start(bot)` → `polling`
 - Порядок shutdown: `task_worker.stop()` → `task_queue.disconnect()` → `shutdown_storage()`
+- В `task_worker.stop()` порядок: активные задачи → `comparator.close()` → `cleanup_service.stop()`
+- `_FileCleanupService` НЕ удаляет директории — только файлы (`is_file()`)
+- Пути к директориям файлов берутся из `Config` (`UPLOAD_DIR`, `DOWNLOAD_DIR`, `OUTPUT_DIR`) — не хардкодить
 - Порядок записи AI-лога: `synchronize_data` → `create_report_with_changes` → `create_ai_log_in_report`
 - Хендлеры upload.py НЕ вызывают `synchronize_data()` inline — только `task_queue.enqueue()`
 - `create_bot()` теперь принимает `task_queue: TaskQueue` и передаёт его в `register_upload_handlers()`
@@ -919,6 +937,19 @@ Dataclass-модель задачи. Поля: `user_id`, `chat_id`, `task_type`
 - Ограничение параллелизма: `asyncio.Semaphore(5)` — максимум 5 одновременных обработок
 - Семафор `AIComparator` теперь глобальный: максимум 5 AI-запросов суммарно по всем задачам
 - При shutdown корректно дожидается завершения активных задач, затем закрывает `AIComparator`
+- `_FileCleanupService` запускается вместе с воркером — раз в 24 часа удаляет файлы
+  старше `FILE_MAX_AGE_DAYS` дней из папок `UPLOAD_DIR`, `DOWNLOAD_DIR`, `OUTPUT_DIR`
+
+#### _FileCleanupService (`services/task_worker.py`)
+Приватный класс фоновой очистки временных файлов (паттерн Single Responsibility).
+- Интервал проверки: каждые 24 часа
+- Срок хранения файлов: `Config.FILE_MAX_AGE_DAYS` (default=7 дней)
+- Сканируемые директории: `Config.UPLOAD_DIR`, `Config.DOWNLOAD_DIR`, `Config.OUTPUT_DIR`
+- Удаляет только файлы (`is_file()`), директории не трогает
+- Тяжёлый обход файловой системы выполняется в `run_in_executor` — не блокирует event loop
+- Логирует каждый удалённый файл и итоговую статистику (сколько файлов, сколько МБ)
+- При недоступности директории — предупреждение в логах, остальные директории обрабатываются
+- Запускается в `TaskWorker.start()`, останавливается в `TaskWorker.stop()` через `task.cancel()`
 
 #### Поток обработки
 
@@ -1051,25 +1082,50 @@ dp.callback_query.middleware(AccessControlMiddleware())
 
 ## Логирование
 
-### Конфигурация
+### Конфигурация (v4.7)
 
-Модуль `utils/logger_config.py` настраивает:
-- Формат: `[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s`
-- Ротация файлов (если настроено через `LOG_FILE_PATH`)
-- Вывод в консоль + файл
+Модуль `utils/logger_config.py` — единая точка логирования для всего проекта.
 
-Уровень логирования задаётся через `LOG_LEVEL` в `.env`.
+**Два форматтера:**
+- `_ConsoleFormatter` — человекочитаемый вывод в stdout: `2026-05-24 17:26:48 | INFO  | сообщение | key=value`
+  Показывает только ключи из белого списка: `path`, `file`, `error`, `error_type`, `step`, `current`, `total`, `directory`
+- `_JsonFileFormatter` — полный JSON в файл: `timestamp`, `level`, `message`, `logger`, `trace_id`, `context`, `exception`
 
-### Использование
+**Один файл на весь проект:**
+`_install_file_handler()` добавляет `RotatingFileHandler` в корневой логгер **один раз** (флаг `_file_handler_installed`).
+Все дочерние логгеры автоматически наследуют этот handler. Ротация: 10 МБ, 5 бэкапов.
+
+**Путь к файлу и уровень — из `.env`:**
+```env
+LOG_FILE_PATH=./logs/app.log
+LOG_LEVEL=INFO
+```
+
+### AppLogger — адаптер с trace_id и context
+
+`setup_logger()` возвращает `AppLogger` (подкласс `logging.LoggerAdapter`).
 
 ```python
 from utils.logger_config import setup_logger
 logger = setup_logger('module_name')
 
-logger.info("Информационное сообщение")
-logger.error("Ошибка", exc_info=True)
-logger.debug("Детальная информация для отладки")
+# Базовое использование
+logger.info("задача завершена")
+logger.error("ошибка подключения", exc_info=True)
+
+# С контекстом (попадает в файл и консоль)
+logger.info("файл загружен", context={"file": "wb.xlsx", "total": 42})
+
+# С trace_id для отслеживания цепочки
+logger.info("запрос", context={"user_id": 123}, trace_id="abc-123")
+
+# Создать новый trace для отдельной цепочки
+trace_logger = logger.new_trace()
+trace_logger.info("начало обработки")   # trace_id генерируется автоматически
 ```
+
+**ВАЖНО:** `setup_logger()` больше не создаёт новый файл при каждом вызове.
+До v4.7 каждый вызов создавал `sync_YYYYMMDD_HHMMSS.log` — теперь всегда один `app.log`.
 
 ## Обработка файлов Excel
 
@@ -1154,9 +1210,17 @@ Redis используется для двух целей:
 
 ---
 
-**Версия документации**: 4.6
+**Версия документации**: 4.7
 **Дата обновления**: Май 2026
 **Последние изменения**:
+- v4.7: Исправлен логгер — единый `logs/app.log` с `RotatingFileHandler` (10 МБ, 5 бэкапов)
+  вместо нового файла `sync_YYYYMMDD_HHMMSS.log` при каждом вызове `setup_logger()`.
+  Добавлен `AppLogger` — адаптер с поддержкой `trace_id` и `context`.
+  Два форматтера: человекочитаемый в консоль (белый список ключей) и полный JSON в файл.
+  Добавлены переменные окружения `UPLOAD_DIR`, `DOWNLOAD_DIR`, `OUTPUT_DIR`, `FILE_MAX_AGE_DAYS` в `Config`.
+  Добавлен `_FileCleanupService` в `TaskWorker` — фоновая задача раз в 24 часа удаляет
+  файлы старше `FILE_MAX_AGE_DAYS` дней из всех трёх директорий. Запускается и останавливается
+  вместе с `TaskWorker`. Обход файловой системы выполняется в `run_in_executor`, не блокирует event loop.
 - v4.6: Оптимизация и исправление ошибок.
   `AIComparator` вынесен в `TaskWorker.__init__` — промпты читаются один раз при старте,
   семафор стал глобальным (max 5 AI-запросов суммарно по всем задачам).

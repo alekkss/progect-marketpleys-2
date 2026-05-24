@@ -250,7 +250,8 @@ class DataSynchronizer:
         # ----------------------------------------------------------
         if output_paths:
             await excel_manager.save_results(
-                synced_dfs, output_paths, self.ai_validation_log
+                synced_dfs, output_paths, self.ai_validation_log,
+                changes_log=self.changes_log,
             )
 
         logger.info("\n" + "=" * 60)

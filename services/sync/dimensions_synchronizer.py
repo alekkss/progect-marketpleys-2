@@ -6,7 +6,7 @@
 с учётом различных форматов каждого маркетплейса:
     - WB:     раздельные столбцы в сантиметрах (имена определяются динамически).
     - Ozon:   раздельные столбцы в миллиметрах.
-    - Яндекс: один композитный столбец «длина/ширина/высота» в сантиметрах.
+    - Яндекс: раздельные столбцы в сантиметрах.
 
 Паттерн: Strategy — форматы маркетплейсов описаны в DIMENSIONS_MAPPING,
 добавление нового МП не требует изменения алгоритма синхронизации.
@@ -50,7 +50,9 @@ class DimensionsSynchronizer:
             "unit": "mm",
         },
         "yandex": {
-            "composite": "Габариты с упаковкой, см",
+            "length": "Длина, см *",
+            "width": "Ширина, см *",
+            "height": "Высота, см *",
             "unit": "cm",
         },
     }
@@ -139,6 +141,9 @@ class DimensionsSynchronizer:
         """
         Парсит строку «71/68/197» в словарь {length, width, height}.
 
+        Используется для парсинга XML-поля [XML] dimensions,
+        которое хранит габариты в формате «длина/ширина/высота».
+
         Args:
             value: строка в формате «длина/ширина/высота».
 
@@ -174,6 +179,7 @@ class DimensionsSynchronizer:
         """
         Форматирует габариты в строку «Длина/Ширина/Высота».
 
+        Используется для формирования значения XML-поля dimensions.
         Целые числа выводятся без дробной части, дробные — с одним знаком.
 
         Args:
@@ -210,7 +216,7 @@ class DimensionsSynchronizer:
         cls, dfs: Dict[str, pd.DataFrame]
     ) -> Dict[str, Dict[str, float]]:
         """
-        Читает габариты из Яндекс (композитный формат «д/ш/в» в см).
+        Читает габариты из Яндекс (раздельные столбцы в сантиметрах).
 
         Args:
             dfs: словарь DataFrame маркетплейсов.
@@ -218,18 +224,26 @@ class DimensionsSynchronizer:
         Returns:
             Словарь {артикул: {length, width, height}} в сантиметрах.
         """
-        logger.info("\n📖 ЭТАП 1: Чтение габаритов из Яндекс (композитный формат)")
+        logger.info("\n📖 ЭТАП 1: Чтение габаритов из Яндекс (раздельные столбцы, см)")
 
         result: Dict[str, Dict[str, float]] = {}
-        yandex_col = cls.DIMENSIONS_MAPPING["yandex"]["composite"]
+        yandex_map = cls.DIMENSIONS_MAPPING["yandex"]
         article_col = cls._ARTICLE_COLUMNS["yandex"]
 
         if "yandex" not in dfs:
             logger.warning("   ❌ DataFrame 'yandex' отсутствует!")
             return result
 
-        if yandex_col not in dfs["yandex"].columns:
-            logger.warning(f"   ❌ Столбец '{yandex_col}' не найден в Яндекс!")
+        # Проверяем наличие всех трёх столбцов габаритов
+        missing_cols = [
+            col
+            for col in [yandex_map["length"], yandex_map["width"], yandex_map["height"]]
+            if col not in dfs["yandex"].columns
+        ]
+        if missing_cols:
+            logger.error(
+                f"   ⛔ Пропускаю Яндекс — отсутствуют столбцы: {missing_cols}"
+            )
             return result
 
         rows_with_dimensions = 0
@@ -238,17 +252,32 @@ class DimensionsSynchronizer:
             if not (pd.notna(article) and str(article).strip()):
                 continue
 
-            dimensions = cls.parse_composite_dimensions(row.get(yandex_col))
-            if dimensions:
-                result[str(article).strip()] = dimensions
-                rows_with_dimensions += 1
-                if rows_with_dimensions <= 3:
-                    logger.info(
-                        f"   ✓ Яндекс [{article}]: "
-                        f"{dimensions['length']}/{dimensions['width']}/{dimensions['height']} см"
-                    )
+            length_val = row.get(yandex_map["length"])
+            width_val = row.get(yandex_map["width"])
+            height_val = row.get(yandex_map["height"])
 
-        logger.info(f"   📊 Итого Яндекс: {rows_with_dimensions} артикулов с габаритами")
+            if all(
+                pd.notna(v) and str(v).strip()
+                for v in [length_val, width_val, height_val]
+            ):
+                try:
+                    result[str(article).strip()] = {
+                        "length": float(length_val),
+                        "width": float(width_val),
+                        "height": float(height_val),
+                    }
+                    rows_with_dimensions += 1
+                    if rows_with_dimensions <= 3:
+                        logger.info(
+                            f"   ✓ Яндекс [{article}]: "
+                            f"{length_val}/{width_val}/{height_val} см"
+                        )
+                except ValueError:
+                    pass
+
+        logger.info(
+            f"   📊 Итого Яндекс: {rows_with_dimensions} артикулов с габаритами"
+        )
         return result
 
     @classmethod
@@ -531,29 +560,50 @@ class DimensionsSynchronizer:
         article: str,
         dimensions: Dict[str, float],
     ) -> int:
-        """Записывает габариты в композитный столбец Яндекс."""
+        """Записывает габариты (см) в раздельные столбцы Яндекс."""
         if "yandex" not in dfs:
             return 0
 
-        yandex_col = cls.DIMENSIONS_MAPPING["yandex"]["composite"]
+        yandex_map = cls.DIMENSIONS_MAPPING["yandex"]
         df = dfs["yandex"]
         article_col = cls._ARTICLE_COLUMNS["yandex"]
         mask = df[article_col].astype(str).str.strip() == article
         if not mask.any():
             return 0
 
+        # Проверяем наличие столбцов
+        missing_cols = [
+            col
+            for col in [yandex_map["length"], yandex_map["width"], yandex_map["height"]]
+            if col not in df.columns
+        ]
+        if missing_cols:
+            return 0
+
         idx = df[mask].index[0]
-        current = df.at[idx, yandex_col]
+        written = 0
 
-        if pd.isna(current) or not str(current).strip():
-            composite = cls.format_composite_dimensions(
-                dimensions["length"], dimensions["width"], dimensions["height"]
+        for dim_key, col_name in [
+            ("length", yandex_map["length"]),
+            ("width", yandex_map["width"]),
+            ("height", yandex_map["height"]),
+        ]:
+            current = df.at[idx, col_name]
+            if pd.isna(current) or not str(current).strip():
+                df.at[idx, col_name] = dimensions[dim_key]
+                written += 1
+                logger.debug(
+                    f"   [→Яндекс] {article}: {col_name}={dimensions[dim_key]} см"
+                )
+
+        if written > 0:
+            logger.info(
+                f"   ✓ [→Яндекс] {article}: "
+                f"{dimensions['length']}/{dimensions['width']}/{dimensions['height']} см "
+                f"({written} столбцов)"
             )
-            df.at[idx, yandex_col] = composite
-            logger.info(f"   ✓ [→Яндекс] {article}: {composite}")
-            return 1
 
-        return 0
+        return written
 
     # ------------------------------------------------------------------
     # Определение столбцов WB

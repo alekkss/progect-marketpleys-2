@@ -39,15 +39,19 @@ _XML_GROUPS: List[str] = [
 # Поле XML с габаритами — обрабатывается отдельно через sync_dimensions_from_xml
 _XML_DIMENSIONS_FIELD = "[XML] dimensions"
 
-# Столбцы габаритов Ozon
+# Столбцы габаритов Ozon (мм)
 _OZON_DIM_COLUMNS: Dict[str, str] = {
     "length": "Длина упаковки, мм*",
     "width":  "Ширина упаковки, мм*",
     "height": "Высота упаковки, мм*",
 }
 
-# Составной столбец габаритов Яндекс
-_YANDEX_COMPOSITE_COL = "Габариты с упаковкой, см"
+# Столбцы габаритов Яндекс (раздельные, см)
+_YANDEX_DIM_COLUMNS: Dict[str, str] = {
+    "length": "Длина, см *",
+    "width":  "Ширина, см *",
+    "height": "Высота, см *",
+}
 
 
 class XmlSyncer:
@@ -213,7 +217,7 @@ class XmlSyncer:
         Конвертация единиц:
             - WB:     раздельные столбцы в см (как есть).
             - Ozon:   раздельные столбцы в мм (см * 10).
-            - Яндекс: составной формат «д/ш/в» в см.
+            - Яндекс: раздельные столбцы в см (как есть).
 
         Args:
             dfs: словарь {маркетплейс: DataFrame}.
@@ -518,17 +522,30 @@ class XmlSyncer:
         width_cm: float,
         height_cm: float,
     ) -> int:
-        """Записывает габариты в составной столбец Яндекс из XML."""
+        """Записывает габариты (см) в раздельные столбцы Яндекс из XML."""
         if "yandex" not in dfs:
             return 0
 
         df = dfs["yandex"]
         article_col = self._article_columns["yandex"]
 
-        if (
-            article_col not in df.columns
-            or _YANDEX_COMPOSITE_COL not in df.columns
-        ):
+        if article_col not in df.columns:
+            return 0
+
+        # Проверяем наличие всех трёх столбцов габаритов
+        missing_cols = [
+            col
+            for col in [
+                _YANDEX_DIM_COLUMNS["length"],
+                _YANDEX_DIM_COLUMNS["width"],
+                _YANDEX_DIM_COLUMNS["height"],
+            ]
+            if col not in df.columns
+        ]
+        if missing_cols:
+            logger.warning(
+                f"   ⚠️ [XML→Яндекс] Отсутствуют столбцы габаритов: {missing_cols}"
+            )
             return 0
 
         mask = df[article_col].astype(str).str.strip() == article
@@ -536,20 +553,31 @@ class XmlSyncer:
             return 0
 
         idx = df[mask].index[0]
-        current = df.at[idx, _YANDEX_COMPOSITE_COL]
+        written = 0
 
-        if pd.notna(current) and str(current).strip():
-            return 0  # Уже заполнено
+        for dim_key, value_cm in [
+            ("length", length_cm),
+            ("width",  width_cm),
+            ("height", height_cm),
+        ]:
+            col_name = _YANDEX_DIM_COLUMNS[dim_key]
+            current = df.at[idx, col_name]
 
-        composite = DimensionsSynchronizer.format_composite_dimensions(
-            length_cm, width_cm, height_cm
-        )
-        df.at[idx, _YANDEX_COMPOSITE_COL] = composite
-        self._log_change("yandex", article, _YANDEX_COMPOSITE_COL, composite)
-        logger.debug(
-            f"   [XML→Яндекс] {article}: {_YANDEX_COMPOSITE_COL}={composite}"
-        )
-        return 1
+            if pd.notna(current) and str(current).strip():
+                continue  # Уже заполнено
+
+            df.at[idx, col_name] = value_cm
+            written += 1
+            self._log_change("yandex", article, col_name, value_cm)
+            logger.debug(f"   [XML→Яндекс] {article}: {col_name}={value_cm} см")
+
+        if written > 0:
+            logger.info(
+                f"   ✓ [XML→Яндекс] {article}: "
+                f"{length_cm}/{width_cm}/{height_cm} см ({written} столбцов)"
+            )
+
+        return written
 
     # ------------------------------------------------------------------
     # Вспомогательные методы

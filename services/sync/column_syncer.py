@@ -13,14 +13,19 @@
 Паттерн: Dependency Injection — все зависимости передаются через конструктор.
 """
 
+import re
 from typing import Dict, List, Optional
 
 import pandas as pd
 
-from config.config import ALL_DIMENSION_COLUMN_NAMES, is_excluded_column
+from config.config import (
+    ALL_DIMENSION_COLUMN_NAMES,
+    TNVED_COLUMN_NAMES,
+    TNVED_NUMERIC_ONLY_MARKETPLACES,
+    is_excluded_column,
+)
 from services.sync.ai_validator import AiValidator
 from services.sync.article_aligner import ArticleAligner
-from services.sync.dimensions_synchronizer import DimensionsSynchronizer
 from services.sync.value_converter import ValueConverter
 from utils.logger_config import setup_logger
 
@@ -34,8 +39,9 @@ _PAIR_CONFIGS: List[tuple] = [
     ("matches_2_3", "ozon",        "yandex",  "column_2", "column_3"),
 ]
 
-# Составной столбец габаритов Яндекс — обрабатывается особо
-_YANDEX_COMPOSITE_COL = "Габариты с упаковкой, см"
+# Регулярное выражение для извлечения числового кода ТНВЭД
+# Берёт первую непрерывную последовательность цифр из строки
+_TNVED_CODE_PATTERN = re.compile(r"^(\d+)")
 
 
 class ColumnSyncer:
@@ -359,7 +365,11 @@ class ColumnSyncer:
             if source_value is None:
                 continue
 
-            source_unit = {"wildberries": unit_wb, "ozon": unit_ozon, "yandex": unit_yandex}[source_mp]
+            source_unit = {
+                "wildberries": unit_wb,
+                "ozon": unit_ozon,
+                "yandex": unit_yandex,
+            }[source_mp]
 
             # Заполняем каждый МП по очереди
             for mp, col, unit, data in [
@@ -374,23 +384,15 @@ class ColumnSyncer:
 
                 idx = data[article]["index"]
 
-                # Специальная обработка составного столбца Яндекс
-                if col == _YANDEX_COMPOSITE_COL:
-                    written = self._write_yandex_composite(
-                        dfs, article, idx, source_mp,
-                        unit_wb, unit_ozon,
-                        wb_data, ozon_data,
-                    )
-                    filled_count += written
-                    continue
-
                 converted = self._value_converter.convert_value(
                     source_value, source_unit, unit
                 )
                 final = await self._ai_validator.validate_multiple_values(
                     converted, mp, col
                 )
-                written = self._write_value(dfs, mp, idx, col, converted, final, source_mp)
+                written = self._write_value(
+                    dfs, mp, idx, col, converted, final, source_mp
+                )
                 filled_count += written
 
         return filled_count
@@ -490,6 +492,8 @@ class ColumnSyncer:
         """
         Записывает значение в ячейку DataFrame с учётом типа столбца.
 
+        Если столбец является ТНВЭД и целевой МП принимает только числовой
+        код — извлекает числовую часть перед записью.
         Если есть validation и AI не нашло совпадение — ячейка не обновляется.
 
         Args:
@@ -517,6 +521,9 @@ class ColumnSyncer:
             )
             return 0
 
+        # Очистка ТНВЭД: извлекаем только числовой код для WB и Яндекс
+        value_to_set = self._apply_tnved_cleanup(mp, col, value_to_set)
+
         try:
             series = dfs[mp][col]
             if isinstance(series, pd.DataFrame):
@@ -533,87 +540,60 @@ class ColumnSyncer:
             logger.error(f"Ошибка записи [{mp}] '{col}': {e}")
             return 0
 
-    def _write_yandex_composite(
-        self,
-        dfs: Dict[str, pd.DataFrame],
-        article: str,
-        idx: int,
-        source_mp: str,
-        unit_wb: Optional[str],
-        unit_ozon: Optional[str],
-        wb_data: Dict,
-        ozon_data: Dict,
-    ) -> int:
+    @staticmethod
+    def _extract_tnved_code(value: str) -> str:
         """
-        Формирует и записывает составное значение габаритов для Яндекс.
+        Извлекает числовой код ТНВЭД из строки с пояснением.
 
-        Яндекс хранит габариты как «длина/ширина/высота» в сантиметрах.
-        Источником могут быть WB (см) или Ozon (мм → см).
+        Примеры:
+            "2103909009 - Прочие продукты..." → "2103909009"
+            "2103909009"                      → "2103909009"
+            ""                                → ""
 
         Args:
-            dfs:       словарь DataFrame.
-            article:   артикул товара.
-            idx:       индекс строки в DataFrame Яндекс.
-            source_mp: маркетплейс-источник габаритов.
-            unit_wb:   единица WB.
-            unit_ozon: единица Ozon.
-            wb_data:   article_map для WB.
-            ozon_data: article_map для Ozon.
+            value: строковое значение ТНВЭД (возможно, с пояснением).
 
         Returns:
-            1 если значение записано, 0 если данных недостаточно.
+            Числовой код ТНВЭД или исходная строка, если число не найдено.
         """
-        df_yandex = dfs["yandex"]
+        if not value or not str(value).strip():
+            return str(value) if value else ""
 
-        if source_mp == "wildberries" and article in wb_data and self._resolved_wb_dims:
-            wb_row = dfs["wildberries"][
-                dfs["wildberries"][self._article_columns["wildberries"]]
-                .astype(str)
-                .str.strip()
-                == article
-            ].iloc[0]
+        text = str(value).strip()
+        match = _TNVED_CODE_PATTERN.match(text)
+        if match:
+            return match.group(1)
 
-            length = wb_row.get(self._resolved_wb_dims["length"])
-            width  = wb_row.get(self._resolved_wb_dims["width"])
-            height = wb_row.get(self._resolved_wb_dims["height"])
+        return text
 
-            if all(pd.notna(v) for v in [length, width, height]):
-                composite = DimensionsSynchronizer.format_composite_dimensions(
-                    float(length), float(width), float(height)
+    @staticmethod
+    def _apply_tnved_cleanup(mp: str, col: str, value: object) -> object:
+        """
+        Применяет очистку ТНВЭД если столбец является кодом ТН ВЭД
+        и целевой маркетплейс принимает только числовой код.
+
+        Args:
+            mp:    маркетплейс-получатель.
+            col:   название столбца.
+            value: значение для записи.
+
+        Returns:
+            Очищенное значение (только число) или исходное значение.
+        """
+        if (
+            col in TNVED_COLUMN_NAMES
+            and mp in TNVED_NUMERIC_ONLY_MARKETPLACES
+        ):
+            original = str(value) if value is not None else ""
+            cleaned = ColumnSyncer._extract_tnved_code(original)
+            if cleaned != original:
+                logger.info(
+                    f"  🔢 [{mp.upper()}] ТНВЭД очищен: "
+                    f"'{original}' → '{cleaned}'"
                 )
-                df_yandex.at[idx, _YANDEX_COMPOSITE_COL] = composite
-                self._log_change(
-                    "yandex", df_yandex, idx,
-                    _YANDEX_COMPOSITE_COL, composite, "wildberries"
-                )
-                return 1
+            return cleaned
 
-        elif source_mp == "ozon" and article in ozon_data:
-            ozon_row = dfs["ozon"][
-                dfs["ozon"][self._article_columns["ozon"]]
-                .astype(str)
-                .str.strip()
-                == article
-            ].iloc[0]
-
-            length_mm = ozon_row.get("Длина упаковки, мм*")
-            width_mm  = ozon_row.get("Ширина упаковки, мм*")
-            height_mm = ozon_row.get("Высота упаковки, мм*")
-
-            if all(pd.notna(v) for v in [length_mm, width_mm, height_mm]):
-                composite = DimensionsSynchronizer.format_composite_dimensions(
-                    DimensionsSynchronizer.mm_to_cm(float(length_mm)),
-                    DimensionsSynchronizer.mm_to_cm(float(width_mm)),
-                    DimensionsSynchronizer.mm_to_cm(float(height_mm)),
-                )
-                df_yandex.at[idx, _YANDEX_COMPOSITE_COL] = composite
-                self._log_change(
-                    "yandex", df_yandex, idx,
-                    _YANDEX_COMPOSITE_COL, composite, "ozon"
-                )
-                return 1
-
-        return 0
+        return value
 
     def _log_change(
         self,

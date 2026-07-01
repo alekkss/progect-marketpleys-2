@@ -201,6 +201,24 @@ class Config:
     }
 
     # ===================================================================
+    # Столбцы ТН ВЭД (код товарной номенклатуры)
+    # ===================================================================
+    # В Ozon код хранится с пояснением: "2103909009 - Прочие продукты..."
+    # В WB и Яндекс принимается только числовой код: "2103909009"
+    # При синхронизации из Ozon в WB/Яндекс извлекается только число.
+    # ===================================================================
+    TNVED_COLUMN_NAMES: set = {
+        'Код ТН ВЭД',           # WB и Яндекс
+        'ТН ВЭД коды ЕАЭС*',   # Ozon
+    }
+
+    # МП, которые принимают только числовой код ТНВЭД (без пояснений)
+    TNVED_NUMERIC_ONLY_MARKETPLACES: set = {
+        'wildberries',
+        'yandex',
+    }
+
+    # ===================================================================
     # Маппинг единиц измерения для XML-полей
     # ===================================================================
     XML_UNIT_MAPPING: Dict[str, str] = {
@@ -488,3 +506,5 @@ UPLOAD_DIR = Config.UPLOAD_DIR
 DOWNLOAD_DIR = Config.DOWNLOAD_DIR
 OUTPUT_DIR = Config.OUTPUT_DIR
 FILE_MAX_AGE_DAYS = Config.FILE_MAX_AGE_DAYS
+TNVED_COLUMN_NAMES = Config.TNVED_COLUMN_NAMES
+TNVED_NUMERIC_ONLY_MARKETPLACES = Config.TNVED_NUMERIC_ONLY_MARKETPLACES

@@ -16,6 +16,7 @@ from openai import AsyncOpenAI, RateLimitError, APIStatusError
 from config.config import (
     AI_MODEL,
     AI_TEMPERATURE,
+    FORCED_PAIR_ONLY_MATCHES,
     MANDATORY_MATCHES,
     is_excluded_column,
     Config,
@@ -101,7 +102,7 @@ class AIComparator:
         except FileNotFoundError:
             self.mvm_matching_template = None
             print("[i] МВМ промпт не найден (будет загружен при первом использовании)")
-    
+
     async def close(self) -> None:
         """
         Закрывает HTTP-клиент и освобождает сетевые соединения.
@@ -194,6 +195,9 @@ class AIComparator:
 
         # НОВОЕ: Добавляем исключенные столбцы в результат
         result = self._add_excluded_to_result(result, excluded_1, excluded_2, excluded_3)
+
+        # Принудительные парные сопоставления (перед дедупликацией)
+        result = self._enforce_forced_pairs(result, filtered_1, filtered_2, filtered_3)
 
         # НОВОЕ: Удаляем дубли и пересечения между тройными и парными
         result = self._deduplicate_matches(result)
@@ -742,6 +746,199 @@ class AIComparator:
             print(f"\n[⚠️] ВАЛИДАЦИЯ: Отклонено {rejected_count} несуществующих совпадений от AI\n")
 
         return validated
+
+    def _enforce_forced_pairs(
+        self,
+        result: Dict,
+        columns_1: List[str],
+        columns_2: List[str],
+        columns_3: List[str],
+    ) -> Dict:
+        """
+        Принудительно применяет правила из FORCED_PAIR_ONLY_MATCHES.
+
+        Для каждого правила (например, Видео: WB+Яндекс, Ozon=NA):
+            1. Удаляет эти столбцы из тройных сопоставлений (matches_all_three).
+            2. Удаляет эти столбцы из ошибочных парных с запрещённым МП
+               (например, matches_1_2 и matches_2_3 если column_2=None).
+            3. Если освободившийся столбец Ozon остался без пары —
+               возвращает его в only_in_second.
+            4. Гарантирует наличие правильного парного сопоставления
+               (например, matches_1_3 для WB+Яндекс).
+
+        Вызывается после _add_mandatory_matches и до _deduplicate_matches.
+
+        Args:
+            result:    текущий результат сопоставлений.
+            columns_1: столбцы WB (для fuzzy-поиска).
+            columns_2: столбцы Ozon.
+            columns_3: столбцы Яндекс.
+
+        Returns:
+            Обновлённый результат с принудительными парными.
+        """
+        if not FORCED_PAIR_ONLY_MATCHES:
+            return result
+
+        for rule in FORCED_PAIR_ONLY_MATCHES:
+            rule_col_1 = rule.get("column_1")
+            rule_col_2 = rule.get("column_2")
+            rule_col_3 = rule.get("column_3")
+            description = rule.get("description", "")
+
+            # Определяем какие column_key заполнены, а какой None (запрещённый МП)
+            # Для Видео: column_1="Видео", column_2=None, column_3="Ссылка на видео"
+            present_keys = {}   # {column_key: искомое_название}
+            none_key = None     # column_key, который должен быть NA
+
+            for col_key, col_val in [
+                ("column_1", rule_col_1),
+                ("column_2", rule_col_2),
+                ("column_3", rule_col_3),
+            ]:
+                if col_val is None:
+                    none_key = col_key
+                else:
+                    present_keys[col_key] = col_val
+
+            if none_key is None or len(present_keys) < 2:
+                continue  # Некорректное правило — пропускаем
+
+            # Fuzzy-поиск реальных названий столбцов в файлах
+            col_lists = {
+                "column_1": columns_1,
+                "column_2": columns_2,
+                "column_3": columns_3,
+            }
+            resolved = {}
+            for col_key, col_name in present_keys.items():
+                found = ExcelReader.find_column_fuzzy(col_lists[col_key], col_name)
+                if found:
+                    resolved[col_key] = found
+
+            if len(resolved) < 2:
+                # Столбцы не найдены в файлах — правило неприменимо
+                continue
+
+            # Множество найденных столбцов для быстрого поиска
+            resolved_values = set(resolved.values())
+
+            print(f"\n[FORCED PAIR] Применяю правило: {description}")
+            print(f"   Столбцы: {resolved}")
+            print(f"   Запрещённый МП: {none_key}")
+
+            removed_count = 0
+            freed_ozon_columns: List[str] = []
+
+            # --- ШАГ 1: Удаляем из тройных (matches_all_three) ---
+            cleaned_triple = []
+            for match in result.get("matches_all_three", []):
+                # Проверяем, содержит ли это тройное сопоставление
+                # хотя бы один из столбцов правила
+                match_has_forced = False
+                for col_key, col_val in resolved.items():
+                    if match.get(col_key) == col_val:
+                        match_has_forced = True
+                        break
+
+                if match_has_forced:
+                    # Запоминаем освободившийся столбец запрещённого МП
+                    freed_col = match.get(none_key)
+                    if freed_col:
+                        freed_ozon_columns.append(freed_col)
+                    removed_count += 1
+                    print(
+                        f"   ❌ Удалено из тройных: "
+                        f"'{match.get('column_1')}' ↔ "
+                        f"'{match.get('column_2')}' ↔ "
+                        f"'{match.get('column_3')}'"
+                    )
+                else:
+                    cleaned_triple.append(match)
+
+            result["matches_all_three"] = cleaned_triple
+
+            # --- ШАГ 2: Удаляем из ошибочных парных с запрещённым МП ---
+            # Определяем какие парные группы содержат запрещённый МП
+            pair_groups_with_none = []
+            if none_key == "column_1":
+                pair_groups_with_none = ["matches_1_2", "matches_1_3"]
+            elif none_key == "column_2":
+                pair_groups_with_none = ["matches_1_2", "matches_2_3"]
+            elif none_key == "column_3":
+                pair_groups_with_none = ["matches_1_3", "matches_2_3"]
+
+            for group_key in pair_groups_with_none:
+                cleaned_pair = []
+                for match in result.get(group_key, []):
+                    match_has_forced = False
+                    for col_key, col_val in resolved.items():
+                        if match.get(col_key) == col_val:
+                            match_has_forced = True
+                            break
+
+                    if match_has_forced:
+                        freed_col = match.get(none_key)
+                        if freed_col:
+                            freed_ozon_columns.append(freed_col)
+                        removed_count += 1
+                        print(f"   ❌ Удалено из {group_key}: {match}")
+                    else:
+                        cleaned_pair.append(match)
+
+                result[group_key] = cleaned_pair
+
+            # --- ШАГ 3: Возвращаем освободившиеся столбцы в уникальные ---
+            if freed_ozon_columns:
+                unique_key_map = {
+                    "column_1": "only_in_first",
+                    "column_2": "only_in_second",
+                    "column_3": "only_in_third",
+                }
+                unique_key = unique_key_map.get(none_key, "")
+                if unique_key:
+                    existing_unique = set(result.get(unique_key, []))
+                    for col in freed_ozon_columns:
+                        if col not in existing_unique:
+                            result[unique_key].append(col)
+                            print(f"   ↩️ Возвращён в {unique_key}: '{col}'")
+
+            # --- ШАГ 4: Гарантируем наличие правильного парного ---
+            # Определяем целевую парную группу
+            resolved_keys = sorted(resolved.keys())  # ['column_1', 'column_3']
+            pair_key_map = {
+                ("column_1", "column_2"): "matches_1_2",
+                ("column_1", "column_3"): "matches_1_3",
+                ("column_2", "column_3"): "matches_2_3",
+            }
+            target_pair_key = pair_key_map.get(tuple(resolved_keys))
+
+            if target_pair_key:
+                # Проверяем, есть ли уже такое парное
+                existing_pairs = result.get(target_pair_key, [])
+                already_exists = any(
+                    all(m.get(k) == v for k, v in resolved.items())
+                    for m in existing_pairs
+                )
+
+                if not already_exists:
+                    new_pair = {
+                        **{k: v for k, v in resolved.items()},
+                        "confidence": 1.0,
+                        "mandatory": True,
+                    }
+                    result[target_pair_key].insert(0, new_pair)
+                    print(
+                        f"   ✅ Добавлено парное в {target_pair_key}: {resolved}"
+                    )
+
+            if removed_count > 0:
+                print(
+                    f"   📊 Итого: удалено {removed_count} ошибочных, "
+                    f"освобождено столбцов: {len(freed_ozon_columns)}"
+                )
+
+        return result
 
     def _get_remaining_columns(
         self,

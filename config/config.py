@@ -4,7 +4,7 @@
 
 import os
 import re
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from dotenv import load_dotenv
 import sys
 from pathlib import Path
@@ -217,6 +217,32 @@ class Config:
         'wildberries',
         'yandex',
     }
+
+    # ===================================================================
+    # Принудительные парные сопоставления (без определённого МП)
+    # ===================================================================
+    # Некоторые столбцы существуют только в 2 из 3 маркетплейсов.
+    # AI может ошибочно сопоставить их с произвольным столбцом 3-го МП.
+    # Этот словарь задаёт жёсткие правила: для каждого набора столбцов
+    # указан column_key, который ВСЕГДА должен быть None (NA).
+    #
+    # Формат: список словарей с ключами column_1, column_2, column_3.
+    # Значение None означает, что этот МП НЕ участвует в сопоставлении.
+    #
+    # Обработка в AIComparator._enforce_forced_pairs():
+    #   1. Если AI поместил эти столбцы в тройное — Ozon-столбец удаляется,
+    #      сопоставление перемещается в парное WB+Яндекс.
+    #   2. Если AI создал парное с Ozon для этих столбцов — оно удаляется.
+    #   3. Принудительное парное WB+Яндекс добавляется если отсутствует.
+    # ===================================================================
+    FORCED_PAIR_ONLY_MATCHES: List[Dict[str, Optional[str]]] = [
+        {
+            "column_1": "Видео",
+            "column_2": None,
+            "column_3": "Ссылка на видео",
+            "description": "Видео товара (в Ozon нет поля видео в основном листе)"
+        },
+    ]
 
     # ===================================================================
     # Маппинг единиц измерения для XML-полей
@@ -508,3 +534,4 @@ OUTPUT_DIR = Config.OUTPUT_DIR
 FILE_MAX_AGE_DAYS = Config.FILE_MAX_AGE_DAYS
 TNVED_COLUMN_NAMES = Config.TNVED_COLUMN_NAMES
 TNVED_NUMERIC_ONLY_MARKETPLACES = Config.TNVED_NUMERIC_ONLY_MARKETPLACES
+FORCED_PAIR_ONLY_MATCHES = Config.FORCED_PAIR_ONLY_MATCHES

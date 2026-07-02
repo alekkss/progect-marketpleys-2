@@ -5,16 +5,16 @@
 того, что у каждого маркетплейса разная структура фото-столбцов:
     - WB:     один столбец «Фото» — все ссылки через «;»
     - Ozon:   два столбца — «Ссылка на главное фото*» и
-              «Ссылки на дополнительные фото» (через пробел)
+              «Ссылки на дополнительные фото» (через перенос строки «\n»)
     - Яндекс: один столбец «Ссылка на изображение *» — все ссылки через «,»
 
 Логика переноса:
     Ozon → WB:      главное + дополнительные → один столбец через «;»
     Ozon → Яндекс:  главное + дополнительные → один столбец через «,»
     WB → Ozon:      первая ссылка → главное фото,
-                    остальные → дополнительные через пробел
+                    остальные → дополнительные через «\n»
     Яндекс → Ozon:  первая ссылка → главное фото,
-                    остальные → дополнительные через пробел
+                    остальные → дополнительные через «\n»
 
 Принцип Single Responsibility: этот класс знает только о фото.
 Принцип Dependency Inversion: все зависимости передаются через конструктор.
@@ -22,18 +22,28 @@
     запись в PHOTO_COLUMNS конфига, без изменения существующей логики.
 """
 
-from typing import Dict, List, Optional, Tuple
+import re
+from typing import Dict, List, Optional
 
 import pandas as pd
 
 from config.config import (
     PHOTO_COLUMNS,
-    PHOTO_READ_SEPARATORS,
     PHOTO_WRITE_SEPARATORS,
 )
 from utils.logger_config import setup_logger
 
 logger = setup_logger("photo_syncer")
+
+# Универсальный паттерн для разбивки ссылок.
+# Обрабатывает все форматы которые встречаются в реальных файлах МП:
+#   \r\n — Windows перенос строки
+#   \n   — Unix перенос строки
+#   ;    — WB разделитель
+#   ,    — Яндекс разделитель (только если не часть URL — но URL запятых не содержат)
+# Пробел НЕ включён намеренно — он может быть частью названия,
+# хотя в URL не встречается. Безопаснее не включать.
+_LINK_SPLIT_PATTERN = re.compile(r"[\r\n;,]+")
 
 
 class PhotoSyncer:
@@ -80,7 +90,7 @@ class PhotoSyncer:
             3. WB → Ozon
             4. Яндекс → Ozon
 
-        Шаги 3 и 4 выполняются только если после шага 1/2
+        Шаги 3 и 4 выполняются только если после шагов 1/2
         в Ozon остались пустые фото-столбцы.
 
         Args:
@@ -107,7 +117,7 @@ class PhotoSyncer:
         if filled > 0:
             logger.info(f"  📷 Ozon → Яндекс: заполнено {filled} артикулов")
 
-        # WB → Ozon (только пустые после шага выше)
+        # WB → Ozon (только пустые после шагов выше)
         filled = self._sync_wb_to_ozon(dfs)
         total_filled += filled
         if filled > 0:
@@ -217,9 +227,9 @@ class PhotoSyncer:
         df_ozon   = dfs["ozon"]
         df_yandex = dfs["yandex"]
 
-        ozon_main_col   = PHOTO_COLUMNS["ozon"]["main"]
-        ozon_extra_col  = PHOTO_COLUMNS["ozon"]["extra"]
-        yandex_all_col  = PHOTO_COLUMNS["yandex"]["all"]
+        ozon_main_col  = PHOTO_COLUMNS["ozon"]["main"]
+        ozon_extra_col = PHOTO_COLUMNS["ozon"]["extra"]
+        yandex_all_col = PHOTO_COLUMNS["yandex"]["all"]
 
         article_col_ozon   = self._article_columns["ozon"]
         article_col_yandex = self._article_columns["yandex"]
@@ -265,12 +275,11 @@ class PhotoSyncer:
         """
         Переносит фото из WB в Ozon.
 
-        Разбивает столбец WB «Фото» по «;»:
+        Разбивает столбец WB «Фото» универсальным сплиттером:
             - Первая ссылка → «Ссылка на главное фото*»
-            - Остальные (если есть) → «Ссылки на дополнительные фото» через пробел
+            - Остальные (если есть) → «Ссылки на дополнительные фото» через «\n»
 
-        Пропускает артикул если оба столбца Ozon уже заполнены,
-        или если заполнен хотя бы «Ссылка на главное фото*».
+        Пропускает артикул если «Ссылка на главное фото*» уже заполнена.
 
         Args:
             dfs: словарь {маркетплейс: DataFrame}.
@@ -293,6 +302,9 @@ class PhotoSyncer:
         article_col_wb   = self._article_columns["wildberries"]
         article_col_ozon = self._article_columns["ozon"]
 
+        # Разделитель при записи дополнительных фото в Ozon — перенос строки
+        ozon_write_sep = PHOTO_WRITE_SEPARATORS["ozon"]
+
         filled_count = 0
 
         for _, wb_row in df_wb.iterrows():
@@ -300,7 +312,6 @@ class PhotoSyncer:
             if not article:
                 continue
 
-            # Ищем строку в Ozon по артикулу
             ozon_idx = self._find_row_index(df_ozon, article_col_ozon, article)
             if ozon_idx is None:
                 continue
@@ -309,9 +320,9 @@ class PhotoSyncer:
             if self._is_filled(df_ozon, ozon_idx, ozon_main_col):
                 continue
 
-            # Читаем ссылки из WB
+            # Читаем и разбиваем ссылки из WB универсальным сплиттером
             wb_value = wb_row.get(wb_all_col)
-            links = self._split_links(wb_value, PHOTO_READ_SEPARATORS["wildberries"])
+            links = self._split_links(wb_value)
             if not links:
                 continue
 
@@ -319,16 +330,15 @@ class PhotoSyncer:
             df_ozon.at[ozon_idx, ozon_main_col] = links[0]
             self._log_change("ozon", article, ozon_main_col, links[0], "wildberries")
 
-            # Остальные ссылки → дополнительные фото Ozon
+            # Остальные ссылки → дополнительные фото Ozon через "\n"
             if len(links) > 1:
-                extra_value = PHOTO_WRITE_SEPARATORS["ozon"].join(links[1:])
+                extra_value = ozon_write_sep.join(links[1:])
                 df_ozon.at[ozon_idx, ozon_extra_col] = extra_value
                 self._log_change(
                     "ozon", article, ozon_extra_col, extra_value, "wildberries"
                 )
 
             filled_count += 1
-
             logger.debug(
                 f"  [WB→Ozon] {article}: {len(links)} фото "
                 f"(главное + {len(links) - 1} доп.)"
@@ -344,9 +354,9 @@ class PhotoSyncer:
         """
         Переносит фото из Яндекс в Ozon.
 
-        Разбивает столбец Яндекс «Ссылка на изображение *» по «,»:
+        Разбивает столбец Яндекс универсальным сплиттером:
             - Первая ссылка → «Ссылка на главное фото*»
-            - Остальные (если есть) → «Ссылки на дополнительные фото» через пробел
+            - Остальные (если есть) → «Ссылки на дополнительные фото» через «\n»
 
         Пропускает артикул если «Ссылка на главное фото*» в Ozon уже заполнена.
 
@@ -371,6 +381,9 @@ class PhotoSyncer:
         article_col_yandex = self._article_columns["yandex"]
         article_col_ozon   = self._article_columns["ozon"]
 
+        # Разделитель при записи дополнительных фото в Ozon — перенос строки
+        ozon_write_sep = PHOTO_WRITE_SEPARATORS["ozon"]
+
         filled_count = 0
 
         for _, yandex_row in df_yandex.iterrows():
@@ -378,7 +391,6 @@ class PhotoSyncer:
             if not article:
                 continue
 
-            # Ищем строку в Ozon по артикулу
             ozon_idx = self._find_row_index(df_ozon, article_col_ozon, article)
             if ozon_idx is None:
                 continue
@@ -387,11 +399,9 @@ class PhotoSyncer:
             if self._is_filled(df_ozon, ozon_idx, ozon_main_col):
                 continue
 
-            # Читаем ссылки из Яндекс
+            # Читаем и разбиваем ссылки из Яндекс универсальным сплиттером
             yandex_value = yandex_row.get(yandex_all_col)
-            links = self._split_links(
-                yandex_value, PHOTO_READ_SEPARATORS["yandex"]
-            )
+            links = self._split_links(yandex_value)
             if not links:
                 continue
 
@@ -399,16 +409,15 @@ class PhotoSyncer:
             df_ozon.at[ozon_idx, ozon_main_col] = links[0]
             self._log_change("ozon", article, ozon_main_col, links[0], "yandex")
 
-            # Остальные ссылки → дополнительные фото Ozon
+            # Остальные ссылки → дополнительные фото Ozon через "\n"
             if len(links) > 1:
-                extra_value = PHOTO_WRITE_SEPARATORS["ozon"].join(links[1:])
+                extra_value = ozon_write_sep.join(links[1:])
                 df_ozon.at[ozon_idx, ozon_extra_col] = extra_value
                 self._log_change(
                     "ozon", article, ozon_extra_col, extra_value, "yandex"
                 )
 
             filled_count += 1
-
             logger.debug(
                 f"  [Яндекс→Ozon] {article}: {len(links)} фото "
                 f"(главное + {len(links) - 1} доп.)"
@@ -429,11 +438,12 @@ class PhotoSyncer:
         """
         Собирает все фото-ссылки из строки Ozon в упорядоченный список.
 
-        Порядок: сначала главное фото, затем дополнительные.
-        Пустые строки и пробелы отфильтровываются.
+        Порядок: сначала главное фото (одна ссылка), затем дополнительные.
+        Дополнительные разбиваются универсальным сплиттером — обрабатывает
+        как «\n», так и «\r\n» и другие форматы.
 
         Args:
-            ozon_row: строка DataFrame Ozon.
+            ozon_row:  строка DataFrame Ozon.
             main_col:  название столбца главного фото.
             extra_col: название столбца дополнительных фото.
 
@@ -442,42 +452,42 @@ class PhotoSyncer:
         """
         links: List[str] = []
 
-        # Главное фото — одна ссылка
+        # Главное фото — одна ссылка, берём как есть
         main_value = ozon_row.get(main_col)
         if pd.notna(main_value) and str(main_value).strip():
             links.append(str(main_value).strip())
 
-        # Дополнительные фото — несколько через пробел
+        # Дополнительные фото — разбиваем универсальным сплиттером
         extra_value = ozon_row.get(extra_col)
-        extra_links = self._split_links(
-            extra_value, PHOTO_READ_SEPARATORS["ozon"]
-        )
+        extra_links = self._split_links(extra_value)
         links.extend(extra_links)
 
         return links
 
     @staticmethod
-    def _split_links(value: object, separator: str) -> List[str]:
+    def _split_links(value: object) -> List[str]:
         """
-        Разбивает строку ссылок на список по разделителю.
+        Универсально разбивает строку ссылок на список.
 
-        Отфильтровывает пустые элементы и лишние пробелы.
+        Обрабатывает все форматы разделителей которые встречаются
+        в реальных файлах маркетплейсов:
+            - «\r\n» и «\n» — перенос строки (Ozon дополнительные фото)
+            - «;»            — точка с запятой (WB)
+            - «,»            — запятая (Яндекс)
+
+        Пустые элементы и строки из одних пробелов отфильтровываются.
 
         Args:
-            value:     значение ячейки (строка или NaN).
-            separator: символ-разделитель.
+            value: значение ячейки (строка, число или NaN).
 
         Returns:
-            Список непустых ссылок.
+            Список непустых ссылок без лишних пробелов.
         """
         if pd.isna(value) or not str(value).strip():
             return []
 
-        return [
-            link.strip()
-            for link in str(value).split(separator)
-            if link.strip()
-        ]
+        parts = _LINK_SPLIT_PATTERN.split(str(value))
+        return [part.strip() for part in parts if part.strip()]
 
     @staticmethod
     def _get_article(row: pd.Series, article_col: str) -> Optional[str]:
@@ -555,8 +565,7 @@ class PhotoSyncer:
         Args:
             dfs:         словарь DataFrame.
             marketplace: ключ маркетплейса.
-            roles:       список ролей столбцов для проверки
-                         (например, ['main', 'extra'] или ['all']).
+            roles:       список ролей столбцов для проверки.
 
         Returns:
             True если все столбцы присутствуют в DataFrame.

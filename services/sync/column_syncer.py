@@ -20,12 +20,14 @@ import pandas as pd
 
 from config.config import (
     ALL_DIMENSION_COLUMN_NAMES,
+    PHOTO_COLUMNS,
     TNVED_COLUMN_NAMES,
     TNVED_NUMERIC_ONLY_MARKETPLACES,
     is_excluded_column,
 )
 from services.sync.ai_validator import AiValidator
 from services.sync.article_aligner import ArticleAligner
+from services.sync.photo_syncer import PhotoSyncer
 from services.sync.value_converter import ValueConverter
 from utils.logger_config import setup_logger
 
@@ -43,6 +45,14 @@ _PAIR_CONFIGS: List[tuple] = [
 # Берёт первую непрерывную последовательность цифр из строки
 _TNVED_CODE_PATTERN = re.compile(r"^(\d+)")
 
+# Множество всех фото-столбцов всех МП для быстрой проверки в _should_skip_match.
+# Фото-столбцы исключаются из стандартной синхронизации — ими управляет PhotoSyncer.
+_ALL_PHOTO_COLUMNS: set = {
+    col_name
+    for mp_cols in PHOTO_COLUMNS.values()
+    for col_name in mp_cols.values()
+}
+
 
 class ColumnSyncer:
     """
@@ -57,6 +67,9 @@ class ColumnSyncer:
         - changes_log:       общий лог изменений (передаётся по ссылке).
         - resolved_wb_dims:  реальные имена столбцов габаритов WB
                              (результат DimensionsSynchronizer.sync_dimensions).
+
+    Фото-столбцы делегируются в PhotoSyncer — стандартная логика
+    «скопировать значение как есть» для них неприменима.
     """
 
     def __init__(
@@ -88,6 +101,15 @@ class ColumnSyncer:
         self._changes_log = changes_log
         self._resolved_wb_dims = resolved_wb_dims
 
+        # PhotoSyncer создаётся один раз — получает те же ссылки на
+        # article_columns и changes_log, что и ColumnSyncer.
+        # Dependency Inversion: PhotoSyncer зависит от абстракций,
+        # а не от конкретных МП.
+        self._photo_syncer = PhotoSyncer(
+            article_columns=article_columns,
+            changes_log=changes_log,
+        )
+
     # ------------------------------------------------------------------
     # Публичный интерфейс
     # ------------------------------------------------------------------
@@ -102,6 +124,12 @@ class ColumnSyncer:
             1. Выравнивание артикулов (повторно после XML-индекса).
             2. Тройные совпадения (все 3 МП).
             3. Парные совпадения (все комбинации двух МП).
+            4. Фото-столбцы (через PhotoSyncer — отдельная логика).
+
+        Фото обрабатываются последними, потому что стандартные шаги 2–3
+        могут заполнить другие столбцы того же артикула, а PhotoSyncer
+        проверяет только пустые фото-ячейки — порядок не критичен,
+        но так логичнее для отладки.
 
         Args:
             dfs: словарь {маркетплейс: DataFrame}.
@@ -123,6 +151,9 @@ class ColumnSyncer:
 
         logger.info("\n[*] Синхронизирую совпадения между парами маркетплейсов...")
         synced_dfs = await self._sync_two_way_matches(synced_dfs)
+
+        logger.info("\n[*] Синхронизирую фото-столбцы...")
+        synced_dfs = self._photo_syncer.sync_photos(synced_dfs)
 
         return synced_dfs
 
@@ -214,8 +245,8 @@ class ColumnSyncer:
         skipped_count = 0
 
         for match in matches:
-            col_wb    = match.get("column_1")
-            col_ozon  = match.get("column_2")
+            col_wb     = match.get("column_1")
+            col_ozon   = match.get("column_2")
             col_yandex = match.get("column_3")
 
             if not all([col_wb, col_ozon, col_yandex]):
@@ -367,8 +398,8 @@ class ColumnSyncer:
 
             source_unit = {
                 "wildberries": unit_wb,
-                "ozon": unit_ozon,
-                "yandex": unit_yandex,
+                "ozon":        unit_ozon,
+                "yandex":      unit_yandex,
             }[source_mp]
 
             # Заполняем каждый МП по очереди
@@ -661,10 +692,12 @@ class ColumnSyncer:
     @staticmethod
     def _should_skip_match(*columns: str) -> bool:
         """
-        Проверяет, нужно ли пропустить сопоставление.
+        Проверяет, нужно ли пропустить сопоставление в стандартной обработке.
 
-        Пропускаем если столбец исключён из синхронизации
-        или относится к габаритам (обрабатываются DimensionsSynchronizer).
+        Пропускаем если столбец:
+            - исключён из синхронизации (EXCLUDED_COLUMNS)
+            - относится к габаритам (обрабатываются DimensionsSynchronizer)
+            - является фото-столбцом (обрабатываются PhotoSyncer)
 
         Args:
             columns: названия столбцов сопоставления.
@@ -677,6 +710,9 @@ class ColumnSyncer:
                 return True
             if col in ALL_DIMENSION_COLUMN_NAMES:
                 logger.info(f"⏭️ Пропуск (габариты): {' ↔ '.join(columns)}")
+                return True
+            if col in _ALL_PHOTO_COLUMNS:
+                logger.info(f"⏭️ Пропуск (фото → PhotoSyncer): {' ↔ '.join(columns)}")
                 return True
         return False
 

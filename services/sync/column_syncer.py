@@ -20,6 +20,7 @@ import pandas as pd
 
 from config.config import (
     ALL_DIMENSION_COLUMN_NAMES,
+    DECIMAL_DOT_MARKETPLACES,
     PHOTO_COLUMNS,
     TNVED_COLUMN_NAMES,
     TNVED_NUMERIC_ONLY_MARKETPLACES,
@@ -44,6 +45,11 @@ _PAIR_CONFIGS: List[tuple] = [
 # Регулярное выражение для извлечения числового кода ТНВЭД
 # Берёт первую непрерывную последовательность цифр из строки
 _TNVED_CODE_PATTERN = re.compile(r"^(\d+)")
+
+# Регулярное выражение для десятичного числа с запятой.
+# Матчит строки вида: "1234,5", "-0,75", "100,00"
+# Не матчит: "1,234,567" (тысячные разделители), "текст,текст"
+_DECIMAL_COMMA_PATTERN = re.compile(r"^-?\d+,\d+$")
 
 # Множество всех фото-столбцов всех МП для быстрой проверки в _should_skip_match.
 # Фото-столбцы исключаются из стандартной синхронизации — ими управляет PhotoSyncer.
@@ -523,8 +529,11 @@ class ColumnSyncer:
         """
         Записывает значение в ячейку DataFrame с учётом типа столбца.
 
-        Если столбец является ТНВЭД и целевой МП принимает только числовой
-        код — извлекает числовую часть перед записью.
+        Порядок постобработки перед записью:
+            1. Очистка ТНВЭД (извлечение числового кода).
+            2. Нормализация десятичного разделителя (запятая → точка для Ozon).
+            3. Приведение к числовому типу (если столбец числовой).
+
         Если есть validation и AI не нашло совпадение — ячейка не обновляется.
 
         Args:
@@ -555,6 +564,11 @@ class ColumnSyncer:
         # Очистка ТНВЭД: извлекаем только числовой код для WB и Яндекс
         value_to_set = self._apply_tnved_cleanup(mp, col, value_to_set)
 
+        # Нормализация десятичного разделителя: запятая → точка для МП,
+        # требующих точку (Ozon). Применяется ПОСЛЕ очистки ТНВЭД и
+        # ПЕРЕД записью в DataFrame, чтобы числа записывались корректно.
+        value_to_set = self._normalize_decimal_separator(mp, value_to_set)
+
         try:
             series = dfs[mp][col]
             if isinstance(series, pd.DataFrame):
@@ -570,6 +584,48 @@ class ColumnSyncer:
         except Exception as e:
             logger.error(f"Ошибка записи [{mp}] '{col}': {e}")
             return 0
+
+    @staticmethod
+    def _normalize_decimal_separator(mp: str, value: object) -> object:
+        """
+        Нормализует десятичный разделитель для маркетплейсов, требующих точку.
+
+        Если маркетплейс входит в DECIMAL_DOT_MARKETPLACES (например, Ozon)
+        и значение является десятичным числом с запятой (например, "1234,5"),
+        запятая заменяется на точку ("1234.5").
+
+        Не затрагивает:
+            - Значения без запятой ("1234", "текст").
+            - Значения с несколькими запятыми ("1,234,567" — тысячные разделители).
+            - Числовые типы (int, float) — у них нет запятой.
+            - Маркетплейсы, не входящие в DECIMAL_DOT_MARKETPLACES.
+
+        Args:
+            mp:    маркетплейс-получатель.
+            value: значение для записи.
+
+        Returns:
+            Значение с нормализованным разделителем или исходное значение.
+        """
+        if mp not in DECIMAL_DOT_MARKETPLACES:
+            return value
+
+        if value is None or not isinstance(value, str):
+            return value
+
+        text = value.strip()
+        if not text:
+            return value
+
+        if _DECIMAL_COMMA_PATTERN.match(text):
+            normalized = text.replace(",", ".")
+            logger.info(
+                f"  🔄 [{mp.upper()}] Десятичный разделитель: "
+                f"'{text}' → '{normalized}'"
+            )
+            return normalized
+
+        return value
 
     @staticmethod
     def _extract_tnved_code(value: str) -> str:

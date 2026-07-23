@@ -98,16 +98,16 @@ Telegram-бот и веб-приложение для автоматическо
 │   └── access.py                     # AccessManager (async, TTL-кэш)
 │
 ├── /web/                             # === ВЕБ-ПРИЛОЖЕНИЕ (НОВОЕ) ===
-│   ├── __init__.py                   # Пакет
-│   ├── app.py                        # Создание aiohttp Application
-│   ├── session.py                    # WebSessionManager (cookie sessions)
+│   ├── __init__.py                   # Пакет, экспорт create_web_app
+│   ├── app.py                        # Создание aiohttp Application (Factory)
 │   ├── forms.py                      # Валидация форм (без Pydantic)
 │   │
 │   ├── /auth/
-│   │   ├── __init__.py
-│   │   ├── password.py               # bcrypt хеширование
-│   │   ├── permissions.py            # WebAccessManager (адаптер над AccessManager)
-│   │   └── decorators.py             # @login_required, @admin_required
+│   │   ├── __init__.py               # Пакет аутентификации, экспорты
+│   │   ├── password.py               # bcrypt хеширование (asyncio.to_thread)
+│   │   ├── session.py                # WebSessionManager (cookie sessions через PostgreSQL)
+│   │   ├── permissions.py            # WebAccessManager (проверка ролей)
+│   │   └── decorators.py             # @login_required, @admin_required, @editor_required
 │   │
 │   ├── /middleware/
 │   │   ├── __init__.py
@@ -227,7 +227,7 @@ Telegram-бот и веб-приложение для автоматическо
 6. **[Условно] Создание веб-приложения** (если `WEB_HOST` задан):
    - Создание `WebSocketManager` — хранит активные WS-соединения `{task_id: [connections]}`
    - `create_web_app(task_queue, ai_comparator, ws_manager)` — инициализация `aiohttp.web.Application`
-   - Jinja2 templates, middleware (auth → errors → csrf), routes
+   - Jinja2 templates, middleware (errors → auth → csrf), routes
    - Shared resources в app context: `task_queue`, `ai_comparator`, `ws_manager`, `db`
    - Запуск `web.TCPSite(runner, WEB_HOST, WEB_PORT)`
    - Graceful degradation: если ImportError (нет веб-зависимостей) или ошибка — бот продолжает без веба
@@ -600,13 +600,14 @@ async def create_web_app(
 | Метод | URL | Описание | Требует авторизации |
 |---|---|---|---|
 | GET | `/` | Редирект → `/dashboard` или `/auth/login` | — |
+| GET | `/health` | Health-check (JSON: status, service) | Нет |
 | GET | `/auth/login` | Форма входа | Нет |
 | POST | `/auth/login` | Обработка входа | Нет |
 | GET | `/auth/register` | Форма регистрации | Нет* |
 | POST | `/auth/register` | Создание аккаунта | Нет* |
 | POST | `/auth/logout` | Выход | Да |
 | GET | `/dashboard` | Статистика, быстрые действия | Да |
-| GET | `/schemas` | Список схем | Да |
+| GET | `/schemas` | Список схем | Да (@login_required) |
 | GET | `/schemas/create` | Wizard создания | Да |
 | POST | `/schemas/create` | AI-сопоставление + сохранение | Да |
 | GET | `/schemas/create-mvm` | Wizard МВМ-схемы | Да |
@@ -638,10 +639,11 @@ async def create_web_app(
 5. Редирект на `/dashboard`
 
 **Middleware проверки:**
-1. Извлекает `session_id` из cookie
-2. `SELECT` из `web_sessions` (проверка `expires_at`)
-3. Загружает `web_user` в `request['user']`
-4. Если невалидная/истёкшая — редирект на `/auth/login`
+1. Проверяет путь — публичные (`/health`, `/auth/login`, `/auth/register`, `/static/`) пропускаются без проверки
+2. Извлекает `session_id` из cookie `MARKETPLACE_SESSION`
+3. `SELECT` из `web_sessions` JOIN `web_users` (проверка `expires_at` и `is_active`)
+4. Загружает данные в `request['user']` (Dict или None)
+5. Решение о блокировке принимают декораторы (`@login_required`, `@admin_required`), не middleware
 
 **Связь с Telegram:**
 - Поле `telegram_user_id` в `web_users` — опциональная привязка
@@ -709,17 +711,35 @@ class WebSocketManager:
 
 ```python
 class WebAccessManager:
-    @staticmethod
-    async def get_role(web_user_id: int) -> str: ...
+    """
+    Все методы принимают user_data (Dict из request["user"]),
+    а не web_user_id. Это исключает лишние запросы в БД —
+    данные уже загружены auth middleware.
+    """
 
     @staticmethod
-    async def can_see_all_schemas(web_user_id: int) -> bool: ...
+    def get_role(user_data: Optional[Dict]) -> str: ...
 
     @staticmethod
-    async def can_manage_users(web_user_id: int) -> bool: ...
+    def can_see_all_schemas(user_data: Optional[Dict]) -> bool: ...
 
     @staticmethod
-    async def is_active(web_user_id: int) -> bool: ...
+    def can_manage_users(user_data: Optional[Dict]) -> bool: ...
+
+    @staticmethod
+    def is_owner(user_data: Optional[Dict]) -> bool: ...
+
+    @staticmethod
+    def is_admin_or_owner(user_data: Optional[Dict]) -> bool: ...
+
+    @staticmethod
+    def can_upload_files(user_data: Optional[Dict]) -> bool: ...
+
+    @staticmethod
+    def can_delete_schema(user_data: Optional[Dict], schema_owner_id: int) -> bool: ...
+
+    @staticmethod
+    def has_minimum_role(user_data: Optional[Dict], minimum_role: str) -> bool: ...
 ```
 
 ### Регистрация веб-пользователей
@@ -727,6 +747,7 @@ class WebAccessManager:
 - По умолчанию: закрытая регистрация (`WEB_REGISTRATION_OPEN=false`)
 - Создание аккаунтов — через admin-панель (owner/admin)
 - При открытой регистрации — новый пользователь получает `role='user'`
+- После успешной регистрации — автоматический вход (создание сессии + cookie)
 - Привязка Telegram → проверка `whitelist_users` и синхронизация роли
 
 ---
@@ -1072,11 +1093,15 @@ Facade-оркестратор. Создаёт компоненты `sync/`, ко
 - Graceful degradation: при ImportError веб-модулей бот продолжает работать без веба
 - WebSocket URI: `/ws/tasks/{task_id}`
 - Cookie name: `MARKETPLACE_SESSION`
-- Порядок middleware: auth → errors → csrf
+- Порядок middleware: errors → auth → csrf (errors — внешний слой)
 - Nginx отдаёт `/static/` напрямую — aiohttp НЕ обслуживает статику в production
 - `web_app['task_queue']` — та же очередь, что и бот (НЕ создавать отдельную)
 - `web_app['ai_comparator']` — тот же экземпляр (НЕ создавать новый)
 - Один event loop для бота и веба — НЕ разделять на процессы
+- Auth middleware НЕ блокирует запросы — только загружает `request["user"]`. Блокировка — ответственность декораторов.
+- `WebAccessManager` принимает `user_data: Dict` (из request["user"]), НЕ `web_user_id: int` — без лишних запросов к БД
+- `PasswordHasher` всегда использует `asyncio.to_thread()` — НЕ вызывать bcrypt синхронно в event loop
+- Публичные пути (`/health`, `/auth/login`, `/auth/register`, `/static/`) НЕ проверяют сессию
 
 ### Критичные зависимости
 
@@ -1095,10 +1120,10 @@ Facade-оркестратор. Создаёт компоненты `sync/`, ко
 ### Выполнено (до v5.0)
 - ✅ Все фичи из v1.0 — v4.9 (см. предыдущую документацию)
 - ✅ Фаза 0: `shared/delivery.py` + изменения Task и TaskWorker
-
-### v5.0 — Веб-интерфейс
 - ✅ Фаза 1: Каркас aiohttp (app.py, middleware, routes/__init__)
 - ✅ Фаза 2: Аутентификация (web_users, bcrypt, sessions, permissions)
+
+### v5.0 — Веб-интерфейс
 - ✅ Фаза 3: Бизнес-маршруты (schemas, upload, tasks, admin, websocket)
 - ✅ Фаза 4: Шаблоны и фронтенд (HTML, CSS, JavaScript)
 - ✅ Фаза 5: Nginx + SSL + systemd
@@ -1131,6 +1156,8 @@ Facade-оркестратор. Создаёт компоненты `sync/`, ко
 - WebSocket-соединение живёт до завершения задачи (или 24ч максимум)
 - Регистрация закрыта по умолчанию — аккаунты создаёт admin
 - Одна активная сессия на пользователя (при новом логине старая истекает)
+- Пароль: 8-72 символа (ограничение bcrypt — обрезает после 72 байт)
+- bcrypt хеширование выполняется в thread pool (asyncio.to_thread) — не блокирует event loop
 
 ---
 

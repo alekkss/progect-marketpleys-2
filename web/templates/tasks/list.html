@@ -1,0 +1,268 @@
+{% extends "base.html" %}
+
+{% block title %}Задачи — Marketplace Sync{% endblock %}
+
+{% block content %}
+<!-- Заголовок -->
+<div class="flex items-center justify-between mb-6">
+    <div>
+        <h1 class="text-2xl font-bold text-slate-900">Мои задачи</h1>
+        <p class="mt-1 text-sm text-slate-500">
+            {% if tasks %}
+                {{ tasks|length }} {{ 'задача' if tasks|length == 1 else ('задачи' if tasks|length < 5 else 'задач') }}
+            {% else %}
+                История обработок пуста
+            {% endif %}
+        </p>
+    </div>
+    <a href="/upload"
+       class="inline-flex items-center gap-1.5 px-4 py-2 text-sm font-medium text-white bg-brand-600 rounded-lg
+              hover:bg-brand-700 transition-colors">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+        </svg>
+        Новая обработка
+    </a>
+</div>
+
+<!-- Список задач -->
+{% if tasks %}
+<div class="space-y-3">
+    {% for task in tasks %}
+    <div id="task-{{ task.task_id }}" class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+        <div class="p-5">
+            <div class="flex items-start justify-between gap-4">
+                <!-- Левая часть: статус и даты -->
+                <div class="flex items-start gap-3 min-w-0">
+                    <!-- Иконка статуса -->
+                    <div class="flex-shrink-0 mt-0.5">
+                        {% if task.status == 'completed' %}
+                            <div class="w-8 h-8 rounded-full bg-green-100 flex items-center justify-center">
+                                <svg class="w-4 h-4 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                                </svg>
+                            </div>
+                        {% elif task.status == 'failed' %}
+                            <div class="w-8 h-8 rounded-full bg-red-100 flex items-center justify-center">
+                                <svg class="w-4 h-4 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                                </svg>
+                            </div>
+                        {% elif task.status == 'processing' %}
+                            <div class="w-8 h-8 rounded-full bg-blue-100 flex items-center justify-center">
+                                <span class="pulse-dot"></span>
+                            </div>
+                        {% else %}
+                            <div class="w-8 h-8 rounded-full bg-amber-100 flex items-center justify-center">
+                                <svg class="w-4 h-4 text-amber-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                                </svg>
+                            </div>
+                        {% endif %}
+                    </div>
+
+                    <!-- Информация -->
+                    <div class="min-w-0">
+                        <div class="flex items-center gap-2 flex-wrap">
+                            {% if task.status == 'completed' %}
+                                <span class="badge badge-success">Выполнено</span>
+                            {% elif task.status == 'failed' %}
+                                <span class="badge badge-error">Ошибка</span>
+                            {% elif task.status == 'processing' %}
+                                <span class="badge badge-info">Обработка</span>
+                            {% else %}
+                                <span class="badge badge-warning">В очереди</span>
+                            {% endif %}
+
+                            <span class="text-xs text-slate-400">
+                                {{ task.task_id[:8] }}
+                            </span>
+                        </div>
+
+                        <!-- Даты -->
+                        <div class="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-500">
+                            <span class="flex items-center gap-1">
+                                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                                </svg>
+                                Создана: {{ task.created_at[:16] if task.created_at else '—' }}
+                            </span>
+                            {% if task.completed_at %}
+                            <span class="flex items-center gap-1">
+                                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                                </svg>
+                                Завершена: {{ task.completed_at[:16] }}
+                            </span>
+                            {% endif %}
+                        </div>
+
+                        <!-- Ошибка -->
+                        {% if task.status == 'failed' and task.error_message %}
+                        <p class="mt-2 text-xs text-red-600 bg-red-50 rounded px-2 py-1 inline-block max-w-md truncate-text"
+                           title="{{ task.error_message }}">
+                            {{ task.error_message[:100] }}{% if task.error_message|length > 100 %}...{% endif %}
+                        </p>
+                        {% endif %}
+
+                        <!-- Прогресс (для активных задач) -->
+                        {% if task.status in ('pending', 'processing') %}
+                        <div class="mt-2" id="progress-container-{{ task.task_id }}">
+                            <div class="progress-bar-container">
+                                <div id="progress-bar-{{ task.task_id }}" class="progress-bar-fill" style="width: 5%"></div>
+                            </div>
+                            <p id="progress-text-{{ task.task_id }}" class="mt-1 text-xs text-slate-500 italic">
+                                Ожидание...
+                            </p>
+                        </div>
+                        {% endif %}
+                    </div>
+                </div>
+
+                <!-- Правая часть: кнопки скачивания -->
+                {% if task.status == 'completed' and task.output_files %}
+                <div class="flex-shrink-0 flex flex-wrap gap-1.5 justify-end">
+                    {% for filename in task.output_files.keys() %}
+                    <a href="/tasks/{{ task.task_id }}/download/{{ filename }}"
+                       class="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium
+                              text-brand-700 bg-brand-50 rounded-lg
+                              hover:bg-brand-100 transition-colors"
+                       title="Скачать {{ filename }}">
+                        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
+                        </svg>
+                        {{ _shorten_filename(filename) }}
+                    </a>
+                    {% endfor %}
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+{% else %}
+<!-- Пустое состояние -->
+<div class="bg-white rounded-xl border border-slate-200 shadow-sm p-12 text-center">
+    <svg class="mx-auto w-16 h-16 text-slate-300 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+              d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/>
+    </svg>
+    <h3 class="text-lg font-semibold text-slate-700 mb-1">Нет задач</h3>
+    <p class="text-sm text-slate-500 mb-4">
+        Загрузите файлы маркетплейсов для начала обработки
+    </p>
+    <a href="/upload"
+       class="inline-flex items-center gap-1.5 px-4 py-2 text-sm font-medium text-white bg-brand-600 rounded-lg hover:bg-brand-700 transition-colors">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                  d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/>
+        </svg>
+        Загрузить файлы
+    </a>
+</div>
+{% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+    /**
+     * Сокращает имя файла для отображения в кнопке скачивания.
+     * Дублирует серверную логику _shorten_filename.
+     */
+    function shortenFilename(filename) {
+        const lower = filename.toLowerCase();
+        if (lower.includes('wb') || lower.includes('wildberries')) return '📥 WB';
+        if (lower.includes('ozon')) return '📥 Ozon';
+        if (lower.includes('яндекс') || lower.includes('yandex')) return '📥 Яндекс';
+        if (lower.includes('отчёт') || lower.includes('report')) return '📥 Отчёт';
+        return '📥 ' + filename.substring(0, 20);
+    }
+
+    /**
+     * Polling для задач в обработке.
+     * Обновляет статус каждые 5 секунд. При завершении — перезагружает страницу.
+     */
+    const activeTasks = document.querySelectorAll('[id^="progress-container-"]');
+
+    if (activeTasks.length > 0) {
+        // Собираем ID активных задач
+        const taskIds = Array.from(activeTasks).map(el =>
+            el.id.replace('progress-container-', '')
+        );
+
+        // Подключаем WebSocket для каждой активной задачи
+        taskIds.forEach(taskId => {
+            const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const ws = new WebSocket(`${protocol}//${location.host}/ws/tasks/${taskId}`);
+
+            ws.onmessage = (event) => {
+                const msg = JSON.parse(event.data);
+                const textEl = document.getElementById(`progress-text-${taskId}`);
+                const barEl = document.getElementById(`progress-bar-${taskId}`);
+
+                if (msg.type === 'progress' && textEl) {
+                    textEl.textContent = msg.message;
+                    // Эвристика прогресс-бара
+                    updateBarByMessage(barEl, msg.message);
+                } else if (msg.type === 'completed' || msg.type === 'files_ready') {
+                    // Перезагрузка для отображения кнопок скачивания
+                    setTimeout(() => location.reload(), 1000);
+                } else if (msg.type === 'error') {
+                    if (textEl) textEl.textContent = '❌ ' + msg.message;
+                    if (barEl) barEl.classList.add('error');
+                    setTimeout(() => location.reload(), 3000);
+                }
+            };
+
+            ws.onerror = () => startTaskPolling(taskId);
+            ws.onclose = (event) => {
+                // Если закрытие не инициировано сервером по завершению — запускаем polling
+                const container = document.getElementById(`progress-container-${taskId}`);
+                if (container) startTaskPolling(taskId);
+            };
+        });
+    }
+
+    /**
+     * Polling fallback для конкретной задачи.
+     */
+    function startTaskPolling(taskId) {
+        const interval = setInterval(async () => {
+            try {
+                const resp = await fetch(`/api/tasks/${taskId}/status`, {
+                    headers: { 'Accept': 'application/json' },
+                });
+                const data = await resp.json();
+
+                if (data.status === 'completed' || data.status === 'failed') {
+                    clearInterval(interval);
+                    location.reload();
+                }
+            } catch (e) { /* ignore */ }
+        }, 5000);
+    }
+
+    /**
+     * Эвристика прогресс-бара по тексту сообщения.
+     */
+    function updateBarByMessage(barEl, message) {
+        if (!barEl) return;
+        const lower = message.toLowerCase();
+
+        if (lower.includes('загрузка') || lower.includes('чтение')) {
+            barEl.style.width = '15%';
+        } else if (lower.includes('артикул')) {
+            barEl.style.width = '25%';
+        } else if (lower.includes('габарит')) {
+            barEl.style.width = '40%';
+        } else if (lower.includes('синхрониз') || lower.includes('столбц')) {
+            barEl.style.width = '55%';
+        } else if (lower.includes('xml')) {
+            barEl.style.width = '70%';
+        } else if (lower.includes('сохран') || lower.includes('валидац')) {
+            barEl.style.width = '85%';
+        }
+    }
+</script>
+{% endblock %}

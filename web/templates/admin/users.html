@@ -1,0 +1,243 @@
+{% extends "base.html" %}
+
+{% block title %}Управление пользователями — Marketplace Sync{% endblock %}
+
+{% block content %}
+<!-- Заголовок -->
+<div class="mb-6">
+    <h1 class="text-2xl font-bold text-slate-900">Управление пользователями</h1>
+    <p class="mt-1 text-sm text-slate-500">
+        {{ users|length }} {{ 'аккаунт' if users|length == 1 else ('аккаунта' if users|length < 5 else 'аккаунтов') }}
+    </p>
+</div>
+
+<!-- Форма добавления пользователя -->
+<div class="bg-white rounded-xl border border-slate-200 shadow-sm p-6 mb-6">
+    <h2 class="text-base font-semibold text-slate-900 mb-4">Добавить пользователя</h2>
+
+    <form method="POST" action="/admin/users/add" class="space-y-4">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 items-end">
+            <!-- Email -->
+            <div class="lg:col-span-1">
+                <label for="email" class="block text-xs font-medium text-slate-600 mb-1">Email</label>
+                <input
+                    type="email"
+                    id="email"
+                    name="email"
+                    required
+                    placeholder="user@example.com"
+                    class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm
+                           placeholder:text-slate-400
+                           focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500
+                           transition-colors"
+                >
+            </div>
+
+            <!-- Имя -->
+            <div class="lg:col-span-1">
+                <label for="display_name" class="block text-xs font-medium text-slate-600 mb-1">Имя</label>
+                <input
+                    type="text"
+                    id="display_name"
+                    name="display_name"
+                    placeholder="Необязательно"
+                    maxlength="100"
+                    class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm
+                           placeholder:text-slate-400
+                           focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500
+                           transition-colors"
+                >
+            </div>
+
+            <!-- Пароль -->
+            <div class="lg:col-span-1">
+                <label for="password" class="block text-xs font-medium text-slate-600 mb-1">Пароль</label>
+                <input
+                    type="password"
+                    id="password"
+                    name="password"
+                    required
+                    placeholder="Мин. 8 символов"
+                    minlength="8"
+                    maxlength="72"
+                    class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm
+                           placeholder:text-slate-400
+                           focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500
+                           transition-colors"
+                >
+            </div>
+
+            <!-- Роль -->
+            <div>
+                <label for="role" class="block text-xs font-medium text-slate-600 mb-1">Роль</label>
+                <select
+                    id="role"
+                    name="role"
+                    class="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm
+                           focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500
+                           transition-colors"
+                >
+                    <option value="user">user</option>
+                    <option value="editor">editor</option>
+                    {% if is_owner %}
+                    <option value="admin">admin</option>
+                    {% endif %}
+                </select>
+            </div>
+
+            <!-- Кнопка -->
+            <div>
+                <button
+                    type="submit"
+                    class="w-full px-4 py-2 text-sm font-semibold text-white bg-brand-600 rounded-lg
+                           hover:bg-brand-700 transition-colors"
+                >
+                    + Добавить
+                </button>
+            </div>
+        </div>
+    </form>
+</div>
+
+<!-- Таблица пользователей -->
+<div class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+    <div class="overflow-x-auto">
+        <table class="w-full table-hover">
+            <thead>
+                <tr class="border-b border-slate-200">
+                    <th class="px-5 py-3.5 text-left text-xs font-semibold text-slate-500 uppercase tracking-wider">
+                        Пользователь
+                    </th>
+                    <th class="px-5 py-3.5 text-left text-xs font-semibold text-slate-500 uppercase tracking-wider">
+                        Роль
+                    </th>
+                    <th class="px-5 py-3.5 text-left text-xs font-semibold text-slate-500 uppercase tracking-wider">
+                        Статус
+                    </th>
+                    <th class="px-5 py-3.5 text-left text-xs font-semibold text-slate-500 uppercase tracking-wider">
+                        Telegram
+                    </th>
+                    <th class="px-5 py-3.5 text-left text-xs font-semibold text-slate-500 uppercase tracking-wider">
+                        Последний вход
+                    </th>
+                    <th class="px-5 py-3.5 text-right text-xs font-semibold text-slate-500 uppercase tracking-wider">
+                        Действия
+                    </th>
+                </tr>
+            </thead>
+            <tbody class="divide-y divide-slate-100">
+                {% for u in users %}
+                <tr>
+                    <!-- Пользователь -->
+                    <td class="px-5 py-3.5">
+                        <div>
+                            <p class="text-sm font-medium text-slate-900">{{ u.email }}</p>
+                            {% if u.display_name %}
+                            <p class="text-xs text-slate-500">{{ u.display_name }}</p>
+                            {% endif %}
+                        </div>
+                    </td>
+
+                    <!-- Роль (select или текст для owner) -->
+                    <td class="px-5 py-3.5">
+                        {% if u.role == 'owner' %}
+                            <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold bg-amber-100 text-amber-800">
+                                👑 owner
+                            </span>
+                        {% else %}
+                            <form method="POST" action="/admin/users/role" class="inline">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                                <input type="hidden" name="user_id" value="{{ u.id }}">
+                                <select
+                                    name="role"
+                                    onchange="this.form.submit()"
+                                    class="px-2 py-1 border border-slate-200 rounded text-xs font-medium
+                                           focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500
+                                           transition-colors cursor-pointer
+                                           {% if u.role == 'admin' %}bg-blue-50 text-blue-700 border-blue-200
+                                           {% elif u.role == 'editor' %}bg-purple-50 text-purple-700 border-purple-200
+                                           {% else %}bg-slate-50 text-slate-700{% endif %}"
+                                >
+                                    <option value="user" {% if u.role == 'user' %}selected{% endif %}>user</option>
+                                    <option value="editor" {% if u.role == 'editor' %}selected{% endif %}>editor</option>
+                                    {% if is_owner %}
+                                    <option value="admin" {% if u.role == 'admin' %}selected{% endif %}>admin</option>
+                                    {% endif %}
+                                </select>
+                            </form>
+                        {% endif %}
+                    </td>
+
+                    <!-- Статус -->
+                    <td class="px-5 py-3.5">
+                        {% if u.is_active %}
+                            <span class="badge badge-success">Активен</span>
+                        {% else %}
+                            <span class="badge badge-error">Заблокирован</span>
+                        {% endif %}
+                    </td>
+
+                    <!-- Telegram -->
+                    <td class="px-5 py-3.5 text-sm text-slate-500">
+                        {% if u.telegram_user_id %}
+                            <span class="inline-flex items-center gap-1 text-xs">
+                                <svg class="w-3.5 h-3.5 text-blue-500" fill="currentColor" viewBox="0 0 24 24">
+                                    <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69a.2.2 0 00-.05-.18c-.06-.05-.14-.03-.21-.02-.09.02-1.49.95-4.22 2.79-.4.27-.76.41-1.08.4-.36-.01-1.04-.2-1.55-.37-.63-.2-1.12-.31-1.08-.66.02-.18.27-.36.74-.55 2.92-1.27 4.86-2.11 5.83-2.51 2.78-1.16 3.35-1.36 3.73-1.36.08 0 .27.02.39.12.1.08.13.19.14.27-.01.06.01.24 0 .38z"/>
+                                </svg>
+                                {{ u.telegram_user_id }}
+                            </span>
+                        {% else %}
+                            <span class="text-xs text-slate-400">—</span>
+                        {% endif %}
+                    </td>
+
+                    <!-- Последний вход -->
+                    <td class="px-5 py-3.5 text-xs text-slate-500 whitespace-nowrap">
+                        {{ u.last_login_at[:16] if u.last_login_at else '—' }}
+                    </td>
+
+                    <!-- Действия -->
+                    <td class="px-5 py-3.5 text-right">
+                        {% if u.role != 'owner' %}
+                        <form method="POST" action="/admin/users/toggle" class="inline">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                            <input type="hidden" name="user_id" value="{{ u.id }}">
+                            {% if u.is_active %}
+                                <button
+                                    type="submit"
+                                    onclick="return confirm('Заблокировать пользователя {{ u.email }}? Все его сессии будут завершены.')"
+                                    class="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium
+                                           text-red-700 bg-red-50 rounded-lg
+                                           hover:bg-red-100 transition-colors"
+                                >
+                                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                              d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636"/>
+                                    </svg>
+                                    Заблокировать
+                                </button>
+                            {% else %}
+                                <button
+                                    type="submit"
+                                    class="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium
+                                           text-green-700 bg-green-50 rounded-lg
+                                           hover:bg-green-100 transition-colors"
+                                >
+                                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/>
+                                    </svg>
+                                    Разблокировать
+                                </button>
+                            {% endif %}
+                        </form>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}

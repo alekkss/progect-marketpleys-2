@@ -3,8 +3,8 @@
 
 Собирает все компоненты в единое Application:
     - Jinja2 шаблонизатор (серверный рендеринг HTML)
-    - Middleware (обработка ошибок, в будущем — auth, csrf)
-    - Маршруты (health-check, WebSocket, в будущем — бизнес-маршруты)
+    - Middleware (обработка ошибок, auth, csrf)
+    - Маршруты (health-check, WebSocket, бизнес-маршруты)
     - Shared-ресурсы через app context (DI для обработчиков маршрутов)
 
 Паттерн: Factory — скрывает сложность создания и настройки Application.
@@ -50,9 +50,10 @@ def _setup_jinja2(app: web.Application) -> None:
     aiohttp-jinja2 не установлена — шаблонизатор не подключается
     (приложение продолжит работать, но HTML-страницы будут недоступны).
 
-    Глобальные переменные доступные во всех шаблонах:
+    Глобальные переменные и функции доступные во всех шаблонах:
         - app_name: Название приложения
         - web_domain: Публичный домен
+        - _shorten_filename(filename): Сокращение имени файла для кнопок скачивания
 
     Args:
         app: Экземпляр aiohttp Application
@@ -69,6 +70,7 @@ def _setup_jinja2(app: web.Application) -> None:
         return
 
     from config.config import Config
+    from web.routes.tasks import shorten_filename
 
     aiohttp_jinja2.setup(
         app,
@@ -76,11 +78,12 @@ def _setup_jinja2(app: web.Application) -> None:
         context_processors=[aiohttp_jinja2.request_processor],
     )
 
-    # Глобальные переменные для всех шаблонов
+    # Глобальные переменные и функции для всех шаблонов
     env = aiohttp_jinja2.get_env(app)
     env.globals.update({
         "app_name": "Marketplace Sync",
         "web_domain": Config.WEB_DOMAIN,
+        "_shorten_filename": shorten_filename,
     })
 
     logger.info("Jinja2 шаблонизатор настроен (шаблоны: %s)", _TEMPLATES_DIR)

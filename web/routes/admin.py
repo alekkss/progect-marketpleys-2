@@ -17,6 +17,7 @@
 Паттерн: Controller — HTTP → валидация → БД → ответ.
 """
 
+import aiohttp_jinja2
 from aiohttp import web
 from aiohttp.web import Request, Response
 
@@ -39,6 +40,10 @@ async def admin_users_page(request: Request) -> Response:
     Отображает все аккаунты с их ролями, статусом активности,
     датами регистрации и последнего входа.
 
+    Читает flash-сообщения из query params:
+        ?success=Текст — зелёное уведомление
+        ?error=Текст — красное уведомление
+
     Args:
         request: HTTP-запрос
 
@@ -50,12 +55,20 @@ async def admin_users_page(request: Request) -> Response:
     csrf_token = get_csrf_token(request)
     is_owner = WebAccessManager.is_owner(user_data)
 
-    html = _render_admin_users(
-        users=users,
-        is_owner=is_owner,
-        csrf_token=csrf_token,
-    )
-    return Response(text=html, content_type="text/html")
+    # Flash-сообщения из query params (после редиректов)
+    success_message = request.query.get("success", "")
+    error_message = request.query.get("error", "")
+
+    context = {
+        "users": users,
+        "is_owner": is_owner,
+        "csrf_token": csrf_token,
+        "user": user_data,
+        "success_message": success_message,
+        "error_message": error_message,
+    }
+
+    return aiohttp_jinja2.render_template("admin/users.html", request, context)
 
 
 @admin_required
@@ -276,252 +289,3 @@ def setup_admin_routes(app: web.Application) -> None:
     app.router.add_post("/admin/users/add", admin_add_user)
     app.router.add_post("/admin/users/toggle", admin_toggle_user)
     app.router.add_post("/admin/users/role", admin_change_role)
-
-
-# ===================================================================
-# Временный HTML-шаблон (будет заменён на Jinja2 в Фазе 4)
-# ===================================================================
-
-
-def _render_admin_users(
-    users: list,
-    is_owner: bool,
-    csrf_token: str,
-) -> str:
-    """Генерирует HTML admin-панели."""
-
-    # Таблица пользователей
-    rows_html = ""
-    for user in users:
-        role_badge = _get_role_badge(user["role"])
-        status_badge = (
-            '<span class="badge badge-success">Активен</span>'
-            if user["is_active"]
-            else '<span class="badge badge-error">Заблокирован</span>'
-        )
-        last_login = user.get("last_login_at", "")[:16] if user.get("last_login_at") else "—"
-        telegram = user.get("telegram_user_id") or "—"
-
-        # Кнопка блокировки (не для owner)
-        toggle_html = ""
-        if user["role"] != "owner":
-            btn_text = "Разблокировать" if not user["is_active"] else "Заблокировать"
-            btn_class = "btn-unblock" if not user["is_active"] else "btn-block"
-            toggle_html = f"""
-            <form method="POST" action="/admin/users/toggle" style="display:inline">
-                <input type="hidden" name="csrf_token" value="{csrf_token}">
-                <input type="hidden" name="user_id" value="{user['id']}">
-                <button type="submit" class="btn-small {btn_class}">{btn_text}</button>
-            </form>
-            """
-
-        # Селект роли (не для owner)
-        role_select_html = ""
-        if user["role"] != "owner":
-            options = '<option value="user"' + (' selected' if user["role"] == "user" else '') + '>user</option>'
-            options += '<option value="editor"' + (' selected' if user["role"] == "editor" else '') + '>editor</option>'
-            if is_owner:
-                options += '<option value="admin"' + (' selected' if user["role"] == "admin" else '') + '>admin</option>'
-
-            role_select_html = f"""
-            <form method="POST" action="/admin/users/role" style="display:inline">
-                <input type="hidden" name="csrf_token" value="{csrf_token}">
-                <input type="hidden" name="user_id" value="{user['id']}">
-                <select name="role" class="role-select" onchange="this.form.submit()">
-                    {options}
-                </select>
-            </form>
-            """
-        else:
-            role_select_html = '<span class="role-fixed">owner</span>'
-
-        rows_html += f"""
-        <tr>
-            <td>{user['email']}</td>
-            <td>{user.get('display_name') or '—'}</td>
-            <td>{role_select_html}</td>
-            <td>{status_badge}</td>
-            <td>{telegram}</td>
-            <td>{last_login}</td>
-            <td>{toggle_html}</td>
-        </tr>
-        """
-
-    # Форма добавления пользователя
-    role_options = """
-        <option value="user">user</option>
-        <option value="editor">editor</option>
-    """
-    if is_owner:
-        role_options += '<option value="admin">admin</option>'
-
-    return f"""<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Управление пользователями — Marketplace Sync</title>
-    <style>
-        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background-color: #f1f5f9; color: #1e293b; line-height: 1.6;
-        }}
-        .navbar {{
-            background: white; border-bottom: 1px solid #e2e8f0;
-            padding: 1rem 2rem; display: flex; justify-content: space-between; align-items: center;
-        }}
-        .navbar-brand {{ font-weight: 700; font-size: 1.25rem; color: #3b82f6; text-decoration: none; }}
-        .navbar-nav {{ display: flex; gap: 1.5rem; }}
-        .navbar-nav a {{ color: #64748b; text-decoration: none; font-size: 0.875rem; font-weight: 500; }}
-        .navbar-nav a:hover {{ color: #3b82f6; }}
-        .container {{ max-width: 1200px; margin: 0 auto; padding: 2rem; }}
-        .page-title {{ font-size: 1.5rem; font-weight: 700; margin-bottom: 1.5rem; }}
-        .card {{
-            background: white; border-radius: 0.75rem; padding: 1.5rem;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin-bottom: 1.5rem;
-        }}
-        .card-title {{ font-size: 1.125rem; font-weight: 600; margin-bottom: 1rem; }}
-        .form-row {{ display: flex; gap: 1rem; flex-wrap: wrap; align-items: flex-end; }}
-        .form-group {{ flex: 1; min-width: 150px; }}
-        .form-label {{ display: block; font-size: 0.75rem; font-weight: 500; color: #64748b; margin-bottom: 0.25rem; }}
-        .form-input, .form-select {{
-            width: 100%; padding: 0.5rem 0.75rem; border: 1px solid #d1d5db;
-            border-radius: 0.375rem; font-size: 0.875rem; outline: none;
-        }}
-        .form-input:focus, .form-select:focus {{ border-color: #3b82f6; }}
-        .btn-add {{
-            padding: 0.5rem 1rem; background: #3b82f6; color: white;
-            border: none; border-radius: 0.375rem; font-size: 0.875rem;
-            font-weight: 600; cursor: pointer; white-space: nowrap;
-        }}
-        .btn-add:hover {{ background: #2563eb; }}
-        .table-container {{ overflow-x: auto; }}
-        .table {{ width: 100%; border-collapse: collapse; }}
-        .table th, .table td {{
-            text-align: left; padding: 0.75rem 0.5rem;
-            border-bottom: 1px solid #e2e8f0; font-size: 0.8125rem;
-        }}
-        .table th {{ font-weight: 600; color: #64748b; background: #f8fafc; }}
-        .badge {{
-            display: inline-block; padding: 0.125rem 0.5rem; border-radius: 0.25rem;
-            font-size: 0.6875rem; font-weight: 600;
-        }}
-        .badge-success {{ background: #dcfce7; color: #166534; }}
-        .badge-error {{ background: #fef2f2; color: #dc2626; }}
-        .badge-owner {{ background: #fef3c7; color: #92400e; }}
-        .badge-admin {{ background: #dbeafe; color: #1e40af; }}
-        .badge-editor {{ background: #f3e8ff; color: #6b21a8; }}
-        .badge-user {{ background: #f1f5f9; color: #475569; }}
-        .btn-small {{
-            padding: 0.25rem 0.5rem; border: 1px solid #d1d5db;
-            border-radius: 0.25rem; font-size: 0.75rem; cursor: pointer; background: white;
-        }}
-        .btn-block {{ color: #dc2626; }}
-        .btn-block:hover {{ background: #fef2f2; border-color: #dc2626; }}
-        .btn-unblock {{ color: #166534; }}
-        .btn-unblock:hover {{ background: #dcfce7; border-color: #166534; }}
-        .role-select {{
-            padding: 0.25rem 0.375rem; border: 1px solid #d1d5db;
-            border-radius: 0.25rem; font-size: 0.75rem;
-        }}
-        .role-fixed {{ font-size: 0.75rem; color: #92400e; font-weight: 600; }}
-        .alert {{
-            padding: 0.75rem 1rem; border-radius: 0.5rem; margin-bottom: 1rem;
-            font-size: 0.875rem;
-        }}
-        .alert-success {{ background: #dcfce7; color: #166534; }}
-        .alert-error {{ background: #fef2f2; color: #dc2626; }}
-    </style>
-</head>
-<body>
-    <nav class="navbar">
-        <a href="/dashboard" class="navbar-brand">Marketplace Sync</a>
-        <div class="navbar-nav">
-            <a href="/dashboard">Dashboard</a>
-            <a href="/schemas">Схемы</a>
-            <a href="/upload">Загрузка</a>
-            <a href="/tasks">Задачи</a>
-        </div>
-    </nav>
-
-    <div class="container">
-        <h1 class="page-title">👥 Управление пользователями</h1>
-
-        <script>
-        // Показ уведомлений из query params
-        const params = new URLSearchParams(window.location.search);
-        const container = document.currentScript.parentElement;
-        if (params.get('success')) {{
-            container.insertAdjacentHTML('beforeend',
-                `<div class="alert alert-success">${{params.get('success')}}</div>`);
-        }}
-        if (params.get('error')) {{
-            container.insertAdjacentHTML('beforeend',
-                `<div class="alert alert-error">${{params.get('error')}}</div>`);
-        }}
-        </script>
-
-        <div class="card">
-            <h2 class="card-title">Добавить пользователя</h2>
-            <form method="POST" action="/admin/users/add">
-                <input type="hidden" name="csrf_token" value="{csrf_token}">
-                <div class="form-row">
-                    <div class="form-group">
-                        <label class="form-label">Email</label>
-                        <input class="form-input" type="email" name="email" required placeholder="user@example.com">
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label">Имя</label>
-                        <input class="form-input" type="text" name="display_name" placeholder="Необязательно">
-                    </div>
-                    <div class="form-group">
-                        <label class="form-label">Пароль</label>
-                        <input class="form-input" type="password" name="password" required placeholder="Мин. 8 символов">
-                    </div>
-                    <div class="form-group" style="max-width:120px">
-                        <label class="form-label">Роль</label>
-                        <select class="form-select" name="role">{role_options}</select>
-                    </div>
-                    <div>
-                        <button type="submit" class="btn-add">+ Добавить</button>
-                    </div>
-                </div>
-            </form>
-        </div>
-
-        <div class="card">
-            <h2 class="card-title">Пользователи ({len(users)})</h2>
-            <div class="table-container">
-                <table class="table">
-                    <thead>
-                        <tr>
-                            <th>Email</th>
-                            <th>Имя</th>
-                            <th>Роль</th>
-                            <th>Статус</th>
-                            <th>Telegram</th>
-                            <th>Последний вход</th>
-                            <th></th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {rows_html}
-                    </tbody>
-                </table>
-            </div>
-        </div>
-    </div>
-</body>
-</html>"""
-
-
-def _get_role_badge(role: str) -> str:
-    """Возвращает HTML-badge для роли."""
-    badges = {
-        "owner": '<span class="badge badge-owner">👑 owner</span>',
-        "admin": '<span class="badge badge-admin">👨‍💼 admin</span>',
-        "editor": '<span class="badge badge-editor">✏️ editor</span>',
-        "user": '<span class="badge badge-user">👤 user</span>',
-    }
-    return badges.get(role, f'<span class="badge">{role}</span>')

@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="ru" class="h-full">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Marketplace Sync{% endblock %}</title>
+
+    <!-- Tailwind CSS через CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        brand: {
+                            50: '#eff6ff',
+                            100: '#dbeafe',
+                            200: '#bfdbfe',
+                            300: '#93c5fd',
+                            400: '#60a5fa',
+                            500: '#3b82f6',
+                            600: '#2563eb',
+                            700: '#1d4ed8',
+                            800: '#1e40af',
+                            900: '#1e3a8a',
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+
+    <!-- Кастомные стили -->
+    <link rel="stylesheet" href="/static/css/style.css">
+
+    {% block head_extra %}{% endblock %}
+</head>
+<body class="h-full bg-slate-50 text-slate-900 antialiased">
+
+    <!-- Навигация -->
+    {% if user %}
+    <nav class="bg-white border-b border-slate-200 sticky top-0 z-50">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex justify-between items-center h-16">
+                <!-- Логотип -->
+                <a href="/dashboard" class="flex items-center gap-2 text-brand-600 font-bold text-lg hover:text-brand-700 transition-colors">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                              d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+                    </svg>
+                    <span class="hidden sm:inline">Marketplace Sync</span>
+                </a>
+
+                <!-- Основная навигация -->
+                <div class="hidden md:flex items-center gap-1">
+                    <a href="/dashboard"
+                       class="nav-link{% if request.path == '/dashboard' %} nav-link-active{% endif %}">
+                        Dashboard
+                    </a>
+                    <a href="/schemas"
+                       class="nav-link{% if request.path.startswith('/schemas') %} nav-link-active{% endif %}">
+                        Схемы
+                    </a>
+                    <a href="/upload"
+                       class="nav-link{% if request.path.startswith('/upload') %} nav-link-active{% endif %}">
+                        Загрузка
+                    </a>
+                    <a href="/tasks"
+                       class="nav-link{% if request.path.startswith('/tasks') %} nav-link-active{% endif %}">
+                        Задачи
+                    </a>
+                    {% if user.role in ('owner', 'admin') %}
+                    <a href="/admin/users"
+                       class="nav-link{% if request.path.startswith('/admin') %} nav-link-active{% endif %}">
+                        Админ
+                    </a>
+                    {% endif %}
+                </div>
+
+                <!-- Пользователь -->
+                <div class="flex items-center gap-3">
+                    <div class="hidden sm:flex items-center gap-2 text-sm text-slate-600">
+                        <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium
+                            {% if user.role == 'owner' %}bg-amber-100 text-amber-800
+                            {% elif user.role == 'admin' %}bg-blue-100 text-blue-800
+                            {% elif user.role == 'editor' %}bg-purple-100 text-purple-800
+                            {% else %}bg-slate-100 text-slate-600{% endif %}">
+                            {{ user.display_name or user.email }}
+                        </span>
+                    </div>
+                    <form method="POST" action="/auth/logout" class="inline">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                        <button type="submit"
+                                class="text-sm text-slate-500 hover:text-red-600 transition-colors px-2 py-1 rounded hover:bg-red-50"
+                                title="Выйти">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                      d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/>
+                            </svg>
+                        </button>
+                    </form>
+
+                    <!-- Мобильное меню (кнопка) -->
+                    <button id="mobileMenuBtn" class="md:hidden p-2 rounded-lg hover:bg-slate-100">
+                        <svg class="w-5 h-5 text-slate-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"/>
+                        </svg>
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Мобильное меню (выпадающее) -->
+        <div id="mobileMenu" class="hidden md:hidden border-t border-slate-200 bg-white">
+            <div class="px-4 py-3 space-y-1">
+                <a href="/dashboard" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-100">Dashboard</a>
+                <a href="/schemas" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-100">Схемы</a>
+                <a href="/upload" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-100">Загрузка</a>
+                <a href="/tasks" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-100">Задачи</a>
+                {% if user.role in ('owner', 'admin') %}
+                <a href="/admin/users" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-100">Админ</a>
+                {% endif %}
+            </div>
+        </div>
+    </nav>
+    {% endif %}
+
+    <!-- Основной контент -->
+    <main class="{% if user %}max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6{% endif %}">
+        <!-- Flash-сообщения -->
+        {% if success_message %}
+        <div class="mb-4 p-4 rounded-lg bg-green-50 border border-green-200 text-green-800 text-sm flex items-center gap-2" role="alert">
+            <svg class="w-5 h-5 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
+                <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"/>
+            </svg>
+            <span>{{ success_message }}</span>
+        </div>
+        {% endif %}
+
+        {% if error_message %}
+        <div class="mb-4 p-4 rounded-lg bg-red-50 border border-red-200 text-red-800 text-sm flex items-center gap-2" role="alert">
+            <svg class="w-5 h-5 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
+                <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clip-rule="evenodd"/>
+            </svg>
+            <span>{{ error_message }}</span>
+        </div>
+        {% endif %}
+
+        {% block content %}{% endblock %}
+    </main>
+
+    <!-- Мобильное меню: toggle -->
+    {% if user %}
+    <script>
+        const mobileMenuBtn = document.getElementById('mobileMenuBtn');
+        const mobileMenu = document.getElementById('mobileMenu');
+        if (mobileMenuBtn && mobileMenu) {
+            mobileMenuBtn.addEventListener('click', () => {
+                mobileMenu.classList.toggle('hidden');
+            });
+        }
+    </script>
+    {% endif %}
+
+    {% block scripts %}{% endblock %}
+</body>
+</html>

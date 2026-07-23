@@ -1,0 +1,458 @@
+{% extends "base.html" %}
+
+{% block title %}Загрузка файлов — Marketplace Sync{% endblock %}
+
+{% block content %}
+<div class="max-w-3xl mx-auto">
+    <!-- Заголовок -->
+    <div class="mb-6">
+        <h1 class="text-2xl font-bold text-slate-900">Загрузка файлов</h1>
+        <p class="mt-1 text-sm text-slate-500">
+            Загрузите Excel-файлы маркетплейсов и XML-каталог для синхронизации
+        </p>
+    </div>
+
+    <!-- Шаг 1: Загрузка файлов -->
+    <div class="bg-white rounded-xl border border-slate-200 shadow-sm p-6 mb-6">
+        <div class="flex items-center gap-2 mb-4">
+            <span class="flex-shrink-0 w-6 h-6 rounded-full bg-brand-600 text-white text-xs font-bold flex items-center justify-center">1</span>
+            <h2 class="text-base font-semibold text-slate-900">Загрузите файлы маркетплейсов</h2>
+        </div>
+
+        <!-- Зона drag&drop -->
+        <div class="drop-zone" id="dropZone">
+            <svg class="mx-auto w-10 h-10 text-slate-400 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+                      d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/>
+            </svg>
+            <p class="text-sm font-medium text-slate-600 mb-1">
+                Перетащите файлы сюда или нажмите для выбора
+            </p>
+            <p class="text-xs text-slate-400">
+                .xlsx (WB, Ozon, Яндекс) и .xml (каталог МВМ) — до 250 МБ
+            </p>
+            <input type="file" id="fileInput" multiple accept=".xlsx,.xml" class="hidden">
+        </div>
+
+        <!-- Список загруженных файлов -->
+        <div id="fileList" class="mt-4 space-y-2 hidden"></div>
+
+        <!-- Статус загрузки -->
+        <div id="uploadStatus" class="mt-4 hidden"></div>
+    </div>
+
+    <!-- Шаг 2: Выбор схемы и запуск -->
+    <div class="bg-white rounded-xl border border-slate-200 shadow-sm p-6 mb-6">
+        <div class="flex items-center gap-2 mb-4">
+            <span class="flex-shrink-0 w-6 h-6 rounded-full bg-brand-600 text-white text-xs font-bold flex items-center justify-center">2</span>
+            <h2 class="text-base font-semibold text-slate-900">Выберите схему и запустите обработку</h2>
+        </div>
+
+        <!-- Выбор схемы -->
+        <div class="mb-4">
+            <label for="schemaSelect" class="block text-sm font-medium text-slate-700 mb-1.5">
+                Схема сопоставлений
+            </label>
+            <select id="schemaSelect"
+                    class="w-full px-4 py-2.5 border border-slate-300 rounded-lg text-sm
+                           focus:outline-none focus:ring-2 focus:ring-brand-500/20 focus:border-brand-500
+                           transition-colors">
+                <option value="">— Выберите схему —</option>
+                {% for schema in schemas %}
+                <option value="{{ schema.id }}" data-type="{{ schema.schema_type or 'standard' }}">
+                    {% if schema.schema_type == 'mvm' %}📦{% else %}📋{% endif %}
+                    {{ schema.name }}
+                </option>
+                {% endfor %}
+                {% if not schemas %}
+                <option value="" disabled>Нет доступных схем</option>
+                {% endif %}
+            </select>
+            <p class="mt-1 text-xs text-slate-400" id="schemaHint"></p>
+        </div>
+
+        <!-- Кнопка обработки -->
+        <button
+            id="processBtn"
+            disabled
+            class="w-full py-2.5 px-4 bg-brand-600 text-white font-semibold rounded-lg
+                   hover:bg-brand-700 focus:outline-none focus:ring-2 focus:ring-brand-500/50
+                   transition-colors text-sm disabled:bg-slate-300 disabled:cursor-not-allowed"
+        >
+            🚀 Обработать
+        </button>
+    </div>
+
+    <!-- Шаг 3: Прогресс (скрыт по умолчанию) -->
+    <div id="progressSection" class="bg-white rounded-xl border border-slate-200 shadow-sm p-6 hidden">
+        <div class="flex items-center gap-2 mb-4">
+            <span class="flex-shrink-0 w-6 h-6 rounded-full bg-brand-600 text-white text-xs font-bold flex items-center justify-center">3</span>
+            <h2 class="text-base font-semibold text-slate-900">Обработка</h2>
+        </div>
+
+        <!-- Прогресс-бар -->
+        <div class="mb-3">
+            <div class="progress-bar-container">
+                <div id="progressBar" class="progress-bar-fill" style="width: 0%"></div>
+            </div>
+        </div>
+
+        <!-- Текст статуса -->
+        <p id="progressText" class="text-sm text-slate-600 flex items-center gap-2">
+            <span class="pulse-dot"></span>
+            Ожидание начала обработки...
+        </p>
+
+        <!-- Результат (скрыт до завершения) -->
+        <div id="resultSection" class="mt-4 hidden">
+            <div id="resultSuccess" class="hidden p-4 rounded-lg bg-green-50 border border-green-200">
+                <p class="text-sm font-medium text-green-800 mb-2" id="resultMessage"></p>
+                <a href="/tasks" class="inline-flex items-center gap-1.5 text-sm font-medium text-green-700 hover:text-green-800 hover:underline">
+                    Скачать результаты →
+                </a>
+            </div>
+            <div id="resultError" class="hidden p-4 rounded-lg bg-red-50 border border-red-200">
+                <p class="text-sm font-medium text-red-800" id="errorMessage"></p>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    const csrfToken = '{{ csrf_token }}';
+    let uploadedFiles = {};
+    let xmlFilePath = null;
+
+    // === DOM элементы ===
+    const dropZone = document.getElementById('dropZone');
+    const fileInput = document.getElementById('fileInput');
+    const fileList = document.getElementById('fileList');
+    const uploadStatus = document.getElementById('uploadStatus');
+    const schemaSelect = document.getElementById('schemaSelect');
+    const schemaHint = document.getElementById('schemaHint');
+    const processBtn = document.getElementById('processBtn');
+    const progressSection = document.getElementById('progressSection');
+    const progressBar = document.getElementById('progressBar');
+    const progressText = document.getElementById('progressText');
+    const resultSection = document.getElementById('resultSection');
+    const resultSuccess = document.getElementById('resultSuccess');
+    const resultError = document.getElementById('resultError');
+    const resultMessage = document.getElementById('resultMessage');
+    const errorMessage = document.getElementById('errorMessage');
+
+    // === Drag & Drop ===
+    dropZone.addEventListener('click', () => fileInput.click());
+
+    dropZone.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        dropZone.classList.add('drag-over');
+    });
+
+    dropZone.addEventListener('dragleave', () => {
+        dropZone.classList.remove('drag-over');
+    });
+
+    dropZone.addEventListener('drop', (e) => {
+        e.preventDefault();
+        dropZone.classList.remove('drag-over');
+        handleFiles(e.dataTransfer.files);
+    });
+
+    fileInput.addEventListener('change', (e) => {
+        handleFiles(e.target.files);
+    });
+
+    // === Загрузка файлов ===
+    async function handleFiles(files) {
+        if (!files.length) return;
+
+        const formData = new FormData();
+        for (const file of files) {
+            formData.append('files[]', file);
+        }
+
+        showUploadStatus('info', 'Загрузка файлов...');
+
+        try {
+            const resp = await fetch('/upload/files', {
+                method: 'POST',
+                headers: { 'X-CSRF-Token': csrfToken },
+                body: formData,
+            });
+
+            const data = await resp.json();
+
+            if (data.error) {
+                showUploadStatus('error', data.error);
+                return;
+            }
+
+            uploadedFiles = data.files || {};
+            xmlFilePath = data.xml || null;
+
+            renderFileList();
+
+            if (data.errors && data.errors.length > 0) {
+                showUploadStatus('warning', 'Предупреждения: ' + data.errors.join('; '));
+            } else {
+                const count = Object.keys(uploadedFiles).length;
+                let msg = `Загружено: ${count} МП-файлов`;
+                if (xmlFilePath) msg += ' + XML';
+                showUploadStatus('success', msg);
+            }
+
+            updateProcessBtn();
+        } catch (e) {
+            showUploadStatus('error', 'Ошибка сети: ' + e.message);
+        }
+    }
+
+    // === Отображение загруженных файлов ===
+    function renderFileList() {
+        const mpLabels = {
+            wildberries: { name: 'Wildberries', color: 'bg-purple-50 text-purple-700' },
+            ozon: { name: 'Ozon', color: 'bg-blue-50 text-blue-700' },
+            yandex: { name: 'Яндекс', color: 'bg-yellow-50 text-yellow-700' },
+        };
+
+        let html = '';
+
+        for (const [mp, path] of Object.entries(uploadedFiles)) {
+            const label = mpLabels[mp] || { name: mp, color: 'bg-slate-100 text-slate-600' };
+            const filename = path.split('/').pop();
+            html += `
+                <div class="flex items-center justify-between p-3 bg-slate-50 rounded-lg">
+                    <div class="flex items-center gap-2 min-w-0">
+                        <svg class="w-4 h-4 text-slate-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                  d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+                        </svg>
+                        <span class="text-sm text-slate-700 truncate-text">${filename}</span>
+                    </div>
+                    <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${label.color}">
+                        ${label.name}
+                    </span>
+                </div>
+            `;
+        }
+
+        if (xmlFilePath) {
+            const filename = xmlFilePath.split('/').pop();
+            html += `
+                <div class="flex items-center justify-between p-3 bg-slate-50 rounded-lg">
+                    <div class="flex items-center gap-2 min-w-0">
+                        <svg class="w-4 h-4 text-slate-400 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                  d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"/>
+                        </svg>
+                        <span class="text-sm text-slate-700 truncate-text">${filename}</span>
+                    </div>
+                    <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-50 text-green-700">
+                        XML
+                    </span>
+                </div>
+            `;
+        }
+
+        fileList.innerHTML = html;
+        fileList.classList.remove('hidden');
+    }
+
+    // === Статус загрузки ===
+    function showUploadStatus(type, message) {
+        const styles = {
+            info: 'bg-blue-50 border-blue-200 text-blue-800',
+            success: 'bg-green-50 border-green-200 text-green-800',
+            warning: 'bg-amber-50 border-amber-200 text-amber-800',
+            error: 'bg-red-50 border-red-200 text-red-800',
+        };
+
+        uploadStatus.className = `mt-4 p-3 rounded-lg border text-sm ${styles[type] || styles.info}`;
+        uploadStatus.textContent = message;
+        uploadStatus.classList.remove('hidden');
+    }
+
+    // === Выбор схемы ===
+    schemaSelect.addEventListener('change', () => {
+        const selected = schemaSelect.options[schemaSelect.selectedIndex];
+        const type = selected?.dataset?.type;
+
+        if (type === 'mvm') {
+            schemaHint.textContent = 'МВМ-схема: требуется XML файл каталога';
+            schemaHint.className = 'mt-1 text-xs text-purple-600';
+        } else if (type === 'standard') {
+            schemaHint.textContent = '';
+        } else {
+            schemaHint.textContent = '';
+        }
+
+        updateProcessBtn();
+    });
+
+    // === Проверка готовности ===
+    function updateProcessBtn() {
+        const hasFiles = Object.keys(uploadedFiles).length >= 2;
+        const hasSchema = schemaSelect.value !== '';
+
+        // Для МВМ-схемы проверяем наличие XML
+        const selected = schemaSelect.options[schemaSelect.selectedIndex];
+        const isMvm = selected?.dataset?.type === 'mvm';
+        const needsXml = isMvm && !xmlFilePath;
+
+        if (needsXml) {
+            processBtn.disabled = true;
+            schemaHint.textContent = 'МВМ-схема: загрузите XML файл каталога';
+            schemaHint.className = 'mt-1 text-xs text-red-500';
+            return;
+        }
+
+        processBtn.disabled = !(hasFiles && hasSchema);
+    }
+
+    // === Запуск обработки ===
+    processBtn.addEventListener('click', async () => {
+        const schemaId = parseInt(schemaSelect.value);
+        if (!schemaId) return;
+
+        processBtn.disabled = true;
+        processBtn.textContent = '⏳ Создание задачи...';
+
+        try {
+            const resp = await fetch('/upload/process', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRF-Token': csrfToken,
+                },
+                body: JSON.stringify({
+                    schema_id: schemaId,
+                    files: uploadedFiles,
+                    xml: xmlFilePath,
+                }),
+            });
+
+            const data = await resp.json();
+
+            if (data.error) {
+                showUploadStatus('error', data.error);
+                processBtn.disabled = false;
+                processBtn.textContent = '🚀 Обработать';
+                return;
+            }
+
+            // Показываем секцию прогресса
+            progressSection.classList.remove('hidden');
+            processBtn.textContent = '✅ Задача создана';
+
+            // Подключаем WebSocket
+            connectWebSocket(data.task_id);
+
+        } catch (e) {
+            showUploadStatus('error', 'Ошибка: ' + e.message);
+            processBtn.disabled = false;
+            processBtn.textContent = '🚀 Обработать';
+        }
+    });
+
+    // === WebSocket для прогресса ===
+    function connectWebSocket(taskId) {
+        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(`${protocol}//${location.host}/ws/tasks/${taskId}`);
+
+        ws.onmessage = (event) => {
+            const msg = JSON.parse(event.data);
+
+            switch (msg.type) {
+                case 'progress':
+                    progressText.innerHTML = `<span class="pulse-dot"></span> ${msg.message}`;
+                    // Примерный прогресс по ключевым словам
+                    updateProgressByMessage(msg.message);
+                    break;
+
+                case 'files_ready':
+                    progressBar.style.width = '90%';
+                    progressText.textContent = `Файлы готовы (${msg.count} шт.)`;
+                    break;
+
+                case 'completed':
+                    progressBar.style.width = '100%';
+                    progressBar.classList.add('completed');
+                    progressText.innerHTML = '✅ Обработка завершена';
+                    resultSection.classList.remove('hidden');
+                    resultSuccess.classList.remove('hidden');
+                    resultMessage.textContent = msg.message || 'Синхронизация завершена успешно!';
+                    break;
+
+                case 'error':
+                    progressBar.classList.add('error');
+                    progressText.innerHTML = '❌ Ошибка обработки';
+                    resultSection.classList.remove('hidden');
+                    resultError.classList.remove('hidden');
+                    errorMessage.textContent = msg.message;
+                    break;
+            }
+        };
+
+        ws.onerror = () => {
+            // Fallback на polling
+            startPolling(taskId);
+        };
+
+        ws.onclose = () => {
+            // Если ещё нет результата — включаем polling
+            if (resultSection.classList.contains('hidden')) {
+                startPolling(taskId);
+            }
+        };
+    }
+
+    // === Polling fallback ===
+    function startPolling(taskId) {
+        const interval = setInterval(async () => {
+            try {
+                const resp = await fetch(`/api/tasks/${taskId}/status`, {
+                    headers: { 'Accept': 'application/json' },
+                });
+                const data = await resp.json();
+
+                if (data.status === 'completed') {
+                    clearInterval(interval);
+                    progressBar.style.width = '100%';
+                    progressBar.classList.add('completed');
+                    progressText.innerHTML = '✅ Обработка завершена';
+                    resultSection.classList.remove('hidden');
+                    resultSuccess.classList.remove('hidden');
+                    resultMessage.textContent = 'Синхронизация завершена!';
+                } else if (data.status === 'failed') {
+                    clearInterval(interval);
+                    progressBar.classList.add('error');
+                    progressText.innerHTML = '❌ Ошибка обработки';
+                    resultSection.classList.remove('hidden');
+                    resultError.classList.remove('hidden');
+                    errorMessage.textContent = data.error_message || 'Неизвестная ошибка';
+                }
+            } catch (e) { /* ignore */ }
+        }, 5000);
+    }
+
+    // === Примерный прогресс по сообщению ===
+    function updateProgressByMessage(message) {
+        const lower = message.toLowerCase();
+        if (lower.includes('загрузка') || lower.includes('чтение')) {
+            progressBar.style.width = '10%';
+        } else if (lower.includes('артикул')) {
+            progressBar.style.width = '20%';
+        } else if (lower.includes('габарит')) {
+            progressBar.style.width = '35%';
+        } else if (lower.includes('синхрониз') || lower.includes('столбц')) {
+            progressBar.style.width = '55%';
+        } else if (lower.includes('xml')) {
+            progressBar.style.width = '70%';
+        } else if (lower.includes('сохран') || lower.includes('валидац')) {
+            progressBar.style.width = '85%';
+        }
+    }
+</script>
+{% endblock %}

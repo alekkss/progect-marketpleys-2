@@ -100,7 +100,6 @@ Telegram-бот и веб-приложение для автоматическо
 ├── /web/                             # === ВЕБ-ПРИЛОЖЕНИЕ (НОВОЕ) ===
 │   ├── __init__.py                   # Пакет, экспорт create_web_app
 │   ├── app.py                        # Создание aiohttp Application (Factory)
-│   ├── forms.py                      # Валидация форм (без Pydantic)
 │   │
 │   ├── /auth/
 │   │   ├── __init__.py               # Пакет аутентификации, экспорты
@@ -135,9 +134,10 @@ Telegram-бот и веб-приложение для автоматическо
 │   │   ├── dashboard.html
 │   │   ├── /schemas/
 │   │   │   ├── list.html
-│   │   │   ├── create.html           # Wizard стандартной схемы
-│   │   │   ├── create_mvm.html       # Wizard МВМ-схемы
-│   │   │   └── edit.html             # Редактирование сопоставлений
+│   │   │   ├── detail.html           # Просмотр схемы (группы сопоставлений)
+│   │   │   ├── create.html           # Wizard стандартной схемы (Фаза будущая)
+│   │   │   ├── create_mvm.html       # Wizard МВМ-схемы (Фаза будущая)
+│   │   │   └── edit.html             # Редактирование сопоставлений (Фаза будущая)
 │   │   ├── /upload/
 │   │   │   └── index.html            # Drag&drop + выбор схемы
 │   │   ├── /tasks/
@@ -148,11 +148,8 @@ Telegram-бот и веб-приложение для автоматическо
 │   └── /static/
 │       ├── /css/
 │       │   └── style.css             # Кастомные стили (Tailwind через CDN)
-│       └── /js/
-│           ├── upload.js             # Drag&drop, progress bar, multipart upload
-│           ├── websocket.js          # WebSocket client для прогресса
-│           ├── schemas.js            # Интерактивные сопоставления
-│           └── categories.js         # Поиск категорий XML (debounce + toggle)
+│       └── /js/                      # Зарезервировано для будущего выноса JS
+│                                     # Текущая логика встроена в шаблоны ({% block scripts %})
 │
 ├── /shared/                          # === ОБЩИЕ АДАПТЕРЫ (НОВОЕ) ===
 │   ├── __init__.py
@@ -631,6 +628,14 @@ async def create_web_app(
 | GET | `/ws/tasks/{id}` | WebSocket прогресса | Да |
 
 *Регистрация доступна только если `WEB_REGISTRATION_OPEN=true`
+
+### Jinja2 глобальные функции
+
+Регистрируются в `web/app.py → _setup_jinja2()`:
+
+| Функция | Источник | Назначение |
+|---------|----------|-----------|
+| `_shorten_filename(filename)` | `web/routes/tasks.py` | Сокращает имя файла для кнопок скачивания (WB/Ozon/Яндекс/Отчёт) |
 
 ### Аутентификация
 
@@ -1113,6 +1118,10 @@ Facade-оркестратор. Создаёт компоненты `sync/`, ко
 - Определение МП по имени файла: ключевые слова wb/ozon/yandex (регистронезависимо)
 - Admin НЕ может: заблокировать owner, изменить роль owner, изменить свою роль
 - При блокировке пользователя все его сессии удаляются (принудительный logout)
+- Jinja2 globals регистрируются ТОЛЬКО в `web/app.py → _setup_jinja2()` — НЕ в route-модулях
+- `base.html` ожидает `user` и `csrf_token` в контексте каждого шаблона (передаются из route-обработчиков)
+- Flash-сообщения передаются через переменные контекста `success_message` / `error_message`, НЕ через отдельный механизм сессий
+- Навигация в `base.html` подсвечивает активную ссылку через `request.path` — пути маршрутов НЕ менять без обновления шаблона
 
 ### Критичные зависимости
 
@@ -1128,6 +1137,11 @@ Facade-оркестратор. Создаёт компоненты `sync/`, ко
 - `web/routes/schemas.py` использует `storage.db.pool.acquire()` напрямую для `_get_schema_meta` (нет отдельного метода в Database)
 - `web/routes/admin.py` использует `storage.db.pool.acquire()` для UPDATE role (нет отдельного метода)
 - CSRF middleware выполняется ПОСЛЕ auth — порядок в `setup_middlewares()` критичен
+- Все route-обработчики, рендерящие HTML, ОБЯЗАНЫ передавать `"user": user_data` в контекст — `base.html` использует это для навигации
+- `admin/users.html` читает flash из `success_message`/`error_message` контекста — POST-обработчики передают их через query params `?success=`/`?error=`, GET-обработчик извлекает и кладёт в контекст
+- `schemas/detail.html` ожидает `groups` в формате `[{"key", "label", "items": [{"columns": [{"mp", "name"}], "confidence"}]}]` — подготовка в `_prepare_groups_for_template()`
+- `tasks/list.html` использует `{{ _shorten_filename(filename) }}` — функция должна быть в Jinja2 globals
+- Tailwind CSS подключён через CDN в `base.html` — при отсутствии интернета на клиенте стили не загрузятся
 
 ---
 
@@ -1141,7 +1155,7 @@ Facade-оркестратор. Создаёт компоненты `sync/`, ко
 - ✅ Фаза 3: Бизнес-маршруты (dashboard, schemas CRUD, upload + process, tasks + download, admin users, CSRF middleware)
 
 ### v5.0 — Веб-интерфейс
-- ✅ Фаза 4: Шаблоны и фронтенд (HTML, CSS, JavaScript)
+- ✅ Фаза 4: Шаблоны и фронтенд (base.html, auth, dashboard, schemas list/detail, upload, tasks, admin, style.css). Маршруты переведены на aiohttp_jinja2.render_template(). JS встроен в шаблоны через {% block scripts %}.
 - ✅ Фаза 5: Nginx + SSL + systemd
 - ✅ Фаза 6: Интеграция, тестирование, deploy
 
@@ -1179,6 +1193,8 @@ Facade-оркестратор. Создаёт компоненты `sync/`, ко
 - Минимум 2 МП-файла для запуска обработки (из 3 возможных)
 - Файлы результатов удаляются `_FileCleanupService` через FILE_MAX_AGE_DAYS — ссылки на скачивание перестают работать
 - Polling fallback для задач: каждые 5 секунд (если WebSocket недоступен)
+- Tailwind CSS загружается через CDN (cdn.tailwindcss.com) — требуется интернет на стороне клиента
+- Шаблоны create.html, create_mvm.html, edit.html для схем пока не реализованы — создание/редактирование схем доступно только через Telegram-бота
 
 ---
 
@@ -1223,6 +1239,9 @@ Double Submit Cookie: при GET генерируется токен в cookie (
 
 **Может ли admin заблокировать другого admin?**
 Нет. Только owner может блокировать admin. Admin может блокировать editor и user. Owner не может быть заблокирован никем.
+
+**Можно ли создать схему через веб-интерфейс?**
+Пока нет. Просмотр и удаление схем доступны. Создание и редактирование (AI wizard) требуют шаблонов `create.html`, `create_mvm.html`, `edit.html` — будут реализованы в следующих итерациях. Сейчас создание — через Telegram-бота.
 
 ---
 

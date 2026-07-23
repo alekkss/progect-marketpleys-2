@@ -1,0 +1,242 @@
+{% extends "base.html" %}
+
+{% block title %}Схемы — Marketplace Sync{% endblock %}
+
+{% block content %}
+<!-- Заголовок -->
+<div class="flex items-center justify-between mb-6">
+    <div>
+        <h1 class="text-2xl font-bold text-slate-900">Схемы сопоставлений</h1>
+        <p class="mt-1 text-sm text-slate-500">
+            {% if schemas %}
+                {{ schemas|length }} {{ 'схема' if schemas|length == 1 else ('схемы' if schemas|length < 5 else 'схем') }}
+            {% else %}
+                Нет доступных схем
+            {% endif %}
+        </p>
+    </div>
+</div>
+
+<!-- Таблица схем -->
+{% if schemas %}
+<div class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+    <div class="overflow-x-auto">
+        <table class="w-full table-hover">
+            <thead>
+                <tr class="border-b border-slate-200">
+                    <th class="px-6 py-3.5 text-left text-xs font-semibold text-slate-500 uppercase tracking-wider">
+                        Название
+                    </th>
+                    <th class="px-6 py-3.5 text-left text-xs font-semibold text-slate-500 uppercase tracking-wider">
+                        Тип
+                    </th>
+                    {% if can_see_all %}
+                    <th class="px-6 py-3.5 text-left text-xs font-semibold text-slate-500 uppercase tracking-wider">
+                        Владелец
+                    </th>
+                    {% endif %}
+                    <th class="px-6 py-3.5 text-left text-xs font-semibold text-slate-500 uppercase tracking-wider">
+                        Обновлена
+                    </th>
+                    <th class="px-6 py-3.5 text-right text-xs font-semibold text-slate-500 uppercase tracking-wider w-20">
+                        <!-- Действия -->
+                    </th>
+                </tr>
+            </thead>
+            <tbody class="divide-y divide-slate-100">
+                {% for schema in schemas %}
+                <tr id="schema-row-{{ schema.id }}">
+                    <!-- Название -->
+                    <td class="px-6 py-4">
+                        <a href="/schemas/{{ schema.id }}"
+                           class="text-sm font-medium text-brand-600 hover:text-brand-700 hover:underline transition-colors">
+                            {% if schema.schema_type == 'mvm' %}📦{% else %}📋{% endif %}
+                            {{ schema.name }}
+                        </a>
+                    </td>
+
+                    <!-- Тип -->
+                    <td class="px-6 py-4">
+                        {% if schema.schema_type == 'mvm' %}
+                            <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-purple-50 text-purple-700">
+                                МВМ
+                            </span>
+                        {% else %}
+                            <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-slate-100 text-slate-600">
+                                Стандартная
+                            </span>
+                        {% endif %}
+                    </td>
+
+                    <!-- Владелец (только для editor+) -->
+                    {% if can_see_all %}
+                    <td class="px-6 py-4 text-sm text-slate-500">
+                        {{ schema.owner_name or '—' }}
+                    </td>
+                    {% endif %}
+
+                    <!-- Дата обновления -->
+                    <td class="px-6 py-4 text-sm text-slate-500 whitespace-nowrap">
+                        {{ schema.updated_at[:16] if schema.updated_at else '—' }}
+                    </td>
+
+                    <!-- Действия -->
+                    <td class="px-6 py-4 text-right">
+                        <button
+                            onclick="deleteSchema({{ schema.id }}, '{{ schema.name }}')"
+                            class="btn-icon btn-icon-danger"
+                            title="Удалить схему"
+                        >
+                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                      d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+                            </svg>
+                        </button>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% else %}
+<!-- Пустое состояние -->
+<div class="bg-white rounded-xl border border-slate-200 shadow-sm p-12 text-center">
+    <svg class="mx-auto w-16 h-16 text-slate-300 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+              d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+    </svg>
+    <h3 class="text-lg font-semibold text-slate-700 mb-1">Схем пока нет</h3>
+    <p class="text-sm text-slate-500 mb-4">
+        Создайте первую схему сопоставлений через Telegram-бота
+    </p>
+    <p class="text-xs text-slate-400">
+        Команда /start → Управление схемами → Создать схему
+    </p>
+</div>
+{% endif %}
+
+<!-- Модальное окно подтверждения удаления -->
+<div id="deleteModal" class="modal-backdrop">
+    <div class="fixed inset-0 flex items-center justify-center p-4 z-[101]">
+        <div class="modal-content bg-white rounded-xl shadow-xl border border-slate-200 w-full max-w-sm p-6">
+            <div class="flex items-center gap-3 mb-4">
+                <div class="flex-shrink-0 w-10 h-10 rounded-full bg-red-100 flex items-center justify-center">
+                    <svg class="w-5 h-5 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                              d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"/>
+                    </svg>
+                </div>
+                <div>
+                    <h3 class="text-base font-semibold text-slate-900">Удалить схему?</h3>
+                    <p class="text-sm text-slate-500" id="deleteSchemaName"></p>
+                </div>
+            </div>
+            <p class="text-sm text-slate-600 mb-6">
+                Это действие нельзя отменить. Все сопоставления схемы будут удалены.
+            </p>
+            <div class="flex gap-3 justify-end">
+                <button
+                    onclick="closeDeleteModal()"
+                    class="px-4 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-300 rounded-lg
+                           hover:bg-slate-50 transition-colors"
+                >
+                    Отмена
+                </button>
+                <button
+                    id="confirmDeleteBtn"
+                    onclick="confirmDelete()"
+                    class="px-4 py-2 text-sm font-medium text-white bg-red-600 rounded-lg
+                           hover:bg-red-700 transition-colors"
+                >
+                    Удалить
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    const csrfToken = '{{ csrf_token }}';
+    let deleteSchemaId = null;
+
+    /**
+     * Открывает модальное окно подтверждения удаления.
+     */
+    function deleteSchema(schemaId, schemaName) {
+        deleteSchemaId = schemaId;
+        document.getElementById('deleteSchemaName').textContent = schemaName;
+        document.getElementById('deleteModal').classList.add('active');
+    }
+
+    /**
+     * Закрывает модальное окно.
+     */
+    function closeDeleteModal() {
+        deleteSchemaId = null;
+        document.getElementById('deleteModal').classList.remove('active');
+    }
+
+    /**
+     * Отправляет DELETE-запрос и удаляет строку из таблицы.
+     */
+    async function confirmDelete() {
+        if (!deleteSchemaId) return;
+
+        const btn = document.getElementById('confirmDeleteBtn');
+        btn.disabled = true;
+        btn.textContent = 'Удаление...';
+
+        try {
+            const response = await fetch(`/api/schemas/${deleteSchemaId}`, {
+                method: 'DELETE',
+                headers: {
+                    'X-CSRF-Token': csrfToken,
+                    'Accept': 'application/json',
+                },
+            });
+
+            const data = await response.json();
+
+            if (data.success) {
+                // Удаляем строку из таблицы с анимацией
+                const row = document.getElementById(`schema-row-${deleteSchemaId}`);
+                if (row) {
+                    row.style.transition = 'opacity 0.3s, transform 0.3s';
+                    row.style.opacity = '0';
+                    row.style.transform = 'translateX(-10px)';
+                    setTimeout(() => row.remove(), 300);
+                }
+                closeDeleteModal();
+
+                // Если таблица пуста — перезагрузка покажет пустое состояние
+                setTimeout(() => {
+                    const tbody = document.querySelector('tbody');
+                    if (tbody && tbody.children.length === 0) {
+                        location.reload();
+                    }
+                }, 400);
+            } else {
+                alert('Ошибка: ' + (data.error || 'Неизвестная ошибка'));
+            }
+        } catch (e) {
+            alert('Ошибка сети: ' + e.message);
+        } finally {
+            btn.disabled = false;
+            btn.textContent = 'Удалить';
+        }
+    }
+
+    // Закрытие модалки по Escape
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') closeDeleteModal();
+    });
+
+    // Закрытие модалки по клику на backdrop
+    document.getElementById('deleteModal').addEventListener('click', (e) => {
+        if (e.target === e.currentTarget) closeDeleteModal();
+    });
+</script>
+{% endblock %}

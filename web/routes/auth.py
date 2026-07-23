@@ -17,12 +17,14 @@
 
 from typing import TYPE_CHECKING
 
+import aiohttp_jinja2
 from aiohttp import web
 from aiohttp.web import Request, Response
 
 from config.config import Config
 from web.auth.password import PasswordHasher
 from web.auth.session import WebSessionManager
+from web.middleware.csrf import get_csrf_token
 from utils.logger_config import setup_logger
 
 if TYPE_CHECKING:
@@ -55,9 +57,16 @@ async def login_page(request: Request) -> Response:
 
     error = request.query.get("error", "")
     next_url = request.query.get("next", "/dashboard")
+    csrf_token = get_csrf_token(request)
 
-    html = _render_login_page(error=error, next_url=next_url)
-    return Response(text=html, content_type="text/html")
+    context = {
+        "error": error,
+        "next_url": next_url,
+        "csrf_token": csrf_token,
+        "registration_open": Config.WEB_REGISTRATION_OPEN,
+    }
+
+    return aiohttp_jinja2.render_template("auth/login.html", request, context)
 
 
 async def login_handler(request: Request) -> Response:
@@ -166,8 +175,14 @@ async def register_page(request: Request) -> Response:
         raise web.HTTPFound("/dashboard")
 
     error = request.query.get("error", "")
-    html = _render_register_page(error=error)
-    return Response(text=html, content_type="text/html")
+    csrf_token = get_csrf_token(request)
+
+    context = {
+        "error": error,
+        "csrf_token": csrf_token,
+    }
+
+    return aiohttp_jinja2.render_template("auth/register.html", request, context)
 
 
 async def register_handler(request: Request) -> Response:
@@ -297,290 +312,3 @@ def setup_auth_routes(app: web.Application) -> None:
     app.router.add_get("/auth/register", register_page)
     app.router.add_post("/auth/register", register_handler)
     app.router.add_post("/auth/logout", logout_handler)
-
-
-# ===================================================================
-# Временные HTML-шаблоны (будут заменены на Jinja2 в Фазе 4)
-# ===================================================================
-
-
-def _render_login_page(error: str = "", next_url: str = "/dashboard") -> str:
-    """Генерирует HTML страницы входа."""
-    error_html = ""
-    if error:
-        error_html = f"""
-        <div class="error-message">{error}</div>
-        """
-
-    return f"""<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Вход — Marketplace Sync</title>
-    <style>
-        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background-color: #f1f5f9;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            min-height: 100vh;
-            padding: 1rem;
-        }}
-        .auth-card {{
-            background: white;
-            border-radius: 1rem;
-            box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);
-            padding: 2.5rem;
-            width: 100%;
-            max-width: 400px;
-        }}
-        .auth-title {{
-            font-size: 1.5rem;
-            font-weight: 700;
-            color: #1e293b;
-            text-align: center;
-            margin-bottom: 0.5rem;
-        }}
-        .auth-subtitle {{
-            font-size: 0.875rem;
-            color: #64748b;
-            text-align: center;
-            margin-bottom: 2rem;
-        }}
-        .form-group {{
-            margin-bottom: 1.25rem;
-        }}
-        .form-label {{
-            display: block;
-            font-size: 0.875rem;
-            font-weight: 500;
-            color: #374151;
-            margin-bottom: 0.375rem;
-        }}
-        .form-input {{
-            width: 100%;
-            padding: 0.75rem 1rem;
-            border: 1px solid #d1d5db;
-            border-radius: 0.5rem;
-            font-size: 1rem;
-            transition: border-color 0.2s;
-            outline: none;
-        }}
-        .form-input:focus {{
-            border-color: #3b82f6;
-            box-shadow: 0 0 0 3px rgba(59,130,246,0.1);
-        }}
-        .btn-primary {{
-            width: 100%;
-            padding: 0.75rem 1.5rem;
-            background-color: #3b82f6;
-            color: white;
-            border: none;
-            border-radius: 0.5rem;
-            font-size: 1rem;
-            font-weight: 600;
-            cursor: pointer;
-            transition: background-color 0.2s;
-        }}
-        .btn-primary:hover {{
-            background-color: #2563eb;
-        }}
-        .error-message {{
-            background-color: #fef2f2;
-            border: 1px solid #fecaca;
-            color: #dc2626;
-            padding: 0.75rem 1rem;
-            border-radius: 0.5rem;
-            font-size: 0.875rem;
-            margin-bottom: 1.25rem;
-        }}
-        .auth-footer {{
-            text-align: center;
-            margin-top: 1.5rem;
-            font-size: 0.875rem;
-            color: #64748b;
-        }}
-        .auth-footer a {{
-            color: #3b82f6;
-            text-decoration: none;
-            font-weight: 500;
-        }}
-        .auth-footer a:hover {{
-            text-decoration: underline;
-        }}
-    </style>
-</head>
-<body>
-    <div class="auth-card">
-        <h1 class="auth-title">Marketplace Sync</h1>
-        <p class="auth-subtitle">Войдите в свой аккаунт</p>
-        {error_html}
-        <form method="POST" action="/auth/login">
-            <input type="hidden" name="next" value="{next_url}">
-            <div class="form-group">
-                <label class="form-label" for="email">Email</label>
-                <input class="form-input" type="email" id="email" name="email"
-                       required autocomplete="email" placeholder="user@example.com">
-            </div>
-            <div class="form-group">
-                <label class="form-label" for="password">Пароль</label>
-                <input class="form-input" type="password" id="password" name="password"
-                       required autocomplete="current-password" placeholder="Минимум 8 символов">
-            </div>
-            <button type="submit" class="btn-primary">Войти</button>
-        </form>
-        <div class="auth-footer">
-            <a href="/auth/register">Создать аккаунт</a>
-        </div>
-    </div>
-</body>
-</html>"""
-
-
-def _render_register_page(error: str = "") -> str:
-    """Генерирует HTML страницы регистрации."""
-    error_html = ""
-    if error:
-        error_html = f"""
-        <div class="error-message">{error}</div>
-        """
-
-    return f"""<!DOCTYPE html>
-<html lang="ru">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Регистрация — Marketplace Sync</title>
-    <style>
-        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background-color: #f1f5f9;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            min-height: 100vh;
-            padding: 1rem;
-        }}
-        .auth-card {{
-            background: white;
-            border-radius: 1rem;
-            box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);
-            padding: 2.5rem;
-            width: 100%;
-            max-width: 400px;
-        }}
-        .auth-title {{
-            font-size: 1.5rem;
-            font-weight: 700;
-            color: #1e293b;
-            text-align: center;
-            margin-bottom: 0.5rem;
-        }}
-        .auth-subtitle {{
-            font-size: 0.875rem;
-            color: #64748b;
-            text-align: center;
-            margin-bottom: 2rem;
-        }}
-        .form-group {{
-            margin-bottom: 1.25rem;
-        }}
-        .form-label {{
-            display: block;
-            font-size: 0.875rem;
-            font-weight: 500;
-            color: #374151;
-            margin-bottom: 0.375rem;
-        }}
-        .form-input {{
-            width: 100%;
-            padding: 0.75rem 1rem;
-            border: 1px solid #d1d5db;
-            border-radius: 0.5rem;
-            font-size: 1rem;
-            transition: border-color 0.2s;
-            outline: none;
-        }}
-        .form-input:focus {{
-            border-color: #3b82f6;
-            box-shadow: 0 0 0 3px rgba(59,130,246,0.1);
-        }}
-        .btn-primary {{
-            width: 100%;
-            padding: 0.75rem 1.5rem;
-            background-color: #3b82f6;
-            color: white;
-            border: none;
-            border-radius: 0.5rem;
-            font-size: 1rem;
-            font-weight: 600;
-            cursor: pointer;
-            transition: background-color 0.2s;
-        }}
-        .btn-primary:hover {{
-            background-color: #2563eb;
-        }}
-        .error-message {{
-            background-color: #fef2f2;
-            border: 1px solid #fecaca;
-            color: #dc2626;
-            padding: 0.75rem 1rem;
-            border-radius: 0.5rem;
-            font-size: 0.875rem;
-            margin-bottom: 1.25rem;
-        }}
-        .auth-footer {{
-            text-align: center;
-            margin-top: 1.5rem;
-            font-size: 0.875rem;
-            color: #64748b;
-        }}
-        .auth-footer a {{
-            color: #3b82f6;
-            text-decoration: none;
-            font-weight: 500;
-        }}
-        .auth-footer a:hover {{
-            text-decoration: underline;
-        }}
-    </style>
-</head>
-<body>
-    <div class="auth-card">
-        <h1 class="auth-title">Marketplace Sync</h1>
-        <p class="auth-subtitle">Создайте новый аккаунт</p>
-        {error_html}
-        <form method="POST" action="/auth/register">
-            <div class="form-group">
-                <label class="form-label" for="email">Email</label>
-                <input class="form-input" type="email" id="email" name="email"
-                       required autocomplete="email" placeholder="user@example.com">
-            </div>
-            <div class="form-group">
-                <label class="form-label" for="display_name">Имя (необязательно)</label>
-                <input class="form-input" type="text" id="display_name" name="display_name"
-                       autocomplete="name" placeholder="Как вас называть">
-            </div>
-            <div class="form-group">
-                <label class="form-label" for="password">Пароль</label>
-                <input class="form-input" type="password" id="password" name="password"
-                       required autocomplete="new-password" placeholder="Минимум 8 символов">
-            </div>
-            <div class="form-group">
-                <label class="form-label" for="password_confirm">Подтверждение пароля</label>
-                <input class="form-input" type="password" id="password_confirm"
-                       name="password_confirm" required autocomplete="new-password"
-                       placeholder="Повторите пароль">
-            </div>
-            <button type="submit" class="btn-primary">Зарегистрироваться</button>
-        </form>
-        <div class="auth-footer">
-            Уже есть аккаунт? <a href="/auth/login">Войти</a>
-        </div>
-    </div>
-</body>
-</html>"""

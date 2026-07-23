@@ -156,7 +156,9 @@ Telegram-бот и веб-приложение для автоматическо
 │
 ├── /shared/                          # === ОБЩИЕ АДАПТЕРЫ (НОВОЕ) ===
 │   ├── __init__.py
-│   ├── delivery.py                   # ResultDelivery (ABC), TelegramDelivery, WebDelivery
+│   ├── delivery.py                   # ResultDelivery (ABC), TelegramDelivery, WebDelivery,
+│   │                                 # ResultDeliveryFactory. Импорты Bot/Task через TYPE_CHECKING
+│   │                                 # для избежания циклических зависимостей.
 │   └── notifications.py              # NotificationService (Telegram / WebSocket)
 │
 ├── /services/                        # === БИЗНЕС-ЛОГИКА (минимальные изменения) ===
@@ -222,18 +224,17 @@ Telegram-бот и веб-приложение для автоматическо
    - Регистрация Telegram middleware и handlers
    - `ai_comparator` → `dp["ai_comparator"]` для DI в хендлеры
 
-6. **Создание веб-приложения** — `create_web_app(task_queue, ai_comparator, db)`:
-   - Инициализация `aiohttp.web.Application`
-   - Jinja2 templates, Redis-backed cookie sessions
-   - Middleware: auth → errors → csrf
-   - Routes: auth, dashboard, schemas, upload, tasks, admin, websocket, api
-   - Static files: `/static/` → `web/static/`
-   - Shared resources в app context: `task_queue`, `ai_comparator`, `db`
+6. **[Условно] Создание веб-приложения** (если `WEB_HOST` задан):
+   - Создание `WebSocketManager` — хранит активные WS-соединения `{task_id: [connections]}`
+   - `create_web_app(task_queue, ai_comparator, ws_manager)` — инициализация `aiohttp.web.Application`
+   - Jinja2 templates, middleware (auth → errors → csrf), routes
+   - Shared resources в app context: `task_queue`, `ai_comparator`, `ws_manager`, `db`
+   - Запуск `web.TCPSite(runner, WEB_HOST, WEB_PORT)`
+   - Graceful degradation: если ImportError (нет веб-зависимостей) или ошибка — бот продолжает без веба
 
-7. **Создание WebSocketManager** — хранит активные WS-соединения `{task_id: [connections]}`
-
-8. **Запуск TaskWorker** — `await task_worker.start(bot, ws_manager)`:
-   - Получает `bot` (для `TelegramDelivery`) и `ws_manager` (для `WebDelivery`)
+7. **Запуск TaskWorker** — `await task_worker.start(bot)`:
+   - `ws_manager` уже передан в конструктор `TaskWorker(..., ws_manager=ws_manager)`
+   - `bot` передаётся в `start(bot)` — сохраняется для `TelegramDelivery`
    - `ResultDeliveryFactory` выбирает стратегию по `task.delivery_channel`
    - `_FileCleanupService` — очистка файлов каждые 24ч
    - `Semaphore(MAX_CONCURRENT_TASKS)`
@@ -340,13 +341,20 @@ class WebDelivery(ResultDelivery):
     async def send_files(self, file_paths: List[str], caption: str = "") -> None:
         # Файлы уже на диске — просто обновляем статус в БД
         from bot import storage
+
+        output_files: Dict[str, str] = {}
+        for path in file_paths:
+            filename = Path(path).name
+            output_files[filename] = path
+
         await storage.db.update_task_result(
             self._task_id,
-            output_files={f"file_{i}": p for i, p in enumerate(file_paths)},
+            output_files=output_files,
         )
         await self._ws_manager.notify(self._task_id, {
             "type": "files_ready",
             "count": len(file_paths),
+            "filenames": [Path(p).name for p in file_paths],
         })
 
     async def send_result(self, text: str) -> None:
@@ -381,10 +389,12 @@ class ResultDeliveryFactory:
 Добавлены 2 поля:
 
 ```python
+DeliveryChannel = Literal["telegram", "web"]
+
 @dataclass
 class Task:
     # ... все существующие поля без изменений ...
-    delivery_channel: Literal["telegram", "web"] = "telegram"
+    delivery_channel: DeliveryChannel = "telegram"
     web_user_id: Optional[int] = None
 ```
 
@@ -396,7 +406,10 @@ class Task:
 
 - Вместо прямого `self._bot.send_message(...)` → `delivery.send_progress(...)`
 - Вместо `self._bot.send_document(...)` → `delivery.send_files(...)`
-- Конструктор принимает `ws_manager: Optional[WebSocketManager] = None`
+- Конструктор принимает `ws_manager: Optional[object] = None`
+- `ResultDelivery` создаётся через `ResultDeliveryFactory.create(task, bot, ws_manager)` в начале `_execute_task`
+- При невозможности создать канал доставки (неизвестный `delivery_channel`, отсутствие `bot`) — задача помечается `failed` без обработки
+- Все файлы результатов (3 МП + отчёт) отправляются одним вызовом `delivery.send_files(result_files)`
 
 Метод `_notify_user` удалён — заменён на `delivery.send_progress/send_result/send_error`.
 
@@ -515,25 +528,44 @@ async def get_user_task_results(self, web_user_id, limit=20) -> List[Dict]
 ```python
 # После создания бота и перед polling:
 web_runner = None
+ws_manager = None
+
 if Config.WEB_HOST:
-    from web.app import create_web_app
-    from web.routes.websocket import WebSocketManager
+    try:
+        from aiohttp import web
+        from web.app import create_web_app
 
-    ws_manager = WebSocketManager()
-    web_app = await create_web_app(task_queue, ai_comparator, ws_manager)
+        ws_manager_module = __import__(
+            'web.routes.websocket', fromlist=['WebSocketManager']
+        )
+        WebSocketManager = ws_manager_module.WebSocketManager
+        ws_manager = WebSocketManager()
 
-    web_runner = web.AppRunner(web_app)
-    await web_runner.setup()
-    site = web.TCPSite(web_runner, Config.WEB_HOST, Config.WEB_PORT)
-    await site.start()
-    logger.info("Веб-сервер: http://%s:%s", Config.WEB_HOST, Config.WEB_PORT)
-else:
-    ws_manager = None
+        web_app = await create_web_app(task_queue, ai_comparator, ws_manager)
+
+        web_runner = web.AppRunner(web_app)
+        await web_runner.setup()
+        site = web.TCPSite(web_runner, Config.WEB_HOST, Config.WEB_PORT)
+        await site.start()
+        logger.info("Веб-сервер: http://%s:%s", Config.WEB_HOST, Config.WEB_PORT)
+    except ImportError as e:
+        logger.warning(
+            "Не удалось импортировать веб-модули (%s). "
+            "Веб-сервер не запущен. Установите: "
+            "pip install aiohttp-jinja2 aiohttp-session bcrypt jinja2",
+            e,
+        )
+        web_runner = None
+        ws_manager = None
+    except Exception as e:
+        logger.error("Ошибка запуска веб-сервера: %s. Бот продолжит работу без веба.", e)
+        web_runner = None
+        ws_manager = None
 
 # TaskWorker получает ws_manager:
 task_worker = TaskWorker(task_queue, Config.MAX_CONCURRENT_TASKS, ai_comparator, ws_manager)
 
-# В finally:
+# В finally (порядок: веб → воркер → очередь → хранилища):
 if web_runner:
     await web_runner.cleanup()
 ```
@@ -756,6 +788,8 @@ PROXY_URL=http://user:pass@host:port
 Бот не запустится без: `TELEGRAM_BOT_TOKEN`, `OPENROUTER_API_KEY`, `DATABASE_URL`, `ACCESS_OWNER_ID`.
 
 Веб не запустится без (если `WEB_HOST` задан): `WEB_SECRET_KEY`.
+
+`Config.validate()` бросает `ValueError` при отсутствии обязательных параметров. Дополнительно: если `WEB_HOST` задан, но `WEB_SECRET_KEY` пустой — бросает `ValueError` с инструкцией генерации ключа. Предупреждение при `WEB_SESSION_MAX_AGE <= 0`.
 
 ---
 
@@ -1033,6 +1067,9 @@ Facade-оркестратор. Создаёт компоненты `sync/`, ко
 **Веб (новое):**
 - Бот работает через polling — НЕ переводить на webhook
 - `ResultDelivery` — ровно 4 метода (`send_progress`, `send_files`, `send_result`, `send_error`)
+- `ResultDeliveryFactory.create()` — единственное место выбора стратегии доставки
+- `ws_manager` передаётся в конструктор `TaskWorker`, НЕ в метод `start()`
+- Graceful degradation: при ImportError веб-модулей бот продолжает работать без веба
 - WebSocket URI: `/ws/tasks/{task_id}`
 - Cookie name: `MARKETPLACE_SESSION`
 - Порядок middleware: auth → errors → csrf
@@ -1044,9 +1081,11 @@ Facade-оркестратор. Создаёт компоненты `sync/`, ко
 ### Критичные зависимости
 
 - Бот и веб делят: Database pool, Redis, TaskQueue, AIComparator
-- WebSocketManager передаётся в TaskWorker → WebDelivery уведомляет браузер
+- WebSocketManager передаётся в конструктор TaskWorker (не в start()) → WebDelivery уведомляет браузер
 - `Task.delivery_channel` определяет стратегию доставки
+- `ResultDeliveryFactory.create()` бросает RuntimeError если bot=None для Telegram-задачи
 - Если `WEB_HOST` пустой — веб не запускается, бот работает как раньше
+- Если ImportError при импорте веб-модулей — бот продолжает работу, ws_manager=None
 - SSL-сертификат обновляется автоматически (certbot timer)
 
 ---
@@ -1055,9 +1094,9 @@ Facade-оркестратор. Создаёт компоненты `sync/`, ко
 
 ### Выполнено (до v5.0)
 - ✅ Все фичи из v1.0 — v4.9 (см. предыдущую документацию)
+- ✅ Фаза 0: `shared/delivery.py` + изменения Task и TaskWorker
 
 ### v5.0 — Веб-интерфейс
-- ✅ Фаза 0: `shared/delivery.py` + изменения Task и TaskWorker
 - ✅ Фаза 1: Каркас aiohttp (app.py, middleware, routes/__init__)
 - ✅ Фаза 2: Аутентификация (web_users, bcrypt, sessions, permissions)
 - ✅ Фаза 3: Бизнес-маршруты (schemas, upload, tasks, admin, websocket)

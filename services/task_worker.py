@@ -1,8 +1,9 @@
 """
 Фоновый воркер обработки задач синхронизации.
 
-Паттерн: Service Layer — координирует очередь, синхронизацию и отправку результатов.
+Паттерн: Service Layer — координирует очередь, синхронизацию и доставку результатов.
 Паттерн: Semaphore — ограничивает количество одновременных обработок.
+Паттерн: Strategy — доставка результатов через ResultDelivery (Telegram / Web).
 """
 
 import asyncio
@@ -14,7 +15,6 @@ import time
 from config.config import Config
 
 from aiogram import Bot
-from aiogram.types import FSInputFile
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -22,11 +22,13 @@ from bot import storage
 from services.ai_comparator import AIComparator
 from services.data_synchronizer import DataSynchronizer
 from services.task_queue import TaskQueue, Task
+from shared.delivery import ResultDeliveryFactory, ResultDelivery
 from utils.excel_writer import ExcelWriter
 from utils.logger_config import setup_logger
 from utils.xml_reader import XmlReader
 
 logger = setup_logger("task_worker")
+
 
 class _FileCleanupService:
     """
@@ -137,6 +139,10 @@ class TaskWorker:
     Читает задачи из очереди и обрабатывает их с ограничением
     на количество одновременных обработок (по умолчанию 5).
 
+    Доставка результатов абстрагирована через ResultDelivery (Strategy):
+        - Telegram-задачи → TelegramDelivery (Bot.send_document)
+        - Веб-задачи → WebDelivery (task_results в БД + WebSocket)
+
     Backpressure: семафор захватывается ДО создания asyncio.Task.
     Это гарантирует, что при всплеске задач не будет создано больше
     корутин, чем позволяет лимит. Задачи ждут в очереди Redis/memory,
@@ -148,7 +154,8 @@ class TaskWorker:
     что корректно ограничивает суммарное число AI-запросов.
 
     Паттерн: Service Layer — бизнес-логика обработки задач.
-    Паттерн: Dependency Injection — comparator инжектируется извне.
+    Паттерн: Dependency Injection — comparator и ws_manager инжектируются извне.
+    Паттерн: Strategy — доставка через ResultDeliveryFactory.create().
     """
 
     def __init__(
@@ -156,12 +163,21 @@ class TaskWorker:
         task_queue: TaskQueue,
         max_concurrent: int = 5,
         ai_comparator: Optional[AIComparator] = None,
+        ws_manager: Optional[object] = None,
     ) -> None:
+        """
+        Args:
+            task_queue: Очередь задач (Redis или in-memory)
+            max_concurrent: Максимум параллельных обработок (Semaphore)
+            ai_comparator: Общий экземпляр AIComparator (DI)
+            ws_manager: WebSocketManager для веб-доставки (None если веб выключен)
+        """
         self._queue = task_queue
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._running = False
         self._worker_task: Optional[asyncio.Task] = None
         self._bot: Optional[Bot] = None
+        self._ws_manager = ws_manager
         self._active_tasks: Set[asyncio.Task] = set()
 
         # AIComparator передаётся извне (из start_bot) —
@@ -278,17 +294,35 @@ class TaskWorker:
             self._semaphore.release()
 
     async def _execute_task(self, task: Task) -> None:
-        """Выполняет полный цикл обработки задачи."""
-        if not self._bot:
-            logger.error("Bot не установлен, невозможно отправить результат")
+        """
+        Выполняет полный цикл обработки задачи.
+
+        Создаёт ResultDelivery через фабрику по task.delivery_channel.
+        Все уведомления и отправка файлов — через абстракцию delivery,
+        а не напрямую через Bot API.
+        """
+        # Создаём стратегию доставки для этой задачи
+        try:
+            delivery: ResultDelivery = ResultDeliveryFactory.create(
+                task=task,
+                bot=self._bot,
+                ws_manager=self._ws_manager,
+            )
+        except (RuntimeError, ValueError) as e:
+            logger.error(
+                "Не удалось создать канал доставки для задачи %s: %s",
+                task.id, e,
+            )
+            await self._queue.update_status(task.id, "failed", error_message=str(e))
             return
 
         logger.info(
-            "Начало обработки задачи %s (пользователь %s)", task.id, task.user_id
+            "Начало обработки задачи %s (пользователь %s, канал %s)",
+            task.id, task.user_id, task.delivery_channel,
         )
 
         await self._queue.update_status(task.id, "processing")
-        await self._notify_user(task.chat_id, "⏳ Ваша задача начала обработку...")
+        await delivery.send_progress("⏳ Ваша задача начала обработку...")
 
         processing_id: Optional[int] = None
 
@@ -379,15 +413,12 @@ class TaskWorker:
                 processing_id, wb_count, ozon_count, yandex_count, total_synced
             )
 
-            # Отправка результатов
-            await self._notify_user(task.chat_id, "📤 Отправляю результаты...")
-            for path in output_sync_paths.values():
-                await self._bot.send_document(task.chat_id, FSInputFile(path))
-            await self._bot.send_document(
-                task.chat_id,
-                FSInputFile(task.report_path),
-                caption="📊 Отчёт",
-            )
+            # Отправка результатов через абстракцию доставки
+            await delivery.send_progress("📤 Отправляю результаты...")
+
+            # Собираем все файлы для отправки
+            result_files = list(output_sync_paths.values()) + [task.report_path]
+            await delivery.send_files(result_files, caption="📊 Отчёт")
 
             # Формируем текст результата
             result_text = (
@@ -398,7 +429,7 @@ class TaskWorker:
             if xml_filled and xml_filled > 0:
                 result_text += f"\n📦 Из XML каталога: {xml_filled}"
 
-            await self._notify_user(task.chat_id, result_text)
+            await delivery.send_result(result_text)
 
             # Обновляем статус в очереди
             await self._queue.update_status(
@@ -426,17 +457,4 @@ class TaskWorker:
             await self._queue.update_status(
                 task.id, "failed", error_message=error_msg
             )
-            await self._notify_user(
-                task.chat_id, f"❌ Ошибка обработки: {error_msg}"
-            )
-
-    async def _notify_user(self, chat_id: int, text: str) -> None:
-        """Отправляет сообщение пользователю."""
-        if not self._bot:
-            return
-        try:
-            await self._bot.send_message(chat_id, text)
-        except Exception as e:
-            logger.error(
-                "Не удалось отправить сообщение пользователю %s: %s", chat_id, e
-            )
+            await delivery.send_error(error_msg)

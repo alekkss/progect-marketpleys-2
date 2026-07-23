@@ -141,6 +141,29 @@ class Config:
     OUTPUT_DIR: str = os.getenv("OUTPUT_DIR", "/root/progect/output")
     FILE_MAX_AGE_DAYS: int = _safe_int_env("FILE_MAX_AGE_DAYS", 7)
 
+    # ===================================================================
+    # Веб-сервер (опционально)
+    # ===================================================================
+    # Если WEB_HOST пустой — веб-сервер НЕ запускается, бот работает
+    # как раньше. Это позволяет использовать тот же код на серверах
+    # без веб-компонента.
+    #
+    # WEB_HOST            — адрес для прослушивания (127.0.0.1 за Nginx)
+    # WEB_PORT            — порт aiohttp (Nginx проксирует сюда)
+    # WEB_DOMAIN          — публичный домен (для формирования ссылок)
+    # WEB_SECRET_KEY      — секрет для подписи cookie-сессий (обязателен!)
+    # WEB_SESSION_MAX_AGE — время жизни сессии в секундах (24 ч)
+    # WEB_REGISTRATION_OPEN — разрешить свободную регистрацию
+    # WEB_CSRF_ENABLED    — включить CSRF-защиту форм
+    # ===================================================================
+    WEB_HOST: str = os.getenv("WEB_HOST", "")
+    WEB_PORT: int = _safe_int_env("WEB_PORT", 8080)
+    WEB_DOMAIN: str = os.getenv("WEB_DOMAIN", "galina-blanka.ru")
+    WEB_SECRET_KEY: str = os.getenv("WEB_SECRET_KEY", "")
+    WEB_SESSION_MAX_AGE: int = _safe_int_env("WEB_SESSION_MAX_AGE", 86400)
+    WEB_REGISTRATION_OPEN: bool = os.getenv("WEB_REGISTRATION_OPEN", "false").lower() == "true"
+    WEB_CSRF_ENABLED: bool = os.getenv("WEB_CSRF_ENABLED", "true").lower() == "true"
+
     # Конфигурация файлов для каждого маркетплейса
     FILE_CONFIGS: Dict[str, Dict[str, Any]] = {
         "wildberries": {
@@ -518,6 +541,27 @@ class Config:
                 cls.REDIS_URL,
             )
 
+        # ===============================================================
+        # Валидация веб-сервера (условная)
+        # ===============================================================
+        # Веб-сервер запускается ТОЛЬКО если WEB_HOST задан.
+        # Если он задан — WEB_SECRET_KEY обязателен для безопасности
+        # cookie-сессий. Без него злоумышленник сможет подделать сессию.
+        # ===============================================================
+        if cls.WEB_HOST and not cls.WEB_SECRET_KEY:
+            raise ValueError(
+                "WEB_SECRET_KEY обязателен при включённом веб-сервере (WEB_HOST задан). "
+                "Сгенерируйте: python3 -c 'import secrets; print(secrets.token_hex(32))'"
+            )
+
+        if cls.WEB_HOST and cls.WEB_SESSION_MAX_AGE <= 0:
+            import logging
+            logging.getLogger('config').warning(
+                "WEB_SESSION_MAX_AGE=%d — некорректное значение. "
+                "Установлено значение по умолчанию: 86400 (24 часа).",
+                cls.WEB_SESSION_MAX_AGE,
+            )
+
         return True
 
     # Прокси настройки
@@ -595,3 +639,12 @@ PHOTO_COLUMNS = Config.PHOTO_COLUMNS
 PHOTO_READ_SEPARATORS = Config.PHOTO_READ_SEPARATORS
 PHOTO_WRITE_SEPARATORS = Config.PHOTO_WRITE_SEPARATORS
 DECIMAL_DOT_MARKETPLACES = Config.DECIMAL_DOT_MARKETPLACES
+
+# Веб-сервер
+WEB_HOST = Config.WEB_HOST
+WEB_PORT = Config.WEB_PORT
+WEB_DOMAIN = Config.WEB_DOMAIN
+WEB_SECRET_KEY = Config.WEB_SECRET_KEY
+WEB_SESSION_MAX_AGE = Config.WEB_SESSION_MAX_AGE
+WEB_REGISTRATION_OPEN = Config.WEB_REGISTRATION_OPEN
+WEB_CSRF_ENABLED = Config.WEB_CSRF_ENABLED

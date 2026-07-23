@@ -1032,3 +1032,539 @@ class Database:
             'user': {'used': user_count},
             'total_used': editor_count + user_count,
         }
+
+    # =================================================================
+    # Веб-пользователи (web_users)
+    # =================================================================
+
+    async def create_web_user(
+        self,
+        email: str,
+        password_hash: str,
+        display_name: Optional[str] = None,
+        role: str = 'user',
+    ) -> Optional[int]:
+        """
+        Создаёт нового веб-пользователя.
+
+        Args:
+            email: Email (уникальный, используется для входа)
+            password_hash: Хеш пароля (bcrypt)
+            display_name: Отображаемое имя
+            role: Роль ('owner', 'admin', 'editor', 'user')
+
+        Returns:
+            ID созданного пользователя или None при дубликате email
+        """
+        async with self.pool.acquire() as conn:
+            try:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO web_users (email, password_hash, display_name, role)
+                    VALUES ($1, $2, $3, $4)
+                    RETURNING id
+                    """,
+                    email, password_hash, display_name, role,
+                )
+                return row['id']
+            except asyncpg.UniqueViolationError:
+                return None
+
+    async def get_web_user_by_email(self, email: str) -> Optional[Dict]:
+        """
+        Получает веб-пользователя по email.
+
+        Args:
+            email: Email для поиска
+
+        Returns:
+            Словарь с данными пользователя или None
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, email, password_hash, display_name,
+                       telegram_user_id, role, is_active,
+                       created_at, last_login_at
+                FROM web_users
+                WHERE email = $1
+                """,
+                email,
+            )
+
+        if row is None:
+            return None
+
+        return {
+            'id': row['id'],
+            'email': row['email'],
+            'password_hash': row['password_hash'],
+            'display_name': row['display_name'],
+            'telegram_user_id': row['telegram_user_id'],
+            'role': row['role'],
+            'is_active': row['is_active'],
+            'created_at': str(row['created_at']) if row['created_at'] else None,
+            'last_login_at': str(row['last_login_at']) if row['last_login_at'] else None,
+        }
+
+    async def get_web_user_by_id(self, user_id: int) -> Optional[Dict]:
+        """
+        Получает веб-пользователя по ID.
+
+        Args:
+            user_id: ID пользователя в таблице web_users
+
+        Returns:
+            Словарь с данными пользователя или None
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, email, password_hash, display_name,
+                       telegram_user_id, role, is_active,
+                       created_at, last_login_at
+                FROM web_users
+                WHERE id = $1
+                """,
+                user_id,
+            )
+
+        if row is None:
+            return None
+
+        return {
+            'id': row['id'],
+            'email': row['email'],
+            'password_hash': row['password_hash'],
+            'display_name': row['display_name'],
+            'telegram_user_id': row['telegram_user_id'],
+            'role': row['role'],
+            'is_active': row['is_active'],
+            'created_at': str(row['created_at']) if row['created_at'] else None,
+            'last_login_at': str(row['last_login_at']) if row['last_login_at'] else None,
+        }
+
+    async def update_web_user_last_login(self, user_id: int) -> None:
+        """
+        Обновляет время последнего входа.
+
+        Args:
+            user_id: ID веб-пользователя
+        """
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE web_users
+                SET last_login_at = $1
+                WHERE id = $2
+                """,
+                datetime.now(timezone.utc), user_id,
+            )
+
+    async def link_telegram_to_web_user(
+        self,
+        web_user_id: int,
+        telegram_user_id: int,
+    ) -> bool:
+        """
+        Привязывает Telegram-аккаунт к веб-пользователю.
+
+        Args:
+            web_user_id: ID в таблице web_users
+            telegram_user_id: Telegram user_id
+
+        Returns:
+            True если привязка успешна, False если telegram_user_id уже занят
+        """
+        async with self.pool.acquire() as conn:
+            try:
+                await conn.execute(
+                    """
+                    UPDATE web_users
+                    SET telegram_user_id = $1
+                    WHERE id = $2
+                    """,
+                    telegram_user_id, web_user_id,
+                )
+                return True
+            except asyncpg.UniqueViolationError:
+                return False
+
+    async def get_web_users_list(self, limit: int = 50) -> List[Dict]:
+        """
+        Получает список всех веб-пользователей.
+
+        Args:
+            limit: Максимальное количество записей
+
+        Returns:
+            Список словарей с информацией о пользователях
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, email, display_name, telegram_user_id,
+                       role, is_active, created_at, last_login_at
+                FROM web_users
+                ORDER BY created_at DESC
+                LIMIT $1
+                """,
+                limit,
+            )
+
+        result: List[Dict] = []
+        for row in rows:
+            result.append({
+                'id': row['id'],
+                'email': row['email'],
+                'display_name': row['display_name'],
+                'telegram_user_id': row['telegram_user_id'],
+                'role': row['role'],
+                'is_active': row['is_active'],
+                'created_at': str(row['created_at']) if row['created_at'] else None,
+                'last_login_at': str(row['last_login_at']) if row['last_login_at'] else None,
+            })
+        return result
+
+    async def set_web_user_active(self, user_id: int, is_active: bool) -> None:
+        """
+        Активирует или деактивирует веб-пользователя.
+
+        Args:
+            user_id: ID веб-пользователя
+            is_active: True для активации, False для блокировки
+        """
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE web_users SET is_active = $1 WHERE id = $2",
+                is_active, user_id,
+            )
+
+    # =================================================================
+    # Веб-сессии (web_sessions)
+    # =================================================================
+
+    async def create_web_session(
+        self,
+        session_id: str,
+        web_user_id: int,
+        expires_at: datetime,
+        ip_address: Optional[str] = None,
+        user_agent: Optional[str] = None,
+    ) -> None:
+        """
+        Создаёт новую веб-сессию.
+
+        Args:
+            session_id: UUID сессии (устанавливается в cookie)
+            web_user_id: ID веб-пользователя
+            expires_at: Время истечения сессии
+            ip_address: IP-адрес клиента
+            user_agent: User-Agent браузера
+        """
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO web_sessions
+                    (id, web_user_id, expires_at, ip_address, user_agent)
+                VALUES ($1, $2, $3, $4, $5)
+                """,
+                session_id, web_user_id, expires_at,
+                ip_address, user_agent,
+            )
+
+    async def get_web_session(self, session_id: str) -> Optional[Dict]:
+        """
+        Получает данные сессии по ID.
+
+        Возвращает None если сессия не найдена или истекла.
+
+        Args:
+            session_id: UUID сессии из cookie
+
+        Returns:
+            Словарь с данными сессии или None
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT ws.id, ws.web_user_id, ws.expires_at,
+                       wu.email, wu.display_name, wu.role, wu.is_active
+                FROM web_sessions ws
+                JOIN web_users wu ON ws.web_user_id = wu.id
+                WHERE ws.id = $1 AND ws.expires_at > NOW()
+                """,
+                session_id,
+            )
+
+        if row is None:
+            return None
+
+        return {
+            'session_id': row['id'],
+            'web_user_id': row['web_user_id'],
+            'expires_at': str(row['expires_at']),
+            'email': row['email'],
+            'display_name': row['display_name'],
+            'role': row['role'],
+            'is_active': row['is_active'],
+        }
+
+    async def delete_web_session(self, session_id: str) -> None:
+        """
+        Удаляет сессию (logout).
+
+        Args:
+            session_id: UUID сессии
+        """
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM web_sessions WHERE id = $1",
+                session_id,
+            )
+
+    async def delete_user_sessions(self, web_user_id: int) -> None:
+        """
+        Удаляет все сессии пользователя (принудительный logout).
+
+        Args:
+            web_user_id: ID веб-пользователя
+        """
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM web_sessions WHERE web_user_id = $1",
+                web_user_id,
+            )
+
+    async def cleanup_expired_web_sessions(self) -> int:
+        """
+        Удаляет все истёкшие сессии.
+
+        Вызывается периодически (например, раз в час) для очистки БД.
+
+        Returns:
+            Количество удалённых сессий
+        """
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM web_sessions WHERE expires_at <= NOW()",
+            )
+            # result = 'DELETE N'
+            try:
+                return int(result.split()[-1])
+            except (IndexError, ValueError):
+                return 0
+
+    # =================================================================
+    # Результаты задач (task_results) — для веб-скачивания
+    # =================================================================
+
+    async def create_task_result(
+        self,
+        task_id: str,
+        web_user_id: int,
+    ) -> None:
+        """
+        Создаёт запись результата задачи (статус pending).
+
+        Вызывается при постановке веб-задачи в очередь.
+
+        Args:
+            task_id: UUID задачи
+            web_user_id: ID веб-пользователя (владелец результатов)
+        """
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO task_results (task_id, web_user_id, status)
+                VALUES ($1, $2, 'pending')
+                ON CONFLICT (task_id) DO NOTHING
+                """,
+                task_id, web_user_id,
+            )
+
+    async def update_task_result(
+        self,
+        task_id: str,
+        status: Optional[str] = None,
+        output_files: Optional[Dict] = None,
+        report_path: Optional[str] = None,
+        stats: Optional[Dict] = None,
+        error_message: Optional[str] = None,
+    ) -> None:
+        """
+        Обновляет результат задачи.
+
+        Вызывается из WebDelivery при завершении обработки.
+        Обновляет только переданные поля (не-None).
+
+        Args:
+            task_id: UUID задачи
+            status: Новый статус ('processing', 'completed', 'failed')
+            output_files: Словарь {filename: path} с результатами
+            report_path: Путь к файлу отчёта
+            stats: Статистика обработки (JSONB)
+            error_message: Сообщение об ошибке
+        """
+        fields: List[str] = []
+        values: List = []
+        param_idx = 1
+
+        if status is not None:
+            fields.append(f"status = ${param_idx}")
+            values.append(status)
+            param_idx += 1
+
+        if output_files is not None:
+            fields.append(f"output_files = ${param_idx}")
+            values.append(json.dumps(output_files, ensure_ascii=False))
+            param_idx += 1
+
+        if report_path is not None:
+            fields.append(f"report_path = ${param_idx}")
+            values.append(report_path)
+            param_idx += 1
+
+        if stats is not None:
+            fields.append(f"stats = ${param_idx}")
+            values.append(json.dumps(stats, ensure_ascii=False))
+            param_idx += 1
+
+        if error_message is not None:
+            fields.append(f"error_message = ${param_idx}")
+            values.append(error_message)
+            param_idx += 1
+
+        if status == 'completed' or status == 'failed':
+            fields.append(f"completed_at = ${param_idx}")
+            values.append(datetime.now(timezone.utc))
+            param_idx += 1
+
+        if not fields:
+            return
+
+        values.append(task_id)
+        query = f"""
+            UPDATE task_results
+            SET {', '.join(fields)}
+            WHERE task_id = ${param_idx}
+        """
+
+        async with self.pool.acquire() as conn:
+            await conn.execute(query, *values)
+
+    async def get_task_result(self, task_id: str) -> Optional[Dict]:
+        """
+        Получает результат задачи по ID.
+
+        Args:
+            task_id: UUID задачи
+
+        Returns:
+            Словарь с данными результата или None
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, task_id, web_user_id, status,
+                       output_files, report_path, stats,
+                       created_at, completed_at, error_message
+                FROM task_results
+                WHERE task_id = $1
+                """,
+                task_id,
+            )
+
+        if row is None:
+            return None
+
+        output_files = None
+        if row['output_files']:
+            try:
+                output_files = json.loads(row['output_files']) if isinstance(
+                    row['output_files'], str
+                ) else row['output_files']
+            except (json.JSONDecodeError, TypeError):
+                output_files = None
+
+        stats = None
+        if row['stats']:
+            try:
+                stats = json.loads(row['stats']) if isinstance(
+                    row['stats'], str
+                ) else row['stats']
+            except (json.JSONDecodeError, TypeError):
+                stats = None
+
+        return {
+            'id': row['id'],
+            'task_id': row['task_id'],
+            'web_user_id': row['web_user_id'],
+            'status': row['status'],
+            'output_files': output_files,
+            'report_path': row['report_path'],
+            'stats': stats,
+            'created_at': str(row['created_at']) if row['created_at'] else None,
+            'completed_at': str(row['completed_at']) if row['completed_at'] else None,
+            'error_message': row['error_message'],
+        }
+
+    async def get_user_task_results(
+        self,
+        web_user_id: int,
+        limit: int = 20,
+    ) -> List[Dict]:
+        """
+        Получает список результатов задач пользователя.
+
+        Args:
+            web_user_id: ID веб-пользователя
+            limit: Максимальное количество записей
+
+        Returns:
+            Список словарей с результатами (от новых к старым)
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT task_id, status, output_files, stats,
+                       created_at, completed_at, error_message
+                FROM task_results
+                WHERE web_user_id = $1
+                ORDER BY created_at DESC
+                LIMIT $2
+                """,
+                web_user_id, limit,
+            )
+
+        results: List[Dict] = []
+        for row in rows:
+            output_files = None
+            if row['output_files']:
+                try:
+                    output_files = json.loads(row['output_files']) if isinstance(
+                        row['output_files'], str
+                    ) else row['output_files']
+                except (json.JSONDecodeError, TypeError):
+                    output_files = None
+
+            stats = None
+            if row['stats']:
+                try:
+                    stats = json.loads(row['stats']) if isinstance(
+                        row['stats'], str
+                    ) else row['stats']
+                except (json.JSONDecodeError, TypeError):
+                    stats = None
+
+            results.append({
+                'task_id': row['task_id'],
+                'status': row['status'],
+                'output_files': output_files,
+                'stats': stats,
+                'created_at': str(row['created_at']) if row['created_at'] else None,
+                'completed_at': str(row['completed_at']) if row['completed_at'] else None,
+                'error_message': row['error_message'],
+            })
+
+        return results

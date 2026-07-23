@@ -130,9 +130,10 @@ async def start_bot() -> None:
         3. Подключение очереди задач (Redis или in-memory)
         4. Создание AIComparator (один экземпляр на весь жизненный цикл)
         5. Создание бота и диспетчера (с DI через workflow data)
-        6. Запуск фонового воркера обработки задач
-        7. Запуск polling
-        8. При остановке — graceful shutdown (воркер → очередь → ресурсы)
+        6. [Условно] Создание и запуск веб-сервера (если WEB_HOST задан)
+        7. Запуск фонового воркера обработки задач
+        8. Запуск polling
+        9. При остановке — graceful shutdown (веб → воркер → очередь → ресурсы)
 
     Raises:
         ValueError: если обязательные параметры конфигурации не заданы
@@ -185,23 +186,101 @@ async def start_bot() -> None:
     # инъекции в хендлеры, которые объявляют параметр ai_comparator.
     bot, dp = create_bot(task_queue, ai_comparator)
 
-    # Шаг 6: Запуск фонового воркера
+    # ===================================================================
+    # Шаг 6: Условный запуск веб-сервера
+    # ===================================================================
+    # Веб-сервер запускается ТОЛЬКО если WEB_HOST задан в .env.
+    # Если не задан — бот работает как раньше, без веб-интерфейса.
+    #
+    # Бот и веб работают в одном event loop через asyncio:
+    #   - aiohttp слушает на WEB_HOST:WEB_PORT (за Nginx)
+    #   - aiogram polling работает параллельно
+    #   - Общие ресурсы: db pool, Redis, TaskQueue, AIComparator
+    #
+    # WebSocketManager передаётся в TaskWorker для WebDelivery.
+    # ===================================================================
+    web_runner = None
+    ws_manager = None
+
+    if Config.WEB_HOST:
+        try:
+            from aiohttp import web
+            from web.app import create_web_app
+
+            ws_manager_module = __import__(
+                'web.routes.websocket', fromlist=['WebSocketManager']
+            )
+            WebSocketManager = ws_manager_module.WebSocketManager
+            ws_manager = WebSocketManager()
+
+            web_app = await create_web_app(
+                task_queue=task_queue,
+                ai_comparator=ai_comparator,
+                ws_manager=ws_manager,
+            )
+
+            web_runner = web.AppRunner(web_app)
+            await web_runner.setup()
+            site = web.TCPSite(web_runner, Config.WEB_HOST, Config.WEB_PORT)
+            await site.start()
+
+            logger.info(
+                "Веб-сервер запущен: http://%s:%s (домен: %s)",
+                Config.WEB_HOST,
+                Config.WEB_PORT,
+                Config.WEB_DOMAIN,
+            )
+            print(f"🌐 Веб-сервер: http://{Config.WEB_HOST}:{Config.WEB_PORT}")
+
+        except ImportError as e:
+            logger.warning(
+                "Не удалось импортировать веб-модули (%s). "
+                "Веб-сервер не запущен. Установите: "
+                "pip install aiohttp-jinja2 aiohttp-session bcrypt jinja2",
+                e,
+            )
+            web_runner = None
+            ws_manager = None
+        except Exception as e:
+            logger.error(
+                "Ошибка запуска веб-сервера: %s. Бот продолжит работу без веба.",
+                e,
+                exc_info=True,
+            )
+            web_runner = None
+            ws_manager = None
+
+    # Шаг 7: Запуск фонового воркера
     # Воркер получает тот же ai_comparator — НЕ создаёт свой.
+    # ws_manager передаётся для WebDelivery (None если веб выключен).
     # Семафор общий: максимум 5 AI-запросов суммарно.
-    task_worker = TaskWorker(task_queue, Config.MAX_CONCURRENT_TASKS, ai_comparator)
+    task_worker = TaskWorker(
+        task_queue,
+        Config.MAX_CONCURRENT_TASKS,
+        ai_comparator,
+        ws_manager,
+    )
     await task_worker.start(bot)
 
-    # Шаг 7: Запуск polling с graceful shutdown
+    # Шаг 8: Запуск polling с graceful shutdown
     logger.info("Telegram бот запущен!")
     print("🚀 Telegram бот запущен!")
 
     try:
         await dp.start_polling(bot)
     finally:
-        # Шаг 8: Корректное завершение
-        # Порядок важен: сначала останавливаем воркер (ждём активных задач),
-        # затем отключаем очередь, затем закрываем основные ресурсы.
-        logger.info("Остановка бота, закрытие ресурсов...")
+        # Шаг 9: Корректное завершение
+        # Порядок важен:
+        #   1. Останавливаем веб-сервер (прекращаем приём HTTP)
+        #   2. Останавливаем воркер (ждём активных задач)
+        #   3. Отключаем очередь (Redis)
+        #   4. Закрываем основные ресурсы (PostgreSQL pool)
+        logger.info("Остановка приложения, закрытие ресурсов...")
+
+        if web_runner:
+            await web_runner.cleanup()
+            logger.info("Веб-сервер остановлен.")
+
         await task_worker.stop()
         await task_queue.disconnect()
         await shutdown_storage()

@@ -149,7 +149,7 @@ MIGRATIONS: list[tuple[str, str]] = [
         """
     ),
     (
-        "002_add_schema_type_column",  # ← было "001_add_schema_type_column", исправлено на "002_"
+        "002_add_schema_type_column",
         """
         DO $$
         BEGIN
@@ -161,6 +161,59 @@ MIGRATIONS: list[tuple[str, str]] = [
                     ADD COLUMN schema_type TEXT NOT NULL DEFAULT 'standard';
             END IF;
         END $$;
+        """
+    ),
+    (
+        "003_create_web_users_table",
+        """
+        CREATE TABLE IF NOT EXISTS web_users (
+            id SERIAL PRIMARY KEY,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            display_name TEXT,
+            telegram_user_id BIGINT UNIQUE,
+            role TEXT NOT NULL DEFAULT 'user',
+            is_active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+            last_login_at TIMESTAMP WITH TIME ZONE,
+            CONSTRAINT web_users_role_check CHECK (role IN ('owner', 'admin', 'editor', 'user'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_web_users_email ON web_users(email);
+        CREATE INDEX IF NOT EXISTS idx_web_users_telegram_id ON web_users(telegram_user_id);
+        """
+    ),
+    (
+        "004_create_web_sessions_table",
+        """
+        CREATE TABLE IF NOT EXISTS web_sessions (
+            id TEXT PRIMARY KEY,
+            web_user_id INTEGER REFERENCES web_users(id) ON DELETE CASCADE,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+            expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+            ip_address TEXT,
+            user_agent TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_web_sessions_user_id ON web_sessions(web_user_id);
+        CREATE INDEX IF NOT EXISTS idx_web_sessions_expires ON web_sessions(expires_at);
+        """
+    ),
+    (
+        "005_create_task_results_table",
+        """
+        CREATE TABLE IF NOT EXISTS task_results (
+            id SERIAL PRIMARY KEY,
+            task_id TEXT UNIQUE NOT NULL,
+            web_user_id INTEGER REFERENCES web_users(id),
+            status TEXT NOT NULL DEFAULT 'pending',
+            output_files JSONB,
+            report_path TEXT,
+            stats JSONB,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+            completed_at TIMESTAMP WITH TIME ZONE,
+            error_message TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_task_results_user_id ON task_results(web_user_id);
+        CREATE INDEX IF NOT EXISTS idx_task_results_task_id ON task_results(task_id);
         """
     ),
 ]

@@ -25,6 +25,7 @@ from utils.logger_config import setup_logger
 logger = setup_logger("task_queue")
 
 TaskStatus = Literal["pending", "processing", "completed", "failed", "cancelled"]
+DeliveryChannel = Literal["telegram", "web"]
 
 
 @dataclass
@@ -33,6 +34,14 @@ class Task:
     Модель задачи на синхронизацию.
 
     Использует dataclass (стандартная библиотека) — без Pydantic.
+
+    Поля delivery_channel и web_user_id определяют, как результат
+    будет доставлен пользователю:
+        - telegram: Bot.send_document → chat_id (стандартный путь)
+        - web: сохранение в task_results + WebSocket-уведомление
+
+    Обратная совместимость: оба поля имеют значения по умолчанию,
+    старый код (Telegram-хендлеры) создаёт Task без них.
     """
 
     user_id: int
@@ -55,13 +64,32 @@ class Task:
     yandex_count: Optional[int] = None
     xml_filled: Optional[int] = None
 
+    # ===================================================================
+    # Канал доставки результата (v5.0)
+    # ===================================================================
+    # delivery_channel — определяет Strategy доставки в TaskWorker:
+    #   "telegram" → TelegramDelivery (Bot.send_document)
+    #   "web"      → WebDelivery (task_results в БД + WebSocket)
+    #
+    # web_user_id — ID пользователя в таблице web_users.
+    #   Используется WebDelivery для привязки результатов к аккаунту.
+    #   None для Telegram-задач (привязка через chat_id).
+    # ===================================================================
+    delivery_channel: DeliveryChannel = "telegram"
+    web_user_id: Optional[int] = None
+
     def to_json(self) -> str:
         """Сериализация в JSON."""
         return json.dumps(asdict(self), ensure_ascii=False)
 
     @classmethod
     def from_json(cls, raw: str) -> "Task":
-        """Десериализация из JSON."""
+        """
+        Десериализация из JSON.
+
+        Фильтрует неизвестные поля — безопасно для обратной
+        совместимости при добавлении новых полей в будущем.
+        """
         data = json.loads(raw)
         known = {f.name for f in cls.__dataclass_fields__.values()}
         filtered = {k: v for k, v in data.items() if k in known}

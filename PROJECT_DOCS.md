@@ -608,12 +608,14 @@ async def create_web_app(
 | POST | `/auth/logout` | Выход | Да |
 | GET | `/dashboard` | Статистика, быстрые действия | Да |
 | GET | `/schemas` | Список схем | Да (@login_required) |
+| GET | `/schemas/{id}` | Детали схемы (группы сопоставлений) | Да |
 | GET | `/schemas/create` | Wizard создания | Да |
 | POST | `/schemas/create` | AI-сопоставление + сохранение | Да |
 | GET | `/schemas/create-mvm` | Wizard МВМ-схемы | Да |
 | POST | `/schemas/create-mvm` | Создание МВМ | Да |
-| GET | `/schemas/{id}/edit` | Страница редактирования | Да |
-| POST | `/schemas/{id}/edit` | Сохранение изменений | Да |
+| GET | `/schemas/{id}` | Детали схемы (группы сопоставлений, read-only) | Да |
+| GET | `/schemas/{id}/edit` | Страница редактирования (Фаза 4) | Да |
+| POST | `/schemas/{id}/edit` | Сохранение изменений (Фаза 4) | Да |
 | DELETE | `/api/schemas/{id}` | Удаление схемы (AJAX) | Да |
 | GET | `/upload` | Страница загрузки | Да |
 | POST | `/upload/files` | Multipart загрузка файлов | Да |
@@ -622,8 +624,9 @@ async def create_web_app(
 | GET | `/api/tasks/{id}/status` | JSON-статус (polling fallback) | Да |
 | GET | `/tasks/{id}/download/{filename}` | Скачивание результата | Да |
 | GET | `/admin/users` | Управление whitelist | Admin+ |
-| POST | `/admin/users/add` | Добавить пользователя | Admin+ |
-| POST | `/admin/users/remove` | Удалить пользователя | Admin+ |
+| POST | `/admin/users/add` | Создать веб-аккаунт | Admin+ |
+| POST | `/admin/users/toggle` | Блокировка/разблокировка пользователя | Admin+ |
+| POST | `/admin/users/role` | Изменение роли пользователя | Admin+ |
 | POST | `/api/categories/search` | Поиск категорий XML | Да |
 | GET | `/ws/tasks/{id}` | WebSocket прогресса | Да |
 
@@ -685,10 +688,10 @@ class WebSocketManager:
 1. Drag&drop или `<input type="file" multiple>` на `/upload`
 2. JavaScript отправляет `POST /upload/files` (multipart/form-data)
 3. Сервер: определяет маркетплейс по имени файла (wb/ozon/yandex)
-4. Сохраняет в `UPLOAD_DIR`, возвращает JSON: `{"files": {"wildberries": "/path/...", ...}}`
+4. Сохраняет в `UPLOAD_DIR/{web_user_id}_{upload_id}/`, возвращает JSON: `{"files": {"wildberries": "/path/...", ...}, "xml": "/path/..." | null, "errors": [...]}`
 5. Пользователь выбирает схему, нажимает "Обработать"
 6. `POST /upload/process` → создаёт `Task(delivery_channel="web")` → `task_queue.enqueue()`
-7. Ответ: `{"task_id": "uuid", "ws_url": "/ws/tasks/uuid"}`
+7. Ответ: `{"task_id": "uuid", "queue_position": int}`
 8. Фронтенд подключает WebSocket, показывает прогресс
 9. По завершении — кнопки "Скачать WB", "Скачать Ozon", "Скачать Яндекс", "Скачать отчёт"
 
@@ -1102,6 +1105,14 @@ Facade-оркестратор. Создаёт компоненты `sync/`, ко
 - `WebAccessManager` принимает `user_data: Dict` (из request["user"]), НЕ `web_user_id: int` — без лишних запросов к БД
 - `PasswordHasher` всегда использует `asyncio.to_thread()` — НЕ вызывать bcrypt синхронно в event loop
 - Публичные пути (`/health`, `/auth/login`, `/auth/register`, `/static/`) НЕ проверяют сессию
+- CSRF: Double Submit Cookie (cookie httponly=False + hidden field / X-CSRF-Token header)
+- CSRF отключается через `WEB_CSRF_ENABLED=false` — только для отладки
+- CSRF НЕ проверяется для путей `/health`, `/ws/*`
+- Скачивание файлов: проверяется принадлежность задачи пользователю + filename в output_files + path traversal
+- `create_task_result()` вызывается ДО `task_queue.enqueue()` — запись в БД должна существовать до начала обработки
+- Определение МП по имени файла: ключевые слова wb/ozon/yandex (регистронезависимо)
+- Admin НЕ может: заблокировать owner, изменить роль owner, изменить свою роль
+- При блокировке пользователя все его сессии удаляются (принудительный logout)
 
 ### Критичные зависимости
 
@@ -1112,6 +1123,11 @@ Facade-оркестратор. Создаёт компоненты `sync/`, ко
 - Если `WEB_HOST` пустой — веб не запускается, бот работает как раньше
 - Если ImportError при импорте веб-модулей — бот продолжает работу, ws_manager=None
 - SSL-сертификат обновляется автоматически (certbot timer)
+- `web/routes/upload.py` использует `request.app["task_queue"]` — тот же экземпляр из DI
+- `web/routes/tasks.py` проверяет `task_result["web_user_id"] != web_user_id` перед скачиванием
+- `web/routes/schemas.py` использует `storage.db.pool.acquire()` напрямую для `_get_schema_meta` (нет отдельного метода в Database)
+- `web/routes/admin.py` использует `storage.db.pool.acquire()` для UPDATE role (нет отдельного метода)
+- CSRF middleware выполняется ПОСЛЕ auth — порядок в `setup_middlewares()` критичен
 
 ---
 
@@ -1122,9 +1138,9 @@ Facade-оркестратор. Создаёт компоненты `sync/`, ко
 - ✅ Фаза 0: `shared/delivery.py` + изменения Task и TaskWorker
 - ✅ Фаза 1: Каркас aiohttp (app.py, middleware, routes/__init__)
 - ✅ Фаза 2: Аутентификация (web_users, bcrypt, sessions, permissions)
+- ✅ Фаза 3: Бизнес-маршруты (dashboard, schemas CRUD, upload + process, tasks + download, admin users, CSRF middleware)
 
 ### v5.0 — Веб-интерфейс
-- ✅ Фаза 3: Бизнес-маршруты (schemas, upload, tasks, admin, websocket)
 - ✅ Фаза 4: Шаблоны и фронтенд (HTML, CSS, JavaScript)
 - ✅ Фаза 5: Nginx + SSL + systemd
 - ✅ Фаза 6: Интеграция, тестирование, deploy
@@ -1158,6 +1174,11 @@ Facade-оркестратор. Создаёт компоненты `sync/`, ко
 - Одна активная сессия на пользователя (при новом логине старая истекает)
 - Пароль: 8-72 символа (ограничение bcrypt — обрезает после 72 байт)
 - bcrypt хеширование выполняется в thread pool (asyncio.to_thread) — не блокирует event loop
+- Загрузка файлов: максимум 250 МБ на файл (проверяется и Nginx, и aiohttp `client_max_size`)
+- Допустимые форматы загрузки: только `.xlsx` и `.xml`
+- Минимум 2 МП-файла для запуска обработки (из 3 возможных)
+- Файлы результатов удаляются `_FileCleanupService` через FILE_MAX_AGE_DAYS — ссылки на скачивание перестают работать
+- Polling fallback для задач: каждые 5 секунд (если WebSocket недоступен)
 
 ---
 
@@ -1192,7 +1213,16 @@ aiohttp уже в зависимостях, работает в одном event
 WebSocket `/ws/tasks/{id}`. TaskWorker через WebDelivery вызывает `ws_manager.notify()` — JSON-сообщения `type: progress/files_ready/completed/error`.
 
 **Как скачать результат?**
-`GET /tasks/{id}/download/{filename}` → `aiohttp.web.FileResponse` с файлом из `output_dir`.
+`GET /tasks/{id}/download/{filename}` → `aiohttp.web.FileResponse` с файлом из `output_dir`. Проверяется: принадлежность задачи пользователю, наличие filename в output_files БД, отсутствие `..` в имени файла, существование файла на диске.
+
+**Как определяется маркетплейс при загрузке?**
+По ключевым словам в имени файла (без учёта регистра): wb/wildberries → wildberries, ozon/озон → ozon, yandex/яндекс/маркет → yandex. Если ключевое слово не найдено — файл отклоняется с ошибкой.
+
+**Как работает CSRF-защита?**
+Double Submit Cookie: при GET генерируется токен в cookie (httponly=False). При POST токен должен совпасть в cookie и в form field `csrf_token` (или header `X-CSRF-Token` для AJAX). Сравнение через `secrets.compare_digest` (constant-time).
+
+**Может ли admin заблокировать другого admin?**
+Нет. Только owner может блокировать admin. Admin может блокировать editor и user. Owner не может быть заблокирован никем.
 
 ---
 

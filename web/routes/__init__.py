@@ -6,14 +6,14 @@
 
 Маршруты разделены по файлам-модулям (по доменным областям):
     - auth.py       — вход, регистрация, выход (Фаза 2) ✓
-    - dashboard.py  — главная панель (Фаза 3)
-    - schemas.py    — CRUD схем сопоставлений (Фаза 3)
-    - upload.py     — загрузка файлов (Фаза 3)
-    - tasks.py      — статусы задач, скачивание результатов (Фаза 3)
-    - admin.py      — управление пользователями (Фаза 3)
-    - categories.py — AJAX поиск категорий XML (Фаза 3)
+    - dashboard.py  — главная панель (Фаза 3) ✓
+    - schemas.py    — CRUD схем сопоставлений (Фаза 3) ✓
+    - upload.py     — загрузка файлов (Фаза 3) ✓
+    - tasks.py      — статусы задач, скачивание результатов (Фаза 3) ✓
+    - admin.py      — управление пользователями (Фаза 3) ✓
+    - categories.py — AJAX поиск категорий XML (Фаза 4)
     - websocket.py  — WebSocket прогресса (Фаза 1) ✓
-    - api.py        — JSON API для AJAX (Фаза 3)
+    - api.py        — JSON API для AJAX (Фаза 4)
 
 Паттерн: каждый модуль маршрутов экспортирует функцию
 setup_*_routes(app), которая регистрирует свою группу.
@@ -29,6 +29,11 @@ if TYPE_CHECKING:
 from aiohttp.web import Request, Response
 
 from web.routes.auth import setup_auth_routes
+from web.routes.dashboard import setup_dashboard_routes
+from web.routes.schemas import setup_schemas_routes
+from web.routes.upload import setup_upload_routes
+from web.routes.tasks import setup_tasks_routes
+from web.routes.admin import setup_admin_routes
 from utils.logger_config import setup_logger
 
 logger = setup_logger("web.routes")
@@ -64,7 +69,8 @@ def setup_routes(app: "web.Application") -> None:
     Порядок регистрации:
         1. Служебные (health, root redirect)
         2. Аутентификация (/auth/*)
-        3. Бизнес-маршруты (Фаза 3)
+        3. Бизнес-маршруты (/dashboard, /schemas, /upload, /tasks)
+        4. Администрирование (/admin/*)
 
     Args:
         app: Экземпляр aiohttp Application
@@ -75,6 +81,15 @@ def setup_routes(app: "web.Application") -> None:
 
     # Аутентификация: /auth/login, /auth/register, /auth/logout
     setup_auth_routes(app)
+
+    # Бизнес-маршруты (требуют авторизации через декораторы)
+    setup_dashboard_routes(app)
+    setup_schemas_routes(app)
+    setup_upload_routes(app)
+    setup_tasks_routes(app)
+
+    # Администрирование (требует роли admin+)
+    setup_admin_routes(app)
 
     logger.info("Маршруты веб-приложения зарегистрированы")
 

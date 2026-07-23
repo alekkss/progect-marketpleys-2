@@ -869,15 +869,7 @@ logger.setLevel(logging.DEBUG)  # Подробные логи в utils/logger_co
 ### Требования
 
 ```
-Python 3.10+
-aiogram==3.x
-asyncpg
-pandas
-openpyxl
-openai (для OpenRouter)
-python-dotenv
-aiohttp (для загрузки XML по URL)
-httpx (для прокси в AIComparator)
+aiogram3.4.1 asyncpg0.31.0 pandas2.3.3 openpyxl3.1.5 openai2.14.0 (для OpenRouter) python-dotenv1.2.1 aiohttp3.9.5 (для загрузки XML по URL) httpx0.28.1 (для прокси в AIComparator) redis7.4.0 aiofiles23.2.1 socksio==1.0.0 (для SOCKS-прокси)
 ```
 
 ### Запуск
@@ -889,14 +881,78 @@ pip install -r requirements.txt
 # PostgreSQL должен быть запущен и доступен по DATABASE_URL
 # Миграции применяются автоматически при старте
 
-# Запуск бота
+# Запуск бота (для отладки)
 python main.py
 ```
+
+#### Запуск через systemd (production)
+Сервис /etc/systemd/system/marketplace-bot.service:
+
+[Unit]
+Description=Marketplace Sync Telegram Bot
+After=network.target postgresql.service redis-server.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/progect
+ExecStart=/root/progect/venv/bin/python3 main.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+
+#### Управление
+systemctl start marketplace-bot      # Запуск
+systemctl stop marketplace-bot       # Остановка
+systemctl restart marketplace-bot    # Перезапуск
+systemctl status marketplace-bot     # Статус
+journalctl -u marketplace-bot -f     # Логи в реальном времени
+
+Бот автоматически перезапускается при падении (Restart=always, задержка 5 сек).
 
 ### Переменные окружения
 
 Создайте файл `.env` с обязательными параметрами (см. раздел "Конфигурация").
 Без `DATABASE_URL`, `TELEGRAM_BOT_TOKEN`, `OPENROUTER_API_KEY` и `ACCESS_OWNER_ID` бот не запустится.
+
+### Установка на новый сервер (Ubuntu 24.04)
+
+# 1. Системные пакеты
+sudo apt update && sudo apt install -y postgresql postgresql-contrib redis-server
+
+# 2. Создание БД
+sudo -u postgres psql -c "CREATE USER bot_user WITH PASSWORD 'secret';"
+sudo -u postgres psql -c "CREATE DATABASE marketplace_sync OWNER bot_user;"
+sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE marketplace_sync TO bot_user;"
+
+# 3. Виртуальное окружение
+cd /root/progect
+python3 -m venv venv
+source venv/bin/activate
+pip install --upgrade pip
+
+# 4. Зависимости
+pip install aiogram==3.4.1 asyncpg==0.31.0 pandas==2.3.3 openpyxl==3.1.5 openai==2.14.0 python-dotenv==1.2.1 httpx==0.28.1 redis==7.4.0 aiohttp==3.9.5 aiofiles==23.2.1 socksio==1.0.0
+
+# 5. Директории
+mkdir -p /root/progect/uploads /root/progect/downloads /root/progect/output /root/progect/logs
+
+# 6. Файл .env — создать/перенести с обязательными параметрами
+
+# 7. Миграция БД со старого сервера (опционально)
+# На старом: pg_dump -U bot_user -h localhost marketplace_sync > /tmp/db_backup.sql
+# Перенести файл, на новом: sudo -u postgres psql marketplace_sync < /root/db_backup.sql
+
+# 8. Тестовый запуск
+python3 main.py
+
+# 9. Systemd сервис (см. секцию выше)
+systemctl daemon-reload
+systemctl enable marketplace-bot
+systemctl start marketplace-bot
 
 ## Roadmap & Known Issues
 
@@ -935,6 +991,7 @@ python main.py
 
 ### Ограничения
 
+- Рекомендуемая версия Python: 3.12+ (тестировалось на 3.12.3)
 - Максимум 50 символов в артикуле (фильтрация некорректных данных)
 - МП-файлы только .xlsx формата
 - XML-файлы только .xml формата (YML-фид)
@@ -1295,8 +1352,8 @@ Redis используется для двух целей:
 
 ---
 
-**Версия документации**: 4.8
-**Дата обновления**: Май 2026
+**Версия документации**: 4.9
+**Дата обновления**: Июль 2026
 **Последние изменения**:
 - v4.9: Три изменения в логике синхронизации. Габариты Яндекс: переход с составного столбца "Габариты с упаковкой, см" (формат «д/ш/в») на три раздельных столбца "Длина, см *", "Ширина, см *", "Высота, см *". Затронуты: DimensionsSynchronizer (чтение/запись), XmlSyncer (запись из XML), ColumnSyncer (удалён устаревший _write_yandex_composite), Config (маппинги и MANDATORY_MATCHES). Очистка ТН ВЭД: при синхронизации из Ozon в WB/Яндекс из значения ТНВЭД извлекается только числовой код ("2103909009 - Описание..." → "2103909009"). Настраивается через Config.TNVED_COLUMN_NAMES и Config.TNVED_NUMERIC_ONLY_MARKETPLACES. Реализовано в ColumnSyncer._apply_tnved_cleanup(). Принудительные парные сопоставления: добавлена конфигурация Config.FORCED_PAIR_ONLY_MATCHES и метод AIComparator._enforce_forced_pairs(). Два правила: Видео (WB+Яндекс, Ozon=NA) и НДС (WB+Ozon, Яндекс=NA). AI не может переопределить эти сопоставления — метод постобработки вычищает ошибочные тройные и парные, гарантирует правильное парное.
 - v4.8: Оптимизация AI-валидации при сохранении файлов.

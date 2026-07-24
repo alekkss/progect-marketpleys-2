@@ -506,6 +506,7 @@ async def set_web_user_active(self, user_id, is_active) -> None
 # === Веб-сессии ===
 async def create_web_session(self, web_user_id, session_id, expires_at, ip, ua) -> None
 async def get_web_session(self, session_id) -> Optional[Dict]
+    # Возвращает: session_id, web_user_id, expires_at, email, display_name, role, is_active, telegram_user_id
 async def delete_web_session(self, session_id) -> None
 async def delete_user_sessions(self, web_user_id) -> None
 async def cleanup_expired_web_sessions(self) -> int
@@ -606,8 +607,8 @@ async def create_web_app(
 | GET | `/dashboard` | Статистика, быстрые действия | Да |
 | GET | `/schemas` | Список схем | Да (@login_required) |
 | GET | `/schemas/{id}` | Детали схемы (группы сопоставлений) | Да |
-| GET | `/schemas/create` | Wizard создания | Да |
-| POST | `/schemas/create` | AI-сопоставление + сохранение | Да |
+| GET | `/schemas/create` | Страница создания стандартной схемы (wizard) | Да |
+| POST | `/schemas/create` | Загрузка файлов + AI-сопоставление + сохранение (multipart) | Да |
 | GET | `/schemas/create-mvm` | Wizard МВМ-схемы | Да |
 | POST | `/schemas/create-mvm` | Создание МВМ | Да |
 | GET | `/schemas/{id}` | Детали схемы (группы сопоставлений, read-only) | Да |
@@ -1122,6 +1123,10 @@ Facade-оркестратор. Создаёт компоненты `sync/`, ко
 - `base.html` ожидает `user` и `csrf_token` в контексте каждого шаблона (передаются из route-обработчиков)
 - Flash-сообщения передаются через переменные контекста `success_message` / `error_message`, НЕ через отдельный механизм сессий
 - Навигация в `base.html` подсвечивает активную ссылку через `request.path` — пути маршрутов НЕ менять без обновления шаблона
+- `POST /schemas/create` — синхронный (Вариант A): multipart-загрузка + AI inline. НЕ использует TaskQueue — результат возвращается как redirect после завершения AI
+- `/schemas/create` регистрируется ПЕРЕД `/schemas/{id:\d+}` в `setup_schemas_routes()` — иначе aiohttp интерпретирует "create" как {id}
+- В словарях для Jinja2 шаблонов НЕ использовать ключ "items" — конфликтует с dict.items(). Использовать "matches" или другое имя
+- Для создания схемы через веб пользователь ОБЯЗАН иметь привязанный telegram_user_id — схемы хранятся с FK на users(user_id)
 
 ### Критичные зависимости
 
@@ -1139,9 +1144,11 @@ Facade-оркестратор. Создаёт компоненты `sync/`, ко
 - CSRF middleware выполняется ПОСЛЕ auth — порядок в `setup_middlewares()` критичен
 - Все route-обработчики, рендерящие HTML, ОБЯЗАНЫ передавать `"user": user_data` в контекст — `base.html` использует это для навигации
 - `admin/users.html` читает flash из `success_message`/`error_message` контекста — POST-обработчики передают их через query params `?success=`/`?error=`, GET-обработчик извлекает и кладёт в контекст
-- `schemas/detail.html` ожидает `groups` в формате `[{"key", "label", "items": [{"columns": [{"mp", "name"}], "confidence"}]}]` — подготовка в `_prepare_groups_for_template()`
+- `schemas/detail.html` ожидает `groups` в формате `[{"key", "label", "matches": [{"columns": [{"mp", "name"}], "confidence"}]}]` — подготовка в `_prepare_groups_for_template()`. Ключ "matches", НЕ "items" — в Jinja2 dict.items конфликтует со встроенным методом dict.items()
 - `tasks/list.html` использует `{{ _shorten_filename(filename) }}` — функция должна быть в Jinja2 globals
 - Tailwind CSS подключён через CDN в `base.html` — при отсутствии интернета на клиенте стили не загрузятся
+- `get_web_session()` ОБЯЗАН возвращать `telegram_user_id` из `web_users` — маршруты schemas, upload используют его для привязки к таблице users
+- Создание схемы через веб невозможно без привязки Telegram-аккаунта (telegram_user_id = NULL → ошибка)
 
 ---
 
@@ -1158,6 +1165,15 @@ Facade-оркестратор. Создаёт компоненты `sync/`, ко
 - ✅ Фаза 4: Шаблоны и фронтенд (base.html, auth, dashboard, schemas list/detail, upload, tasks, admin, style.css). Маршруты переведены на aiohttp_jinja2.render_template(). JS встроен в шаблоны через {% block scripts %}.
 - ✅ Фаза 5: Nginx + SSL + systemd
 - ✅ Фаза 6: Интеграция, тестирование, deploy
+
+### v5.1 — Веб: создание схем
+- ✅ Создание стандартных схем через веб (wizard, drag&drop, синхронный AI)
+- ✅ Исправлен конфликт dict.items в Jinja2 (ключ "matches" вместо "items")
+- ✅ Исправлена модалка удаления схемы (display:none + правильная структура backdrop)
+- ✅ Добавлен telegram_user_id в данные веб-сессии (get_web_session)
+- ✅ Исправлена ошибка FK constraint при обработке веб-задач (user_id=0)
+- ⬜ Создание МВМ-схем через веб (create_mvm.html + выбор категорий)
+- ⬜ Редактирование сопоставлений через веб (edit.html)
 
 ### Будущее
 - ⬜ Unit-тесты (pytest)
@@ -1194,7 +1210,9 @@ Facade-оркестратор. Создаёт компоненты `sync/`, ко
 - Файлы результатов удаляются `_FileCleanupService` через FILE_MAX_AGE_DAYS — ссылки на скачивание перестают работать
 - Polling fallback для задач: каждые 5 секунд (если WebSocket недоступен)
 - Tailwind CSS загружается через CDN (cdn.tailwindcss.com) — требуется интернет на стороне клиента
-- Шаблоны create.html, create_mvm.html, edit.html для схем пока не реализованы — создание/редактирование схем доступно только через Telegram-бота
+- Шаблон create_mvm.html для МВМ-схем пока не реализован — создание МВМ-схем доступно только через Telegram-бота
+- Шаблон edit.html для редактирования сопоставлений пока не реализован — редактирование доступно только через Telegram-бота
+- Создание стандартных схем доступно через веб (POST /schemas/create, multipart, синхронный AI-запрос 5-15 сек)
 
 ---
 
@@ -1241,7 +1259,7 @@ Double Submit Cookie: при GET генерируется токен в cookie (
 Нет. Только owner может блокировать admin. Admin может блокировать editor и user. Owner не может быть заблокирован никем.
 
 **Можно ли создать схему через веб-интерфейс?**
-Пока нет. Просмотр и удаление схем доступны. Создание и редактирование (AI wizard) требуют шаблонов `create.html`, `create_mvm.html`, `edit.html` — будут реализованы в следующих итерациях. Сейчас создание — через Telegram-бота.
+Да, стандартные схемы (3 МП) можно создавать через веб: /schemas/create. Wizard на одной странице: название + drag&drop файлов + кнопка запуска. AI-сопоставление выполняется синхронно (5-15 сек). МВМ-схемы (3 МП + XML) пока создаются только через Telegram-бота.
 
 ---
 

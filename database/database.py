@@ -1289,7 +1289,8 @@ class Database:
             row = await conn.fetchrow(
                 """
                 SELECT ws.id, ws.web_user_id, ws.expires_at,
-                       wu.email, wu.display_name, wu.role, wu.is_active
+                       wu.email, wu.display_name, wu.role,
+                       wu.is_active, wu.telegram_user_id
                 FROM web_sessions ws
                 JOIN web_users wu ON ws.web_user_id = wu.id
                 WHERE ws.id = $1 AND ws.expires_at > NOW()
@@ -1308,6 +1309,7 @@ class Database:
             'display_name': row['display_name'],
             'role': row['role'],
             'is_active': row['is_active'],
+            'telegram_user_id': row['telegram_user_id'],
         }
 
     async def delete_web_session(self, session_id: str) -> None:

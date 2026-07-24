@@ -15,6 +15,14 @@
             {% endif %}
         </p>
     </div>
+    <a href="/schemas/create"
+       class="inline-flex items-center gap-2 px-4 py-2.5 text-sm font-medium text-white bg-blue-600 rounded-lg
+              hover:bg-blue-700 transition-colors shadow-sm">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+        </svg>
+        Создать схему
+    </a>
 </div>
 
 <!-- Таблица схем -->
@@ -49,7 +57,7 @@
                     <!-- Название -->
                     <td class="px-6 py-4">
                         <a href="/schemas/{{ schema.id }}"
-                           class="text-sm font-medium text-brand-600 hover:text-brand-700 hover:underline transition-colors">
+                           class="text-sm font-medium text-blue-600 hover:text-blue-700 hover:underline transition-colors">
                             {% if schema.schema_type == 'mvm' %}📦{% else %}📋{% endif %}
                             {{ schema.name }}
                         </a>
@@ -108,11 +116,16 @@
     </svg>
     <h3 class="text-lg font-semibold text-slate-700 mb-1">Схем пока нет</h3>
     <p class="text-sm text-slate-500 mb-4">
-        Создайте первую схему сопоставлений через Telegram-бота
+        Создайте первую схему сопоставлений
     </p>
-    <p class="text-xs text-slate-400">
-        Команда /start → Управление схемами → Создать схему
-    </p>
+    <a href="/schemas/create"
+       class="inline-flex items-center gap-2 px-4 py-2.5 text-sm font-medium text-white bg-blue-600 rounded-lg
+              hover:bg-blue-700 transition-colors">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
+        </svg>
+        Создать схему
+    </a>
 </div>
 {% endif %}
 
@@ -170,9 +183,7 @@
         deleteSchemaId = schemaId;
         document.getElementById('deleteSchemaName').textContent = schemaName;
 
-        // Показываем модалку: снимаем display:none, затем добавляем active для анимации
         deleteModal.style.display = '';
-        // Форсируем reflow для запуска CSS-перехода
         void deleteModal.offsetWidth;
         deleteModal.classList.add('active');
     }
@@ -184,7 +195,6 @@
         deleteSchemaId = null;
         deleteModal.classList.remove('active');
 
-        // После завершения CSS-перехода (200ms) скрываем полностью
         setTimeout(function() {
             deleteModal.style.display = 'none';
         }, 200);
@@ -212,7 +222,6 @@
             const data = await response.json();
 
             if (data.success) {
-                // Удаляем строку из таблицы с анимацией
                 const row = document.getElementById(`schema-row-${deleteSchemaId}`);
                 if (row) {
                     row.style.transition = 'opacity 0.3s, transform 0.3s';
@@ -222,7 +231,6 @@
                 }
                 closeDeleteModal();
 
-                // Если таблица пуста — перезагрузка покажет пустое состояние
                 setTimeout(function() {
                     const tbody = document.querySelector('tbody');
                     if (tbody && tbody.children.length === 0) {
@@ -247,9 +255,8 @@
         }
     });
 
-    // Закрытие модалки по клику на затемнённый фон (backdrop)
+    // Закрытие модалки по клику на backdrop
     deleteModal.addEventListener('click', function(e) {
-        // Закрываем только если клик по самому backdrop, а не по содержимому модалки
         if (e.target === deleteModal) {
             closeDeleteModal();
         }

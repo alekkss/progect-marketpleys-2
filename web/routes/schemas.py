@@ -209,7 +209,7 @@ def _prepare_groups_for_template(matches: dict, schema_type: str) -> list:
             {
                 "key": "matches_all_three",
                 "label": "Тройные (WB + Ozon + Яндекс)",
-                "items": [
+                "matches": [
                     {
                         "columns": [{"mp": "wb", "name": "Артикул продавца"}, ...],
                         "confidence": 0.95,
@@ -219,6 +219,10 @@ def _prepare_groups_for_template(matches: dict, schema_type: str) -> list:
             },
             ...
         ]
+
+    ВАЖНО: Ключ для списка сопоставлений — "matches", НЕ "items".
+    В Jinja2 обращение dict.items интерпретируется как вызов
+    встроенного метода dict.items(), что вызывает TypeError.
 
     Пустые группы (без сопоставлений) не включаются.
 
@@ -237,7 +241,7 @@ def _prepare_groups_for_template(matches: dict, schema_type: str) -> list:
         if not items_raw:
             continue
 
-        items = []
+        match_items = []
         for item in items_raw:
             columns = []
             for col_key in ("column_1", "column_2", "column_3", "column_4"):
@@ -252,7 +256,7 @@ def _prepare_groups_for_template(matches: dict, schema_type: str) -> list:
             else:
                 confidence = None
 
-            items.append({
+            match_items.append({
                 "columns": columns,
                 "confidence": confidence,
             })
@@ -260,7 +264,7 @@ def _prepare_groups_for_template(matches: dict, schema_type: str) -> list:
         groups.append({
             "key": group_key,
             "label": group_label,
-            "items": items,
+            "matches": match_items,
         })
 
     return groups

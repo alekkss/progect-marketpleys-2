@@ -300,6 +300,10 @@ class TaskWorker:
         Создаёт ResultDelivery через фабрику по task.delivery_channel.
         Все уведомления и отправка файлов — через абстракцию delivery,
         а не напрямую через Bot API.
+
+        Запись в processing_history выполняется ТОЛЬКО для задач с реальным
+        Telegram user_id (> 0). Веб-задачи без привязки к Telegram пропускают
+        этот шаг — их результаты отслеживаются через таблицу task_results.
         """
         # Создаём стратегию доставки для этой задачи
         try:
@@ -326,19 +330,26 @@ class TaskWorker:
 
         processing_id: Optional[int] = None
 
-        try:
-            # Регистрируем обработку в БД
-            processing_id = await storage.db.start_processing(task.user_id)
+        # Запись в processing_history только для реальных Telegram-пользователей.
+        # Веб-задачи без привязки к Telegram (user_id=0) не имеют записи в таблице
+        # users, поэтому FK constraint не позволит создать processing_history.
+        # Их результаты отслеживаются через task_results.
+        has_telegram_user = task.user_id > 0
 
-            # Добавляем файлы в историю
-            for marketplace, file_path in task.file_paths.items():
-                await storage.db.add_file(
-                    task.user_id,
-                    processing_id,
-                    marketplace,
-                    os.path.basename(file_path),
-                    file_path,
-                )
+        try:
+            # Регистрируем обработку в БД (только для Telegram-пользователей)
+            if has_telegram_user:
+                processing_id = await storage.db.start_processing(task.user_id)
+
+                # Добавляем файлы в историю
+                for marketplace, file_path in task.file_paths.items():
+                    await storage.db.add_file(
+                        task.user_id,
+                        processing_id,
+                        marketplace,
+                        os.path.basename(file_path),
+                        file_path,
+                    )
 
             # Получаем схему сопоставлений
             comparison_result = await storage.db.get_schema_matches(task.schema_id)
@@ -408,10 +419,11 @@ class TaskWorker:
                 else None
             )
 
-            # Завершаем обработку в БД
-            await storage.db.complete_processing(
-                processing_id, wb_count, ozon_count, yandex_count, total_synced
-            )
+            # Завершаем обработку в БД (только для Telegram-пользователей)
+            if has_telegram_user and processing_id:
+                await storage.db.complete_processing(
+                    processing_id, wb_count, ozon_count, yandex_count, total_synced
+                )
 
             # Отправка результатов через абстракцию доставки
             await delivery.send_progress("📤 Отправляю результаты...")
@@ -451,7 +463,7 @@ class TaskWorker:
                 "Ошибка обработки задачи %s: %s", task.id, e, exc_info=True
             )
 
-            if processing_id:
+            if has_telegram_user and processing_id:
                 await storage.db.fail_processing(processing_id, error_msg)
 
             await self._queue.update_status(

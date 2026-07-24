@@ -83,7 +83,7 @@
                     <!-- Действия -->
                     <td class="px-6 py-4 text-right">
                         <button
-                            onclick="deleteSchema({{ schema.id }}, '{{ schema.name }}')"
+                            onclick="openDeleteModal({{ schema.id }}, '{{ schema.name }}')"
                             class="btn-icon btn-icon-danger"
                             title="Удалить схему"
                         >
@@ -117,41 +117,40 @@
 {% endif %}
 
 <!-- Модальное окно подтверждения удаления -->
-<div id="deleteModal" class="modal-backdrop">
-    <div class="fixed inset-0 flex items-center justify-center p-4 z-[101]">
-        <div class="modal-content bg-white rounded-xl shadow-xl border border-slate-200 w-full max-w-sm p-6">
-            <div class="flex items-center gap-3 mb-4">
-                <div class="flex-shrink-0 w-10 h-10 rounded-full bg-red-100 flex items-center justify-center">
-                    <svg class="w-5 h-5 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                              d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"/>
-                    </svg>
-                </div>
-                <div>
-                    <h3 class="text-base font-semibold text-slate-900">Удалить схему?</h3>
-                    <p class="text-sm text-slate-500" id="deleteSchemaName"></p>
-                </div>
+<div id="deleteModal" class="modal-backdrop" style="display: none;">
+    <div class="modal-content bg-white rounded-xl shadow-xl border border-slate-200 w-full max-w-sm p-6
+                fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2">
+        <div class="flex items-center gap-3 mb-4">
+            <div class="flex-shrink-0 w-10 h-10 rounded-full bg-red-100 flex items-center justify-center">
+                <svg class="w-5 h-5 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                          d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4c-.77-.833-1.964-.833-2.732 0L4.082 16.5c-.77.833.192 2.5 1.732 2.5z"/>
+                </svg>
             </div>
-            <p class="text-sm text-slate-600 mb-6">
-                Это действие нельзя отменить. Все сопоставления схемы будут удалены.
-            </p>
-            <div class="flex gap-3 justify-end">
-                <button
-                    onclick="closeDeleteModal()"
-                    class="px-4 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-300 rounded-lg
-                           hover:bg-slate-50 transition-colors"
-                >
-                    Отмена
-                </button>
-                <button
-                    id="confirmDeleteBtn"
-                    onclick="confirmDelete()"
-                    class="px-4 py-2 text-sm font-medium text-white bg-red-600 rounded-lg
-                           hover:bg-red-700 transition-colors"
-                >
-                    Удалить
-                </button>
+            <div>
+                <h3 class="text-base font-semibold text-slate-900">Удалить схему?</h3>
+                <p class="text-sm text-slate-500" id="deleteSchemaName"></p>
             </div>
+        </div>
+        <p class="text-sm text-slate-600 mb-6">
+            Это действие нельзя отменить. Все сопоставления схемы будут удалены.
+        </p>
+        <div class="flex gap-3 justify-end">
+            <button
+                onclick="closeDeleteModal()"
+                class="px-4 py-2 text-sm font-medium text-slate-700 bg-white border border-slate-300 rounded-lg
+                       hover:bg-slate-50 transition-colors"
+            >
+                Отмена
+            </button>
+            <button
+                id="confirmDeleteBtn"
+                onclick="confirmDelete()"
+                class="px-4 py-2 text-sm font-medium text-white bg-red-600 rounded-lg
+                       hover:bg-red-700 transition-colors"
+            >
+                Удалить
+            </button>
         </div>
     </div>
 </div>
@@ -162,13 +161,20 @@
     const csrfToken = '{{ csrf_token }}';
     let deleteSchemaId = null;
 
+    const deleteModal = document.getElementById('deleteModal');
+
     /**
      * Открывает модальное окно подтверждения удаления.
      */
-    function deleteSchema(schemaId, schemaName) {
+    function openDeleteModal(schemaId, schemaName) {
         deleteSchemaId = schemaId;
         document.getElementById('deleteSchemaName').textContent = schemaName;
-        document.getElementById('deleteModal').classList.add('active');
+
+        // Показываем модалку: снимаем display:none, затем добавляем active для анимации
+        deleteModal.style.display = '';
+        // Форсируем reflow для запуска CSS-перехода
+        void deleteModal.offsetWidth;
+        deleteModal.classList.add('active');
     }
 
     /**
@@ -176,7 +182,12 @@
      */
     function closeDeleteModal() {
         deleteSchemaId = null;
-        document.getElementById('deleteModal').classList.remove('active');
+        deleteModal.classList.remove('active');
+
+        // После завершения CSS-перехода (200ms) скрываем полностью
+        setTimeout(function() {
+            deleteModal.style.display = 'none';
+        }, 200);
     }
 
     /**
@@ -207,12 +218,12 @@
                     row.style.transition = 'opacity 0.3s, transform 0.3s';
                     row.style.opacity = '0';
                     row.style.transform = 'translateX(-10px)';
-                    setTimeout(() => row.remove(), 300);
+                    setTimeout(function() { row.remove(); }, 300);
                 }
                 closeDeleteModal();
 
                 // Если таблица пуста — перезагрузка покажет пустое состояние
-                setTimeout(() => {
+                setTimeout(function() {
                     const tbody = document.querySelector('tbody');
                     if (tbody && tbody.children.length === 0) {
                         location.reload();
@@ -230,13 +241,18 @@
     }
 
     // Закрытие модалки по Escape
-    document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape') closeDeleteModal();
+    document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape' && deleteModal.classList.contains('active')) {
+            closeDeleteModal();
+        }
     });
 
-    // Закрытие модалки по клику на backdrop
-    document.getElementById('deleteModal').addEventListener('click', (e) => {
-        if (e.target === e.currentTarget) closeDeleteModal();
+    // Закрытие модалки по клику на затемнённый фон (backdrop)
+    deleteModal.addEventListener('click', function(e) {
+        // Закрываем только если клик по самому backdrop, а не по содержимому модалки
+        if (e.target === deleteModal) {
+            closeDeleteModal();
+        }
     });
 </script>
 {% endblock %}

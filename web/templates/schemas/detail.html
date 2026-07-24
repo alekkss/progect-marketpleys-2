@@ -84,7 +84,7 @@
             <div class="flex items-center gap-3">
                 <div class="flex-shrink-0 w-8 h-8 rounded-lg flex items-center justify-center
                     {% if 'four' in group.key or 'all_four' in group.key %}bg-amber-50 text-amber-600
-                    {% elif 'triple' in group.key or 'all_three' in group.key %}bg-brand-50 text-brand-600
+                    {% elif 'triple' in group.key or 'all_three' in group.key %}bg-blue-50 text-blue-600
                     {% else %}bg-slate-100 text-slate-500{% endif %}">
                     {% if 'four' in group.key or 'all_four' in group.key %}
                         <span class="text-sm font-bold">4</span>
@@ -96,7 +96,7 @@
                 </div>
                 <div>
                     <h3 class="text-sm font-semibold text-slate-900">{{ group.label }}</h3>
-                    <p class="text-xs text-slate-500">{{ group.items|length }} сопоставлений</p>
+                    <p class="text-xs text-slate-500">{{ group.matches|length }} сопоставлений</p>
                 </div>
             </div>
             <svg class="w-5 h-5 text-slate-400 transition-transform toggle-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -107,7 +107,7 @@
         <!-- Содержимое группы (сворачиваемое) -->
         <div id="group-{{ loop.index }}" class="border-t border-slate-100 hidden">
             <div class="divide-y divide-slate-50">
-                {% for item in group.items %}
+                {% for item in group.matches %}
                 <div class="px-6 py-3 flex items-center justify-between gap-4 hover:bg-slate-50/50">
                     <!-- Столбцы -->
                     <div class="flex flex-wrap items-center gap-1.5 text-sm min-w-0">
@@ -134,7 +134,7 @@
                     {% if item.confidence %}
                     <span class="flex-shrink-0 text-xs font-medium
                         {% if item.confidence >= 0.95 %}text-green-600
-                        {% elif item.confidence >= 0.85 %}text-brand-600
+                        {% elif item.confidence >= 0.85 %}text-blue-600
                         {% else %}text-amber-600{% endif %}">
                         {{ (item.confidence * 100)|round|int }}%
                     </span>

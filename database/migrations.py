@@ -216,6 +216,68 @@ MIGRATIONS: list[tuple[str, str]] = [
         CREATE INDEX IF NOT EXISTS idx_task_results_task_id ON task_results(task_id);
         """
     ),
+    (
+        "006_add_web_user_id_to_schemas",
+        """
+        DO $$
+        BEGIN
+            -- Шаг 1: Добавляем столбец web_user_id если не существует
+            IF NOT EXISTS (
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'schemas' AND column_name = 'web_user_id'
+            ) THEN
+                ALTER TABLE schemas
+                    ADD COLUMN web_user_id INTEGER REFERENCES web_users(id);
+            END IF;
+
+            -- Шаг 2: Делаем user_id nullable (убираем NOT NULL если был)
+            -- ALTER COLUMN ... DROP NOT NULL идемпотентен — не ошибается если уже nullable
+            ALTER TABLE schemas ALTER COLUMN user_id DROP NOT NULL;
+
+            -- Шаг 3: Удаляем старый constraint уникальности (user_id, schema_name)
+            -- и создаём новый, который учитывает nullable user_id
+            IF EXISTS (
+                SELECT 1 FROM information_schema.table_constraints
+                WHERE table_name = 'schemas'
+                  AND constraint_type = 'UNIQUE'
+                  AND constraint_name = 'schemas_user_id_schema_name_key'
+            ) THEN
+                ALTER TABLE schemas
+                    DROP CONSTRAINT schemas_user_id_schema_name_key;
+            END IF;
+
+            -- Шаг 4: Создаём новые уникальные индексы
+            -- Для Telegram-пользователей: уникальность по (user_id, schema_name) где user_id NOT NULL
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_indexes
+                WHERE indexname = 'idx_schemas_unique_user_name'
+            ) THEN
+                CREATE UNIQUE INDEX idx_schemas_unique_user_name
+                    ON schemas (user_id, schema_name)
+                    WHERE user_id IS NOT NULL;
+            END IF;
+
+            -- Для веб-пользователей: уникальность по (web_user_id, schema_name) где web_user_id NOT NULL
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_indexes
+                WHERE indexname = 'idx_schemas_unique_web_user_name'
+            ) THEN
+                CREATE UNIQUE INDEX idx_schemas_unique_web_user_name
+                    ON schemas (web_user_id, schema_name)
+                    WHERE web_user_id IS NOT NULL;
+            END IF;
+
+            -- Шаг 5: Индекс по web_user_id для быстрого поиска
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_indexes
+                WHERE indexname = 'idx_schemas_web_user_id'
+            ) THEN
+                CREATE INDEX idx_schemas_web_user_id
+                    ON schemas (web_user_id);
+            END IF;
+        END $$;
+        """
+    ),
 ]
 
 

@@ -84,7 +84,7 @@ async def schemas_list(request: Request) -> Response:
     GET /schemas — список схем сопоставлений.
 
     Owner/admin/editor видят все схемы (с указанием владельца).
-    User видит только свои.
+    User видит только свои (по web_user_id и привязанному telegram_user_id).
 
     Args:
         request: HTTP-запрос
@@ -94,12 +94,12 @@ async def schemas_list(request: Request) -> Response:
     """
     user_data = request["user"]
     can_see_all = WebAccessManager.can_see_all_schemas(user_data)
-    telegram_user_id = user_data.get("telegram_user_id")
+    web_user_id = user_data.get("web_user_id")
 
     if can_see_all:
         schemas = await storage.db.get_user_schemas(0, all_schemas=True)
-    elif telegram_user_id:
-        schemas = await storage.db.get_user_schemas(telegram_user_id, all_schemas=False)
+    elif web_user_id:
+        schemas = await storage.db.get_web_user_schemas(web_user_id)
     else:
         schemas = []
 
@@ -157,6 +157,10 @@ async def schema_create_handler(request: Request) -> Response:
         6. Сохраняет схему и сопоставления в БД
         7. Редирект на /schemas/{id}
 
+    Telegram-аккаунт НЕ требуется — схема привязывается к web_user_id.
+    Если у пользователя есть привязанный telegram_user_id — он тоже сохраняется
+    для совместимости с ботом.
+
     Args:
         request: HTTP-запрос с multipart-данными
 
@@ -164,14 +168,8 @@ async def schema_create_handler(request: Request) -> Response:
         Редирект на страницу схемы или HTML с ошибкой
     """
     user_data = request["user"]
+    web_user_id = user_data.get("web_user_id")
     telegram_user_id = user_data.get("telegram_user_id")
-
-    # Для создания схемы нужен telegram_user_id (схемы привязаны к Telegram ID)
-    if not telegram_user_id:
-        return _render_create_error(
-            request, user_data,
-            "Для создания схемы необходимо привязать Telegram-аккаунт в профиле.",
-        )
 
     # Парсим multipart-данные
     schema_name = ""
@@ -239,7 +237,6 @@ async def schema_create_handler(request: Request) -> Response:
 
             # Сохраняем файл на диск
             if upload_dir is None:
-                web_user_id = user_data.get("web_user_id", 0)
                 upload_id = str(uuid.uuid4())[:8]
                 upload_dir = Path(Config.UPLOAD_DIR) / f"web_schema_{web_user_id}_{upload_id}"
                 upload_dir.mkdir(parents=True, exist_ok=True)
@@ -290,7 +287,7 @@ async def schema_create_handler(request: Request) -> Response:
                 f"Схема с названием '{schema_name}' уже существует.",
             )
     else:
-        existing = await storage.db.get_schema(telegram_user_id, schema_name)
+        existing = await storage.db.get_schema_by_name_for_web_user(web_user_id, schema_name)
         if existing:
             return _render_create_error(
                 request, user_data,
@@ -359,8 +356,11 @@ async def schema_create_handler(request: Request) -> Response:
     # === Сохранение в БД ===
 
     try:
-        schema_id = await storage.db.create_schema(
-            telegram_user_id, schema_name, schema_type="standard",
+        schema_id = await storage.db.create_schema_for_web_user(
+            web_user_id=web_user_id,
+            schema_name=schema_name,
+            schema_type="standard",
+            telegram_user_id=telegram_user_id,
         )
 
         if not schema_id:
@@ -372,8 +372,9 @@ async def schema_create_handler(request: Request) -> Response:
         await storage.db.save_schema_matches(schema_id, comparison_result)
 
         logger.info(
-            "Схема '%s' (id=%d) создана через веб, пользователь web_user_id=%d",
-            schema_name, schema_id, user_data.get("web_user_id", 0),
+            "Схема '%s' (id=%d) создана через веб, web_user_id=%d, telegram_user_id=%s",
+            schema_name, schema_id, web_user_id,
+            telegram_user_id if telegram_user_id else "не привязан",
         )
 
     except Exception as e:
@@ -417,10 +418,20 @@ async def schema_detail(request: Request) -> Response:
 
     # Проверка доступа: user может видеть только свои
     can_see_all = WebAccessManager.can_see_all_schemas(user_data)
-    telegram_user_id = user_data.get("telegram_user_id")
 
     if not can_see_all:
-        if not telegram_user_id or schema_meta.get("owner_id") != telegram_user_id:
+        web_user_id = user_data.get("web_user_id")
+        telegram_user_id = user_data.get("telegram_user_id")
+
+        is_owner = False
+        # Проверяем владение по web_user_id
+        if web_user_id and schema_meta.get("web_user_id") == web_user_id:
+            is_owner = True
+        # Проверяем владение по telegram_user_id
+        if telegram_user_id and schema_meta.get("owner_id") == telegram_user_id:
+            is_owner = True
+
+        if not is_owner:
             raise web.HTTPForbidden(reason="Нет доступа к этой схеме")
 
     # Подготовка групп для шаблона
@@ -445,7 +456,7 @@ async def schema_delete_api(request: Request) -> Response:
 
     Проверяет права:
         - Owner/admin могут удалять любые
-        - Editor/user — только свои (по telegram_user_id)
+        - Editor/user — только свои (по web_user_id или telegram_user_id)
 
     Args:
         request: HTTP-запрос
@@ -464,8 +475,7 @@ async def schema_delete_api(request: Request) -> Response:
         )
 
     # Проверка прав на удаление
-    schema_owner_id = schema_meta.get("owner_id", 0)
-    can_delete = WebAccessManager.can_delete_schema(user_data, schema_owner_id)
+    can_delete = _check_schema_ownership(user_data, schema_meta)
 
     if not can_delete:
         return web.json_response(
@@ -496,6 +506,38 @@ async def schema_delete_api(request: Request) -> Response:
 # =================================================================
 # Вспомогательные функции
 # =================================================================
+
+def _check_schema_ownership(user_data: dict, schema_meta: dict) -> bool:
+    """
+    Проверяет, может ли пользователь управлять схемой.
+
+    Owner/admin могут управлять любыми схемами.
+    Editor/user — только своими (по web_user_id или telegram_user_id).
+
+    Args:
+        user_data: Данные пользователя из сессии
+        schema_meta: Метаданные схемы
+
+    Returns:
+        True если пользователь имеет право на действие
+    """
+    # Owner и admin могут всё
+    if WebAccessManager.is_admin_or_owner(user_data):
+        return True
+
+    web_user_id = user_data.get("web_user_id")
+    telegram_user_id = user_data.get("telegram_user_id")
+
+    # Проверяем владение по web_user_id
+    if web_user_id and schema_meta.get("web_user_id") == web_user_id:
+        return True
+
+    # Проверяем владение по telegram_user_id
+    if telegram_user_id and schema_meta.get("owner_id") == telegram_user_id:
+        return True
+
+    return False
+
 
 def _render_create_error(
     request: Request,
@@ -600,6 +642,9 @@ async def _get_schema_meta(schema_id: int) -> dict | None:
     """
     Загружает метаданные схемы по ID.
 
+    Возвращает owner_id (telegram) и web_user_id для проверки
+    владения из обоих каналов.
+
     Args:
         schema_id: ID схемы
 
@@ -609,11 +654,14 @@ async def _get_schema_meta(schema_id: int) -> dict | None:
     async with storage.db.pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            SELECT s.id, s.user_id, s.schema_name, s.schema_type,
-                   s.created_at, s.updated_at,
-                   u.username, u.first_name
+            SELECT s.id, s.user_id, s.web_user_id, s.schema_name,
+                   s.schema_type, s.created_at, s.updated_at,
+                   u.username, u.first_name,
+                   wu.display_name AS web_display_name,
+                   wu.email AS web_email
             FROM schemas s
             LEFT JOIN users u ON s.user_id = u.user_id
+            LEFT JOIN web_users wu ON s.web_user_id = wu.id
             WHERE s.id = $1
             """,
             schema_id,
@@ -622,11 +670,24 @@ async def _get_schema_meta(schema_id: int) -> dict | None:
     if not row:
         return None
 
-    owner_display = row["first_name"] if row["first_name"] else f"ID: {row['user_id']}"
+    # Определяем отображаемое имя владельца
+    if row["first_name"]:
+        owner_display = row["first_name"]
+    elif row["web_display_name"]:
+        owner_display = row["web_display_name"]
+    elif row["web_email"]:
+        owner_display = row["web_email"]
+    elif row["user_id"]:
+        owner_display = f"TG ID: {row['user_id']}"
+    elif row["web_user_id"]:
+        owner_display = f"Web ID: {row['web_user_id']}"
+    else:
+        owner_display = "Неизвестен"
 
     return {
         "id": row["id"],
         "owner_id": row["user_id"],
+        "web_user_id": row["web_user_id"],
         "owner_name": owner_display,
         "name": row["schema_name"],
         "schema_type": row["schema_type"] or "standard",

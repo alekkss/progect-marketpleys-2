@@ -375,10 +375,10 @@ class Database:
         schema_type: str = 'standard',
     ) -> Optional[int]:
         """
-        Создаёт новую схему.
+        Создаёт новую схему для Telegram-пользователя.
 
         Args:
-            user_id: ID пользователя
+            user_id: Telegram user_id
             schema_name: Название схемы
             schema_type: Тип схемы ('standard' или 'mvm')
 
@@ -398,6 +398,176 @@ class Database:
                 return row['id']
             except asyncpg.UniqueViolationError:
                 return None
+
+    async def create_schema_for_web_user(
+        self,
+        web_user_id: int,
+        schema_name: str,
+        schema_type: str = 'standard',
+        telegram_user_id: Optional[int] = None,
+    ) -> Optional[int]:
+        """
+        Создаёт новую схему для веб-пользователя.
+
+        Если у веб-пользователя есть привязанный telegram_user_id —
+        записывает оба ID. Если нет — только web_user_id, user_id = NULL.
+
+        Args:
+            web_user_id: ID в таблице web_users
+            schema_name: Название схемы
+            schema_type: Тип схемы ('standard' или 'mvm')
+            telegram_user_id: Telegram user_id (если привязан)
+
+        Returns:
+            ID созданной схемы или None если имя уже занято
+        """
+        async with self.pool.acquire() as conn:
+            try:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO schemas (user_id, web_user_id, schema_name, schema_type)
+                    VALUES ($1, $2, $3, $4)
+                    RETURNING id
+                    """,
+                    telegram_user_id, web_user_id, schema_name, schema_type,
+                )
+                return row['id']
+            except asyncpg.UniqueViolationError:
+                return None
+
+    async def get_web_user_schemas(
+        self,
+        web_user_id: int,
+    ) -> List[Dict]:
+        """
+        Получает список схем веб-пользователя.
+
+        Находит схемы по web_user_id ИЛИ по telegram_user_id
+        (если у веб-пользователя есть привязка к Telegram).
+
+        Args:
+            web_user_id: ID в таблице web_users
+
+        Returns:
+            Список словарей с информацией о схемах
+        """
+        async with self.pool.acquire() as conn:
+            # Получаем telegram_user_id привязанный к этому веб-пользователю
+            web_user_row = await conn.fetchrow(
+                "SELECT telegram_user_id FROM web_users WHERE id = $1",
+                web_user_id,
+            )
+
+            telegram_user_id = (
+                web_user_row['telegram_user_id']
+                if web_user_row and web_user_row['telegram_user_id']
+                else None
+            )
+
+            # Ищем схемы по web_user_id ИЛИ по telegram_user_id
+            if telegram_user_id:
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        s.id, s.schema_name, s.created_at, s.updated_at,
+                        s.schema_type,
+                        (SELECT COUNT(*) FROM schema_matches
+                         WHERE schema_id = s.id) AS matches_count
+                    FROM schemas s
+                    WHERE s.web_user_id = $1 OR s.user_id = $2
+                    ORDER BY s.updated_at DESC
+                    """,
+                    web_user_id, telegram_user_id,
+                )
+            else:
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        s.id, s.schema_name, s.created_at, s.updated_at,
+                        s.schema_type,
+                        (SELECT COUNT(*) FROM schema_matches
+                         WHERE schema_id = s.id) AS matches_count
+                    FROM schemas s
+                    WHERE s.web_user_id = $1
+                    ORDER BY s.updated_at DESC
+                    """,
+                    web_user_id,
+                )
+
+        schemas: List[Dict] = []
+        for row in rows:
+            schemas.append({
+                'id': row['id'],
+                'name': row['schema_name'],
+                'created_at': str(row['created_at']) if row['created_at'] else None,
+                'updated_at': str(row['updated_at']) if row['updated_at'] else None,
+                'matches_count': row['matches_count'],
+                'schema_type': row['schema_type'] or 'standard',
+            })
+        return schemas
+
+    async def get_schema_by_name_for_web_user(
+        self,
+        web_user_id: int,
+        schema_name: str,
+    ) -> Optional[Dict]:
+        """
+        Проверяет наличие схемы с данным именем у веб-пользователя.
+
+        Учитывает и привязанный telegram_user_id.
+
+        Args:
+            web_user_id: ID в таблице web_users
+            schema_name: Название схемы
+
+        Returns:
+            Словарь с информацией о схеме или None
+        """
+        async with self.pool.acquire() as conn:
+            # Получаем telegram_user_id
+            web_user_row = await conn.fetchrow(
+                "SELECT telegram_user_id FROM web_users WHERE id = $1",
+                web_user_id,
+            )
+
+            telegram_user_id = (
+                web_user_row['telegram_user_id']
+                if web_user_row and web_user_row['telegram_user_id']
+                else None
+            )
+
+            if telegram_user_id:
+                row = await conn.fetchrow(
+                    """
+                    SELECT id, schema_name, schema_type, created_at, updated_at
+                    FROM schemas
+                    WHERE schema_name = $1
+                      AND (web_user_id = $2 OR user_id = $3)
+                    LIMIT 1
+                    """,
+                    schema_name, web_user_id, telegram_user_id,
+                )
+            else:
+                row = await conn.fetchrow(
+                    """
+                    SELECT id, schema_name, schema_type, created_at, updated_at
+                    FROM schemas
+                    WHERE schema_name = $1 AND web_user_id = $2
+                    LIMIT 1
+                    """,
+                    schema_name, web_user_id,
+                )
+
+        if row is None:
+            return None
+
+        return {
+            'id': row['id'],
+            'name': row['schema_name'],
+            'schema_type': row['schema_type'] or 'standard',
+            'created_at': str(row['created_at']) if row['created_at'] else None,
+            'updated_at': str(row['updated_at']) if row['updated_at'] else None,
+        }
 
     async def get_user_schemas(
         self,
@@ -421,29 +591,43 @@ class Database:
                     """
                     SELECT
                         s.id, s.schema_name, s.created_at, s.updated_at,
-                        s.user_id, u.username, u.first_name,
+                        s.user_id, s.web_user_id,
+                        u.username, u.first_name,
+                        wu.display_name AS web_display_name,
+                        wu.email AS web_email,
                         (SELECT COUNT(*) FROM schema_matches
                          WHERE schema_id = s.id) AS matches_count,
                         s.schema_type
                     FROM schemas s
                     LEFT JOIN users u ON s.user_id = u.user_id
+                    LEFT JOIN web_users wu ON s.web_user_id = wu.id
                     ORDER BY s.updated_at DESC
                     """,
                 )
 
                 schemas: List[Dict] = []
                 for row in rows:
-                    owner_display = (
-                        row['first_name']
-                        if row['first_name']
-                        else f"ID: {row['user_id']}"
-                    )
+                    # Определяем отображаемое имя владельца
+                    if row['first_name']:
+                        owner_display = row['first_name']
+                    elif row['web_display_name']:
+                        owner_display = row['web_display_name']
+                    elif row['web_email']:
+                        owner_display = row['web_email']
+                    elif row['user_id']:
+                        owner_display = f"TG ID: {row['user_id']}"
+                    elif row['web_user_id']:
+                        owner_display = f"Web ID: {row['web_user_id']}"
+                    else:
+                        owner_display = "Неизвестен"
+
                     schemas.append({
                         'id': row['id'],
                         'name': row['schema_name'],
                         'created_at': str(row['created_at']) if row['created_at'] else None,
                         'updated_at': str(row['updated_at']) if row['updated_at'] else None,
                         'owner_id': row['user_id'],
+                        'web_user_id': row['web_user_id'],
                         'owner_name': owner_display,
                         'matches_count': row['matches_count'],
                         'schema_type': row['schema_type'] or 'standard',
@@ -533,7 +717,7 @@ class Database:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT id, user_id, schema_name, schema_type,
+                SELECT id, user_id, web_user_id, schema_name, schema_type,
                        created_at, updated_at
                 FROM schemas
                 WHERE schema_name = $1
@@ -549,6 +733,7 @@ class Database:
         return {
             'id': row['id'],
             'owner_id': row['user_id'],
+            'web_user_id': row['web_user_id'],
             'name': row['schema_name'],
             'schema_type': row['schema_type'] or 'standard',
             'created_at': str(row['created_at']) if row['created_at'] else None,

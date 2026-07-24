@@ -433,7 +433,7 @@ if cls.WEB_HOST and not cls.WEB_SECRET_KEY:
     )
 ```
 
-### `database/migrations.py` — миграции 003-005
+### `database/migrations.py` — миграции 003-006
 
 ```python
 (
@@ -489,6 +489,66 @@ if cls.WEB_HOST and not cls.WEB_SECRET_KEY:
     CREATE INDEX IF NOT EXISTS idx_task_results_task_id ON task_results(task_id);
     """
 ),
+
+(
+    "006_add_web_user_id_to_schemas",
+    """
+    DO $$
+    BEGIN
+        -- Добавляем столбец web_user_id если не существует
+        IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = 'schemas' AND column_name = 'web_user_id'
+        ) THEN
+            ALTER TABLE schemas
+                ADD COLUMN web_user_id INTEGER REFERENCES web_users(id);
+        END IF;
+
+        -- Делаем user_id nullable
+        ALTER TABLE schemas ALTER COLUMN user_id DROP NOT NULL;
+
+        -- Удаляем старый constraint уникальности
+        IF EXISTS (
+            SELECT 1 FROM information_schema.table_constraints
+            WHERE table_name = 'schemas'
+              AND constraint_type = 'UNIQUE'
+              AND constraint_name = 'schemas_user_id_schema_name_key'
+        ) THEN
+            ALTER TABLE schemas
+                DROP CONSTRAINT schemas_user_id_schema_name_key;
+        END IF;
+
+        -- Partial unique index для Telegram-пользователей
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_indexes
+            WHERE indexname = 'idx_schemas_unique_user_name'
+        ) THEN
+            CREATE UNIQUE INDEX idx_schemas_unique_user_name
+                ON schemas (user_id, schema_name)
+                WHERE user_id IS NOT NULL;
+        END IF;
+
+        -- Partial unique index для веб-пользователей
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_indexes
+            WHERE indexname = 'idx_schemas_unique_web_user_name'
+        ) THEN
+            CREATE UNIQUE INDEX idx_schemas_unique_web_user_name
+                ON schemas (web_user_id, schema_name)
+                WHERE web_user_id IS NOT NULL;
+        END IF;
+
+        -- Индекс по web_user_id
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_indexes
+            WHERE indexname = 'idx_schemas_web_user_id'
+        ) THEN
+            CREATE INDEX idx_schemas_web_user_id
+                ON schemas (web_user_id);
+        END IF;
+    END $$;
+    """
+),
 ```
 
 ### `database/database.py` — новые методы
@@ -502,6 +562,14 @@ async def update_web_user_last_login(self, user_id) -> None
 async def link_telegram_to_web_user(self, web_user_id, telegram_user_id) -> bool
 async def get_web_users_list(self, limit=50) -> List[Dict]
 async def set_web_user_active(self, user_id, is_active) -> None
+
+# === Схемы для веб-пользователей ===
+async def create_schema_for_web_user(self, web_user_id, schema_name, schema_type='standard', telegram_user_id=None) -> Optional[int]
+    # Создаёт схему с web_user_id. Если telegram_user_id передан — записывает оба ID.
+async def get_web_user_schemas(self, web_user_id) -> List[Dict]
+    # Находит схемы по web_user_id ИЛИ по привязанному telegram_user_id.
+async def get_schema_by_name_for_web_user(self, web_user_id, schema_name) -> Optional[Dict]
+    # Проверка уникальности имени для веб-пользователя (учитывает обе привязки).
 
 # === Веб-сессии ===
 async def create_web_session(self, web_user_id, session_id, expires_at, ip, ua) -> None
@@ -1126,7 +1194,9 @@ Facade-оркестратор. Создаёт компоненты `sync/`, ко
 - `POST /schemas/create` — синхронный (Вариант A): multipart-загрузка + AI inline. НЕ использует TaskQueue — результат возвращается как redirect после завершения AI
 - `/schemas/create` регистрируется ПЕРЕД `/schemas/{id:\d+}` в `setup_schemas_routes()` — иначе aiohttp интерпретирует "create" как {id}
 - В словарях для Jinja2 шаблонов НЕ использовать ключ "items" — конфликтует с dict.items(). Использовать "matches" или другое имя
-- Для создания схемы через веб пользователь ОБЯЗАН иметь привязанный telegram_user_id — схемы хранятся с FK на users(user_id)
+- Для создания схемы через веб привязка telegram_user_id НЕ обязательна — схемы могут храниться с web_user_id (FK на web_users(id)), user_id nullable
+- Если у веб-пользователя есть привязанный telegram_user_id — при создании схемы записываются оба ID для совместимости с ботом
+- Проверка владения схемой выполняется по web_user_id ИЛИ по telegram_user_id (user_id в schemas)
 
 ### Критичные зависимости
 
@@ -1148,7 +1218,9 @@ Facade-оркестратор. Создаёт компоненты `sync/`, ко
 - `tasks/list.html` использует `{{ _shorten_filename(filename) }}` — функция должна быть в Jinja2 globals
 - Tailwind CSS подключён через CDN в `base.html` — при отсутствии интернета на клиенте стили не загрузятся
 - `get_web_session()` ОБЯЗАН возвращать `telegram_user_id` из `web_users` — маршруты schemas, upload используют его для привязки к таблице users
-- Создание схемы через веб невозможно без привязки Telegram-аккаунта (telegram_user_id = NULL → ошибка)
+- Создание схемы через веб возможно без привязки Telegram-аккаунта — используется web_user_id
+- Владение схемой проверяется двусторонне: по schemas.web_user_id И по schemas.user_id (telegram)
+- `get_web_user_schemas(web_user_id)` ищет схемы по web_user_id ИЛИ по привязанному telegram_user_id
 
 ---
 
@@ -1172,6 +1244,7 @@ Facade-оркестратор. Создаёт компоненты `sync/`, ко
 - ✅ Исправлена модалка удаления схемы (display:none + правильная структура backdrop)
 - ✅ Добавлен telegram_user_id в данные веб-сессии (get_web_session)
 - ✅ Исправлена ошибка FK constraint при обработке веб-задач (user_id=0)
+- ✅ Убрано требование привязки Telegram для создания схем через веб (миграция 006, web_user_id в schemas)
 - ⬜ Создание МВМ-схем через веб (create_mvm.html + выбор категорий)
 - ⬜ Редактирование сопоставлений через веб (edit.html)
 
@@ -1212,7 +1285,8 @@ Facade-оркестратор. Создаёт компоненты `sync/`, ко
 - Tailwind CSS загружается через CDN (cdn.tailwindcss.com) — требуется интернет на стороне клиента
 - Шаблон create_mvm.html для МВМ-схем пока не реализован — создание МВМ-схем доступно только через Telegram-бота
 - Шаблон edit.html для редактирования сопоставлений пока не реализован — редактирование доступно только через Telegram-бота
-- Создание стандартных схем доступно через веб (POST /schemas/create, multipart, синхронный AI-запрос 5-15 сек)
+- Создание стандартных схем доступно через веб без привязки Telegram-аккаунта (POST /schemas/create, multipart, синхронный AI-запрос 5-15 сек)
+- Схемы, созданные через веб без telegram_user_id, НЕ видны в Telegram-боте до привязки аккаунта
 
 ---
 
@@ -1261,8 +1335,11 @@ Double Submit Cookie: при GET генерируется токен в cookie (
 **Можно ли создать схему через веб-интерфейс?**
 Да, стандартные схемы (3 МП) можно создавать через веб: /schemas/create. Wizard на одной странице: название + drag&drop файлов + кнопка запуска. AI-сопоставление выполняется синхронно (5-15 сек). МВМ-схемы (3 МП + XML) пока создаются только через Telegram-бота.
 
+**Видна ли в боте схема, созданная через веб без привязки Telegram?**
+Нет. Бот ищет схемы по `user_id` (Telegram ID). Если при создании схемы `telegram_user_id` не был привязан — схема будет видна только на вебе. После привязки Telegram-аккаунта в профиле все схемы пользователя станут доступны в обоих каналах.
+
 ---
 
-**Версия документации:** 5.0
+**Версия документации:** 5.1.1
 **Дата обновления:** Июль 2026
 **Автор проекта:** Александр

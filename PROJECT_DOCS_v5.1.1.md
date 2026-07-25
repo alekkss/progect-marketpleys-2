@@ -6,7 +6,7 @@ Telegram-бот и веб-приложение для автоматическо
 
 Два канала доступа к одному и тому же функционалу:
 - **Telegram-бот** — существующий интерфейс, работает без изменений
-- **Веб-сайт** (`https://galina-blanka.ru`) — браузерный интерфейс с drag&drop загрузкой, real-time прогрессом через WebSocket, скачиванием результатов
+- **Веб-сайт** (`https://ecommpedia.ru`) — браузерный интерфейс с drag&drop загрузкой, real-time прогрессом через WebSocket, скачиванием результатов
 
 Оба канала используют общую бизнес-логику, единую очередь задач и единую базу данных.
 
@@ -53,7 +53,7 @@ Telegram-бот и веб-приложение для автоматическо
 | Файлы | pandas + openpyxl | Чтение/запись Excel |
 | Real-time | WebSocket (aiohttp встроенный) | Прогресс обработки |
 | Reverse Proxy | Nginx | SSL, static, WebSocket proxy |
-| SSL | certbot (Let's Encrypt) | HTTPS для galina-blanka.ru |
+| SSL | certbot (Let's Encrypt) | HTTPS для ecommpedia.ru |
 
 ### Ключевые архитектурные принципы
 
@@ -191,10 +191,10 @@ Telegram-бот и веб-приложение для автоматическо
 │   └── config.py                     # Конфигурация (API keys, маппинги, DB/Redis/Web)
 │
 ├── /nginx/
-│   └── galina-blanka.conf            # Nginx: SSL, reverse proxy, static, WebSocket
+│   └── ecommpedia.conf               # Nginx: SSL, reverse proxy, static, WebSocket
 │
 ├── /scripts/
-│   ├── setup_ssl.sh                  # certbot --nginx -d galina-blanka.ru
+│   ├── setup_ssl.sh                  # certbot --nginx -d ecommpedia.ru
 │   └── deploy.sh                     # git pull + pip install + systemctl restart
 │
 └── /systemd/
@@ -1172,7 +1172,7 @@ async def create_web_app(
 
 ```javascript
 // Фронтенд (web/static/js/websocket.js)
-const ws = new WebSocket(`wss://galina-blanka.ru/ws/tasks/${taskId}`);
+const ws = new WebSocket(`wss://ecommpedia.ru/ws/tasks/${taskId}`);
 ws.onmessage = (event) => {
     const data = JSON.parse(event.data);
     switch (data.type) {
@@ -1290,7 +1290,7 @@ ACCESS_ADMIN_ID=436816068
 # === Веб-сервер (опционально — если не задан WEB_HOST, веб не запускается) ===
 WEB_HOST=127.0.0.1
 WEB_PORT=8080
-WEB_DOMAIN=galina-blanka.ru
+WEB_DOMAIN=ecommpedia.ru
 WEB_SECRET_KEY=<сгенерировать: python3 -c 'import secrets; print(secrets.token_hex(32))'>
 WEB_SESSION_MAX_AGE=86400
 WEB_REGISTRATION_OPEN=false
@@ -1543,11 +1543,11 @@ mkdir -p /root/progect/uploads /root/progect/downloads /root/progect/output /roo
 
 # 8. SSL-сертификат
 sudo apt install -y certbot python3-certbot-nginx
-sudo certbot --nginx -d galina-blanka.ru -d www.galina-blanka.ru
+sudo certbot --nginx -d ecommpedia.ru -d www.ecommpedia.ru
 
 # 9. Конфигурация Nginx
-sudo cp /root/progect/nginx/galina-blanka.conf /etc/nginx/sites-available/galina-blanka
-sudo ln -sf /etc/nginx/sites-available/galina-blanka /etc/nginx/sites-enabled/
+sudo cp /root/progect/nginx/ecommpedia.conf /etc/nginx/sites-available/ecommpedia
+sudo ln -sf /etc/nginx/sites-available/ecommpedia /etc/nginx/sites-enabled/
 sudo rm -f /etc/nginx/sites-enabled/default
 sudo nginx -t && sudo systemctl reload nginx
 
@@ -1560,92 +1560,23 @@ systemctl enable marketplace-bot
 systemctl start marketplace-bot
 ```
 
-### Nginx (`nginx/galina-blanka.conf`)
+### Nginx (`nginx/ecommpedia.conf`)
 
 ```nginx
 # HTTP → HTTPS redirect
 server {
     listen 80;
-    server_name galina-blanka.ru www.galina-blanka.ru;
+    server_name ecommpedia.ru www.ecommpedia.ru;
     return 301 https://$host$request_uri;
 }
 
 server {
     listen 443 ssl http2;
-    server_name galina-blanka.ru www.galina-blanka.ru;
+    server_name ecommpedia.ru www.ecommpedia.ru;
 
     # SSL (certbot)
-    ssl_certificate /etc/letsencrypt/live/galina-blanka.ru/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/galina-blanka.ru/privkey.pem;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-    ssl_prefer_server_ciphers on;
-
-    # Безопасность
-    add_header X-Content-Type-Options nosniff;
-    add_header X-Frame-Options DENY;
-    add_header X-XSS-Protection "1; mode=block";
-
-    # Static files (Nginx отдаёт напрямую, минуя Python)
-    location /static/ {
-        alias /root/progect/web/static/;
-        expires 30d;
-        add_header Cache-Control "public, immutable";
-        access_log off;
-    }
-
-    # Favicon
-    location /favicon.ico {
-        alias /root/progect/web/static/favicon.ico;
-        expires 30d;
-        access_log off;
-    }
-
-    # WebSocket (прогресс обработки)
-    location /ws/ {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_read_timeout 86400;  # 24ч для долгих WS-соединений
-    }
-
-    # Загрузка файлов (увеличенный лимит)
-    location /upload/ {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        client_max_body_size 250M;  # Для больших Excel/XML файлов
-        proxy_request_buffering off;
-        proxy_read_timeout 120;
-    }
-
-    # Скачивание результатов
-    location /tasks/ {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_buffering off;  # Streaming для больших файлов
-    }
-
-    # Все остальные запросы → aiohttp
-    location / {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_read_timeout 60;
-    }
-}
+    ssl_certificate /etc/letsencrypt/live/ecommpedia.ru/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/ecommpedia.ru/privkey.pem;
 ```
 
 ---
@@ -1799,6 +1730,7 @@ server {
 - [x] Добавлен telegram_user_id в данные веб-сессии (v5.1)
 - [x] Исправлена ошибка FK constraint при обработке веб-задач (user_id=0) (v5.1)
 - [x] Убрано требование привязки Telegram для создания схем через веб (миграция 006) (v5.1)
+- [x] Миграция домена с galina-blanka.ru на ecommpedia.ru (v5.1.2)
 
 ### Будущее
 - [ ] Создание МВМ-схем через веб (create_mvm.html + выбор категорий)
@@ -1934,6 +1866,6 @@ Double Submit Cookie: при GET генерируется токен в cookie (
 
 ---
 
-**Версия документации:** 5.1.1
+**Версия документации:** 5.1.2
 **Дата обновления:** Июль 2026
 **Автор проекта:** Александр

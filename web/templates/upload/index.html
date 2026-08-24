@@ -29,7 +29,8 @@
                 Перетащите файлы сюда или нажмите для выбора
             </p>
             <p class="text-xs text-slate-400">
-                .xlsx (WB, Ozon, Яндекс) и .xml (каталог МВМ) — до 250 МБ
+                .xlsx (WB, Ozon, Яндекс) и .xml (каталог МВМ) — до 250 МБ.<br>
+                Файлы можно загружать по одному — они накапливаются
             </p>
             <input type="file" id="fileInput" multiple accept=".xlsx,.xml" class="hidden">
         </div>
@@ -122,8 +123,22 @@
 {% block scripts %}
 <script>
     const csrfToken = '{{ csrf_token }}';
+
+    // Накопленное состояние загрузки: {wildberries: путь, ozon: путь, yandex: путь}.
+    // Файлы можно загружать по одному (отдельными запросами) —
+    // они накапливаются здесь до запуска обработки.
     let uploadedFiles = {};
     let xmlFilePath = null;
+
+    // МП, чьи файлы были заменены последней загрузкой (для подсветки в списке)
+    let lastReplaced = new Set();
+
+    // Названия и цвета маркетплейсов — единый источник для списка и сообщений
+    const MP_LABELS = {
+        wildberries: { name: 'Wildberries', color: 'bg-purple-50 text-purple-700' },
+        ozon: { name: 'Ozon', color: 'bg-blue-50 text-blue-700' },
+        yandex: { name: 'Яндекс', color: 'bg-yellow-50 text-yellow-700' },
+    };
 
     // === DOM элементы ===
     const dropZone = document.getElementById('dropZone');
@@ -165,8 +180,17 @@
     });
 
     // === Загрузка файлов ===
-    async function handleFiles(files) {
+    async function handleFiles(fileList) {
+        // ВАЖНО: сначала снимок в обычный массив.
+        // FileList — «живая» коллекция, привязанная к input:
+        // при сбросе fileInput.value она очищается немедленно.
+        // Array.from создаёт независимую копию — она переживает сброс.
+        const files = Array.from(fileList || []);
         if (!files.length) return;
+
+        // Сбрасываем input, чтобы повторный выбор того же файла
+        // снова вызвал событие change. После Array.from это безопасно.
+        fileInput.value = '';
 
         const formData = new FormData();
         for (const file of files) {
@@ -189,8 +213,25 @@
                 return;
             }
 
-            uploadedFiles = data.files || {};
-            xmlFilePath = data.xml || null;
+            // СЛИЯНИЕ вместо перезаписи: файлы текущего запроса
+            // добавляются к уже загруженным ранее. Повторная загрузка
+            // файла того же маркетплейса заменяет только его.
+            const newFiles = data.files || {};
+            lastReplaced = new Set();
+            const xmlWasReplaced = Boolean(data.xml)
+                && Boolean(xmlFilePath)
+                && data.xml !== xmlFilePath;
+
+            for (const [mp, path] of Object.entries(newFiles)) {
+                if (uploadedFiles[mp] && uploadedFiles[mp] !== path) {
+                    lastReplaced.add(mp);
+                }
+                uploadedFiles[mp] = path;
+            }
+
+            if (data.xml) {
+                xmlFilePath = data.xml;
+            }
 
             renderFileList();
 
@@ -198,7 +239,12 @@
                 showUploadStatus('warning', 'Предупреждения: ' + data.errors.join('; '));
             } else {
                 const count = Object.keys(uploadedFiles).length;
-                let msg = `Загружено: ${count} МП-файлов`;
+                let msg = `Загружено МП-файлов: ${count} из 3`;
+                if (lastReplaced.size > 0) {
+                    const names = [...lastReplaced].map(mp => (MP_LABELS[mp] || { name: mp }).name);
+                    msg += ` (заменены: ${names.join(', ')})`;
+                }
+                if (xmlWasReplaced) msg += '; XML обновлён';
                 if (xmlFilePath) msg += ' + XML';
                 showUploadStatus('success', msg);
             }
@@ -211,17 +257,12 @@
 
     // === Отображение загруженных файлов ===
     function renderFileList() {
-        const mpLabels = {
-            wildberries: { name: 'Wildberries', color: 'bg-purple-50 text-purple-700' },
-            ozon: { name: 'Ozon', color: 'bg-blue-50 text-blue-700' },
-            yandex: { name: 'Яндекс', color: 'bg-yellow-50 text-yellow-700' },
-        };
-
         let html = '';
 
         for (const [mp, path] of Object.entries(uploadedFiles)) {
-            const label = mpLabels[mp] || { name: mp, color: 'bg-slate-100 text-slate-600' };
+            const label = MP_LABELS[mp] || { name: mp, color: 'bg-slate-100 text-slate-600' };
             const filename = path.split('/').pop();
+            const isReplaced = lastReplaced.has(mp);
             html += `
                 <div class="flex items-center justify-between p-3 bg-slate-50 rounded-lg">
                     <div class="flex items-center gap-2 min-w-0">
@@ -230,6 +271,7 @@
                                   d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
                         </svg>
                         <span class="text-sm text-slate-700 truncate-text">${filename}</span>
+                        ${isReplaced ? '<span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-amber-50 text-amber-700">обновлён</span>' : ''}
                     </div>
                     <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${label.color}">
                         ${label.name}

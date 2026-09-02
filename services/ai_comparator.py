@@ -42,7 +42,7 @@ class AIComparator:
     # Параметры retry для AI-запросов
     _RETRY_MAX_ATTEMPTS: int = 3       # максимум попыток
     _RETRY_BASE_DELAY: float = 2.0     # базовая задержка в секундах
-    _RETRY_MAX_DELAY: float = 30.0     # максимальная задержка в секундах
+    _RETRY_MAX_DELAY: float = 30.0     # максимальная задержка
     _RETRY_JITTER: float = 0.3         # ±30% случайного отклонения
 
     def __init__(self):
@@ -1173,12 +1173,25 @@ class AIComparator:
             columns_3=json.dumps(columns_3, ensure_ascii=False, indent=2)
         )
 
-    async def _call_ai(self, prompt: str) -> str:
+    async def _call_ai(
+        self,
+        prompt: str,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+    ) -> str:
         """
         Вызывает AI API с ограничением параллельных запросов и retry.
 
         При временных ошибках (rate limit, 5xx, таймаут сети) повторяет
         запрос с экспоненциальным backoff и jitter ±30%.
+
+        Args:
+            prompt: Текст промпта.
+            model: Модель для ЭТОГО запроса; None — модель по умолчанию
+                из конфигурации (AI_MODEL). Используется сервисом маппинга
+                PIM+FDM для отдельной модели (AGENT_AI_MODEL).
+            temperature: Температура для ЭТОГО запроса; None — значение
+                по умолчанию из конфигурации (AI_TEMPERATURE).
 
         Retry применяется:
             - RateLimitError (429) — временный rate limit OpenRouter
@@ -1195,15 +1208,21 @@ class AIComparator:
         Raises:
             Exception: если все попытки исчерпаны или ошибка не подлежит retry.
         """
+        # Эффективные параметры: переопределение или значения по умолчанию
+        effective_model = model if model else AI_MODEL
+        effective_temperature = (
+            AI_TEMPERATURE if temperature is None else temperature
+        )
+
         async with self._semaphore:
             last_exception: Optional[Exception] = None
 
             for attempt in range(self._RETRY_MAX_ATTEMPTS):
                 try:
                     response = await self.client.chat.completions.create(
-                        model=AI_MODEL,
+                        model=effective_model,
                         messages=[{"role": "user", "content": prompt}],
-                        temperature=AI_TEMPERATURE,
+                        temperature=effective_temperature,
                     )
                     return response.choices[0].message.content
 
@@ -1258,6 +1277,81 @@ class AIComparator:
                 await asyncio.sleep(wait)
 
             raise last_exception
+
+    # ===================================================================
+    # НОВОЕ (v6.0): публичный API для внешних сервисов (маппинг PIM+FDM)
+    # ===================================================================
+    # Методы открывают контролируемый доступ к AI-запросам для пакета
+    # services/mapping/. Вызовы идут через тот же семафор, retry и
+    # HTTP-клиент — глобальный лимит AI-запросов приложения действует
+    # и на задания маппинга (единый контур ограничения нагрузки на
+    # LLM-провайдера).
+    # ===================================================================
+
+    async def call_ai(
+        self,
+        prompt: str,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+    ) -> str:
+        """
+        Публичный одиночный AI-запрос.
+
+        Предназначен для внешних сервисов (маппинг PIM+FDM), которым
+        нужен AI-запрос с собственным промптом. Семафор, retry и
+        прокси-клиент компаратора переиспользуются.
+
+        Args:
+            prompt: Полностью сформированный промпт.
+            model: Переопределение модели
+                (None — AI_MODEL из конфигурации).
+            temperature: Переопределение температуры
+                (None — AI_TEMPERATURE из конфигурации).
+
+        Returns:
+            Текст ответа от AI.
+
+        Raises:
+            Exception: ошибки AI-запроса (см. _call_ai).
+        """
+        return await self._call_ai(
+            prompt, model=model, temperature=temperature
+        )
+
+    async def call_ai_json(
+        self,
+        prompt: str,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+    ) -> Dict:
+        """
+        Публичный AI-запрос с разбором JSON-ответа.
+
+        Комбинация call_ai() и _parse_response(): выполняет запрос
+        и извлекает JSON-объект из ответа LLM (чистый JSON,
+        markdown-блок ```json или баланс фигурных скобок).
+
+        Используется мапперами services/mapping/, ожидающими
+        строго JSON в ответе.
+
+        Args:
+            prompt: Полностью сформированный промпт (ожидает JSON в ответе).
+            model: Переопределение модели
+                (None — AI_MODEL из конфигурации).
+            temperature: Переопределение температуры
+                (None — AI_TEMPERATURE из конфигурации).
+
+        Returns:
+            Распарсенный JSON-объект ответа.
+
+        Raises:
+            ValueError: если JSON в ответе AI не найден.
+            Exception: ошибки AI-запроса (см. _call_ai).
+        """
+        response_text = await self._call_ai(
+            prompt, model=model, temperature=temperature
+        )
+        return self._parse_response(response_text)
 
     def _parse_response(self, response_text: str) -> Dict:
         """Парсит ответ от AI"""

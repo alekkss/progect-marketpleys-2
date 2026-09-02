@@ -19,6 +19,11 @@ CSRF-защита для веб-форм.
     - /health — мониторинг
     - /api/* — JSON API (защищается через заголовок X-CSRF-Token)
     - /ws/* — WebSocket
+    - /v1/* — внешний REST API агента маппинга PIM+FDM.
+      Аутентификация Bearer-токеном в заголовке Authorization
+      уже доказывает происхождение запроса; cookie и HTML-формы
+      у API-клиента FDM отсутствуют — Double Submit Cookie
+      к нему неприменим.
 
 Отключение: WEB_CSRF_ENABLED=false в .env (для отладки).
 """
@@ -59,6 +64,7 @@ _EXEMPT_PATHS: Set[str] = {
 # Префиксы путей, исключённых из CSRF-проверки
 _EXEMPT_PREFIXES: tuple = (
     "/ws/",
+    "/v1/",
 )
 
 

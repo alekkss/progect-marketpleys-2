@@ -17,6 +17,9 @@ Middleware НЕ блокирует запрос — это ответствен�
     - /static/ — статические файлы
     - /auth/login — страница входа
     - /auth/register — страница регистрации
+    - /v1/ — внешний REST API агента маппинга PIM+FDM
+      (аутентифицируется собственным Bearer-токеном через
+      api_auth_middleware — контуры безопасности независимы)
 
 Паттерн: Middleware (Chain of Responsibility) — каждый запрос
 проходит через цепочку обработки, middleware добавляет контекст.
@@ -45,6 +48,7 @@ _PUBLIC_PATHS: Set[str] = {
 # Префиксы путей, для которых НЕ проверяется сессия
 _PUBLIC_PREFIXES: tuple = (
     "/static/",
+    "/v1/",
 )
 
 

@@ -18,6 +18,7 @@ from config.config import Config, TELEGRAM_BOT_TOKEN
 from bot.storage import init_storage, shutdown_storage
 from services.task_queue import create_task_queue, TaskQueue
 from services.task_worker import TaskWorker
+from services.mapping.job_worker import MappingJobWorker
 from services.ai_comparator import AIComparator
 from utils.logger_config import setup_logger
 
@@ -132,8 +133,11 @@ async def start_bot() -> None:
         5. Создание бота и диспетчера (с DI через workflow data)
         6. [Условно] Создание и запуск веб-сервера (если WEB_HOST задан)
         7. Запуск фонового воркера обработки задач
+        7.1 [Условно] Запуск воркера AI-агента маппинга PIM+FDM
+            (если задан FDM_API_TOKEN; использует общий AIComparator)
         8. Запуск polling
-        9. При остановке — graceful shutdown (веб → воркер → очередь → ресурсы)
+        9. При остановке — graceful shutdown:
+           веб → воркер задач → воркер агента → очередь → ресурсы
 
     Raises:
         ValueError: если обязательные параметры конфигурации не заданы
@@ -262,6 +266,49 @@ async def start_bot() -> None:
     )
     await task_worker.start(bot)
 
+    # ===================================================================
+    # Шаг 7.1: [Условно] Запуск воркера AI-агента маппинга PIM+FDM
+    # ===================================================================
+    # Воркер обрабатывает задания из таблицы mapping_jobs (запросы
+    # FDM через POST /v1/mapping-tasks). Запускается ТОЛЬКО при
+    # заданном FDM_API_TOKEN — пустой токен означает выключенный
+    # агент (маршруты /v1/* отвечают 503, бот работает как раньше).
+    #
+    # Воркер использует ОБЩИЙ ai_comparator: глобальный семафор
+    # ограничивает AI-запросы суммарно для синхронизации и маппинга.
+    #
+    # Graceful degradation: если агент не смог запуститься (нет
+    # промпта, ошибка БД) — бот и веб продолжают работу без агента.
+    # ===================================================================
+    mapping_worker: Optional[MappingJobWorker] = None
+
+    if Config.FDM_API_TOKEN:
+        try:
+            mapping_worker = MappingJobWorker(ai_comparator)
+            await mapping_worker.start()
+            print("🤖 AI-агент маппинга PIM+FDM запущен (/v1/mapping-tasks)")
+        except FileNotFoundError as e:
+            logger.error(
+                "AI-агент маппинга не запущен — отсутствует файл промпта: %s. "
+                "Маршруты /v1/* будут отвечать 503. "
+                "Создайте промпты в каталоге prompts/.",
+                e,
+            )
+            mapping_worker = None
+        except Exception as e:
+            logger.error(
+                "Ошибка запуска AI-агента маппинга: %s. "
+                "Бот и веб продолжат работу без агента "
+                "(маршруты /v1/* будут отвечать 503).",
+                e,
+                exc_info=True,
+            )
+            mapping_worker = None
+    else:
+        logger.info(
+            "FDM_API_TOKEN не задан — AI-агент маппинга выключен"
+        )
+
     # Шаг 8: Запуск polling с graceful shutdown
     logger.info("Telegram бот запущен!")
     print("🚀 Telegram бот запущен!")
@@ -272,9 +319,12 @@ async def start_bot() -> None:
         # Шаг 9: Корректное завершение
         # Порядок важен:
         #   1. Останавливаем веб-сервер (прекращаем приём HTTP)
-        #   2. Останавливаем воркер (ждём активных задач)
-        #   3. Отключаем очередь (Redis)
-        #   4. Закрываем основные ресурсы (PostgreSQL pool)
+        #   2. Останавливаем воркер синхронизации (ждём активных задач)
+        #   3. Останавливаем воркер AI-агента маппинга (ждёт задания;
+        #      пишет результаты в БД — обязан завершить до закрытия пула;
+        #      не использует Redis-очередь — отключать её до него не нужно)
+        #   4. Отключаем очередь (Redis)
+        #   5. Закрываем основные ресурсы (PostgreSQL pool)
         logger.info("Остановка приложения, закрытие ресурсов...")
 
         if web_runner:
@@ -282,6 +332,10 @@ async def start_bot() -> None:
             logger.info("Веб-сервер остановлен.")
 
         await task_worker.stop()
+
+        if mapping_worker:
+            await mapping_worker.stop()
+
         await task_queue.disconnect()
         await shutdown_storage()
         logger.info("Все ресурсы освобождены.")

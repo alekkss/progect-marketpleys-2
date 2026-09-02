@@ -14,6 +14,9 @@
     - categories.py — AJAX поиск категорий XML (Фаза 4)
     - websocket.py  — WebSocket прогресса (Фаза 1) ✓
     - api.py        — JSON API для AJAX (Фаза 4)
+    - v1_api.py     — внешний REST API агента маппинга PIM+FDM
+                      (POST/GET /v1/mapping-tasks, Bearer-аутентификация
+                      через api_auth_middleware)
 
 Паттерн: каждый модуль маршрутов экспортирует функцию
 setup_*_routes(app), которая регистрирует свою группу.
@@ -34,6 +37,7 @@ from web.routes.schemas import setup_schemas_routes
 from web.routes.upload import setup_upload_routes
 from web.routes.tasks import setup_tasks_routes
 from web.routes.admin import setup_admin_routes
+from web.routes.v1_api import setup_v1_api_routes
 from utils.logger_config import setup_logger
 
 logger = setup_logger("web.routes")
@@ -71,6 +75,8 @@ def setup_routes(app: "web.Application") -> None:
         2. Аутентификация (/auth/*)
         3. Бизнес-маршруты (/dashboard, /schemas, /upload, /tasks)
         4. Администрирование (/admin/*)
+        5. Внешний API агента маппинга (/v1/*) — Bearer-аутентификация
+           через api_auth_middleware, не зависит от порядка регистрации
 
     Args:
         app: Экземпляр aiohttp Application
@@ -90,6 +96,9 @@ def setup_routes(app: "web.Application") -> None:
 
     # Администрирование (требует роли admin+)
     setup_admin_routes(app)
+
+    # Внешний REST API агента маппинга PIM+FDM (Bearer-аутентификация)
+    setup_v1_api_routes(app)
 
     logger.info("Маршруты веб-приложения зарегистрированы")
 

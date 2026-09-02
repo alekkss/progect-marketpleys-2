@@ -278,6 +278,72 @@ MIGRATIONS: list[tuple[str, str]] = [
         END $$;
         """
     ),
+    (
+        "007_create_mapping_jobs_table",
+        """
+        -- =================================================================
+        -- Задания AI-агента маппинга PIM+FDM (v6.0)
+        -- =================================================================
+        -- Таблица выполняет две роли (решение по задаче 5 доработок):
+        --   1. Хранилище очереди заданий: воркер извлекает pending-задания
+        --      через SELECT ... FOR UPDATE SKIP LOCKED (строка блокируется
+        --      только для выбирающего её процесса).
+        --   2. История и статистика для дашборда оператора: каналы,
+        --      длительность, счётчики результата.
+        --
+        -- id — jobId из ответа 202; генерируется API-слоем (secrets.token_hex)
+        -- schema_id — ИД схемы на стороне FDM; НЕ FK: идентификатор внешней
+        --      системы, целостность обеспечивает FDM.
+        -- payload — исходный JSON запроса (для страницы детализации
+        --      и воспроизведения инцидентов).
+        -- result — итоговый JSON по протоколу (results+unresolved либо
+        --      channels+matches).
+        -- channels — список каналов [{platform, name, schemaChannelId}]
+        --      для отображения в дашборде без парсинга payload.
+        -- category_name / attribute_name — заголовок задания в дашборде.
+        -- matched_count / unresolved_count — счётчики результата.
+        -- duration_sec — время обработки (started_at → completed_at).
+        --
+        -- Статус 'cancelled' зарезервирован для будущего эндпоинта
+        -- DELETE /v1/mapping-tasks/{jobId} (отложен по согласованию) —
+        -- включён в CHECK сейчас, чтобы не мигрировать constraint позже.
+        -- =================================================================
+        CREATE TABLE IF NOT EXISTS mapping_jobs (
+            id TEXT PRIMARY KEY,
+            task_type TEXT NOT NULL,
+            schema_id BIGINT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            payload JSONB NOT NULL,
+            result JSONB,
+            channels JSONB NOT NULL DEFAULT '[]'::jsonb,
+            category_name TEXT,
+            attribute_name TEXT,
+            matched_count INTEGER,
+            unresolved_count INTEGER,
+            duration_sec REAL,
+            error_message TEXT,
+            created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+            started_at TIMESTAMP WITH TIME ZONE,
+            completed_at TIMESTAMP WITH TIME ZONE,
+            CONSTRAINT mapping_jobs_task_type_check
+                CHECK (task_type IN ('attribute_mapping', 'reference_value_mapping')),
+            CONSTRAINT mapping_jobs_status_check
+                CHECK (status IN ('pending', 'processing', 'completed', 'failed', 'cancelled'))
+        );
+
+        -- Выборка очереди воркером: WHERE status='pending' ORDER BY created_at
+        CREATE INDEX IF NOT EXISTS idx_mapping_jobs_status
+            ON mapping_jobs (status, created_at);
+
+        -- Сортировка дашборда по дате (новые сверху)
+        CREATE INDEX IF NOT EXISTS idx_mapping_jobs_created
+            ON mapping_jobs (created_at DESC);
+
+        -- Поиск по схеме в дашборде + очистка устаревших заданий
+        CREATE INDEX IF NOT EXISTS idx_mapping_jobs_schema
+            ON mapping_jobs (schema_id);
+        """
+    ),
 ]
 
 

@@ -1,14 +1,16 @@
-# Marketplace Sync — Актуальная документация проекта (v5.1.1)
+# Marketplace Sync — Актуальная документация проекта (v6.0)
 
 ## Назначение
 
 Telegram-бот и веб-приложение для автоматической синхронизации данных товаров между тремя маркетплейсами: Wildberries, Ozon и Яндекс.Маркет. Система использует AI для интеллектуального сопоставления столбцов Excel-файлов и валидации значений с учётом справочников (validation lists).
 
-Два канала доступа к одному и тому же функционалу:
+Три канала доступа:
 - **Telegram-бот** — существующий интерфейс, работает без изменений
 - **Веб-сайт** (`https://ecommpedia.ru`) — браузерный интерфейс с drag&drop загрузкой, real-time прогрессом через WebSocket, скачиванием результатов
+- **Внешний REST API** (`https://ecommpedia.ru/v1/mapping-tasks`) — AI-агент маппинга PIM+FDM (v6.0): принимает задания от внешней системы FDM на сопоставление атрибутов категорий и справочных значений между маркетплейсами, Bearer-аутентификация, асинхронная обработка с GET-поллингом статуса
 
-Оба канала используют общую бизнес-логику, единую очередь задач и единую базу данных.
+Все каналы используют общую бизнес-логику, единый пул БД и общий AIComparator с глобальным семафором AI-запросов. Файловые задачи идут через Redis TaskQueue, задания агента — через таблицу mapping_jobs в PostgreSQL (разные жизненные циклы).
+
 
 ---
 
@@ -23,7 +25,10 @@ Telegram-бот и веб-приложение для автоматическо
 │   ├─ ai_comparator     └─ migrations.py  ├─ xml_reader          │
 │   ├─ task_queue.py                       ├─ excel_writer        │
 │   ├─ task_worker.py                      └─ logger_config       │
-│   └─ sync/ (7 компонентов)                                      │
+│   ├─ sync/ (7 компонентов)                                      │
+│   └─ mapping/ (AI-агент PIM+FDM, v6.0):                          │
+│      models, validators, attribute_mapper,                      │
+│      reference_value_mapper, job_worker                         │
 └───────────────────────────────┬──────────────────────────────────┘
                                  │
                 ┌────────────────┼─────────────────┐
@@ -35,7 +40,15 @@ Telegram-бот и веб-приложение для автоматическо
          │  keyboards  │  │  templates  │   │  notify     │
          │  states     │  │  static     │   │             │
          │             │  │  middleware │   │             │
-         └─────────────┘  └─────────────┘   └─────────────┘
+         └─────────────┘  └──────┬──────┘   └─────────────┘
+                                 │ /v1/* (HTTPS + Bearer)
+                                 ▲
+                          ┌──────┴──────┐
+                          │    FDM      │
+                          │ (внешняя    │
+                          │  система)   │
+                          └─────────────┘
+
 ```
 
 ### Технологии
@@ -61,6 +74,8 @@ Telegram-бот и веб-приложение для автоматическо
 - **Единая очередь** — и бот, и веб ставят задачи в одну TaskQueue. TaskWorker обрабатывает их одинаково, доставка результата зависит от `delivery_channel` в Task.
 - **Strategy для доставки** — `ResultDelivery` абстракция с двумя реализациями: `TelegramDelivery` (Bot.send_document) и `WebDelivery` (сохранение + WebSocket-уведомление).
 - **Бот не изменён** — все существующие хендлеры, FSM, клавиатуры работают как раньше. Веб-интерфейс — параллельный канал, а не замена.
+- **AI-агент маппинга PIM+FDM (v6.0)** — асинхронные задания из PostgreSQL (не Redis-очередь): `POST /v1/mapping-tasks` → таблица `mapping_jobs` → `MappingJobWorker` → результат через GET-поллинг FDM. Использует общий AIComparator: семафор(5) ограничивает AI-запросы суммарно с синхронизацией файлов.
+- **Два независимых контура безопасности** — сайт: cookie-сессии + CSRF; API `/v1/*`: Bearer-токен `FDM_API_TOKEN`. `/v1/*` исключён из auth/csrf middleware, проверяется `api_auth_middleware` (constant-time сравнение, 401/503).
 
 ---
 
@@ -72,6 +87,13 @@ Telegram-бот и веб-приложение для автоматическо
 ├── .env                              # Конфигурация (API ключи, DB, Redis, Web)
 ├── .env.example                      # Шаблон переменных окружения с описаниями
 │
+├── /prompts/                         # === ПРОМПТЫ AI (читаются с диска при старте) ===
+│   ├── column_matching.txt           # Сопоставление столбцов (3 МП, первый проход)
+│   ├── schema_comparison.txt         # Второй проход (оставшиеся столбцы)
+│   ├── value_validation.txt          # Валидация значений против справочников
+│   ├── mvm_column_matching.txt       # МВМ-сопоставление (4 источника)
+│   ├── attribute_mapping.txt         # Маппинг атрибутов PIM+FDM (v6.0)
+│   └── reference_value_mapping.txt   # Маппинг справочных значений PIM+FDM (v6.0)
 ├── /bot/                             # === TELEGRAM БОТ (без изменений) ===
 │   ├── bot.py                        # Инициализация бота, веб-сервера, жизненный цикл
 │   ├── storage.py                    # Глобальный Database + SessionStorage + init/shutdown
@@ -109,10 +131,11 @@ Telegram-бот и веб-приложение для автоматическо
 │   │   └── decorators.py             # @login_required, @admin_required, @editor_required
 │   │
 │   ├── /middleware/
-│   │   ├── __init__.py
-│   │   ├── auth.py                   # Проверка cookie-сессии
-│   │   ├── errors.py                 # 404, 500, JSON errors
-│   │   └── csrf.py                   # CSRF-токены для форм
+│   │   ├── __init__.py               # setup_middlewares: errors → auth → csrf → api_auth
+│   │   ├── auth.py                   # Проверка cookie-сессии (пропускает /v1/*)
+│   │   ├── errors.py                 # 404, 500, JSON errors (+ JSON для /v1/*, статус 422)
+│   │   ├── csrf.py                   # CSRF-токены для форм (пропускает /v1/*)
+│   │   └── api_auth.py               # Bearer-аутентификация /v1/* (v6.0)
 │   │
 │   ├── /routes/
 │   │   ├── __init__.py               # setup_routes(app) — регистрация всех маршрутов
@@ -124,7 +147,10 @@ Telegram-бот и веб-приложение для автоматическо
 │   │   ├── admin.py                  # /admin — управление пользователями
 │   │   ├── categories.py             # /api/categories — AJAX поиск категорий XML
 │   │   ├── websocket.py              # /ws/tasks/{id} — real-time прогресс
-│   │   └── api.py                    # /api/* — JSON API для AJAX
+│   │   ├── api.py                    # /api/* — JSON API для AJAX
+│   │   ├── v1_api.py                 # /v1/mapping-tasks — внешний REST API агента (v6.0)
+│   │   └── agent.py                  # /agent — дашборд оператора агента (v6.0, admin+)
+
 │   │
 │   ├── /templates/
 │   │   ├── base.html                 # Layout: nav, footer, Tailwind CDN, scripts
@@ -142,8 +168,12 @@ Telegram-бот и веб-приложение для автоматическо
 │   │   │   └── index.html            # Drag&drop + выбор схемы
 │   │   ├── /tasks/
 │   │   │   └── list.html             # Задачи + прогресс
-│   │   └── /admin/
-│   │       └── users.html            # Whitelist управление
+│   │   ├── /admin/
+│   │   │   └── users.html            # Whitelist управление
+│   │   └── /agent/                   # Дашборд AI-агента (v6.0)
+│   │       ├── list.html             # История заданий FDM: поиск, пагинация
+│   │       └── detail.html           # Детализация: связки, confidence, unresolved
+
 │   │
 │   └── /static/
 │       ├── /css/
@@ -165,6 +195,13 @@ Telegram-бот и веб-приложение для автоматическо
 │   ├── task_worker.py                # Фоновый воркер: читает очередь, обрабатывает Task через
 │   │                                 # DataSynchronizer, отправляет результат пользователю.
 │   │                                 # _FileCleanupService — раз в 24 ч удаляет файлы старше FILE_MAX_AGE_DAYS
+│   ├── /mapping/                     # === AI-АГЕНТ МАППИНГА PIM+FDM (v6.0) ===
+│   │   ├── __init__.py               # Пакет, экспорты
+│   │   ├── models.py                 # Dataclass-модели задач/результатов + to_dict() по протоколу
+│   │   ├── validators.py             # Валидация payload (MappingValidationError: 400/422, путь до поля)
+│   │   ├── attribute_mapper.py       # Стратегия attribute_mapping + sanitize_confidence/truncate_comment
+│   │   ├── reference_value_mapper.py # Стратегия reference_value_mapping (гарантия полноты matches)
+│   │   └── job_worker.py             # MappingJobWorker: цикл очереди из БД, таймауты, graceful stop
 │   └── /sync/                        # Подпакет компонентов синхронизации (v4.2)
 │       ├── __init__.py               # Экспорты подпакета
 │       ├── value_converter.py        # ValueConverter — единицы измерения и конвертация
@@ -238,6 +275,13 @@ Telegram-бот и веб-приложение для автоматическо
    - `_FileCleanupService` — очистка файлов каждые 24ч
    - `Semaphore(MAX_CONCURRENT_TASKS)`
 
+7.1. **[Условно] Запуск MappingJobWorker** (v6.0, если `FDM_API_TOKEN` задан):
+   - Создаётся с общим `ai_comparator` из шага 4 — НЕ собственный (глобальный семафор AI-запросов)
+   - `recover_stale_mapping_jobs(0)` — зависшие processing-задания (следы падения процесса) → failed
+   - Основной цикл: `claim_pending_mapping_job()` (FOR UPDATE SKIP LOCKED, FIFO) + маршрутизация по `task_type` в мапперы
+   - Цикл обслуживания: раз в 24 ч `cleanup_old_mapping_jobs(AGENT_JOBS_RETENTION_DAYS)`
+   - Graceful degradation: ошибка запуска агента (нет промпта, сбой БД) — бот и веб продолжают работу, `/v1/*` отвечает 503
+
 8. **Параллельный запуск**:
    ```python
    runner = web.AppRunner(web_app)
@@ -251,6 +295,7 @@ Telegram-бот и веб-приложение для автоматическо
 9. **Graceful shutdown** — строгий порядок:
    - `await runner.cleanup()` — остановка веб-сервера
    - `await task_worker.stop()` — ожидание задач → `comparator.close()` → `cleanup_service.stop()`
+   - `await mapping_worker.stop()` — воркер агента: grace 30 сек, прерванные задания → failed (v6.0; пишет в БД — обязан завершиться до закрытия пула; Redis-очередь не использует)
    - `await task_queue.disconnect()` — Redis
    - `await shutdown_storage()` — PostgreSQL pool
 
@@ -443,7 +488,26 @@ task_results            # Результаты задач для веба (ми�
   - created_at TIMESTAMPTZ DEFAULT NOW()
   - completed_at TIMESTAMPTZ
   - error_message TEXT
+
+mapping_jobs            # Задания AI-агента маппинга PIM+FDM (миграция 007, v6.0)
+  - id TEXT PK                       -- jobId (secrets.token_hex(16), 32 hex-символа)
+  - task_type TEXT                   -- 'attribute_mapping' | 'reference_value_mapping' (CHECK)
+  - schema_id BIGINT NOT NULL        -- ИД схемы FDM (внешняя система, НЕ FK)
+  - status TEXT DEFAULT 'pending'    -- pending → processing → completed | failed (CHECK; 'cancelled' зарезервирован)
+  - payload JSONB NOT NULL           -- исходный JSON запроса FDM
+  - result JSONB                     -- итоговый JSON по протоколу
+  - channels JSONB DEFAULT '[]'      -- [{platform, name, schemaChannelId}] для дашборда
+  - category_name TEXT               -- заголовок задания в дашборде (задача 1)
+  - attribute_name TEXT              -- заголовок задания в дашборде (задача 2)
+  - matched_count INTEGER            -- сопоставлено связок/значений
+  - unresolved_count INTEGER         -- без соответствий
+  - duration_sec REAL                -- completed_at − started_at (вычисляется в SQL)
+  - error_message TEXT
+  - created_at, started_at, completed_at TIMESTAMPTZ
+  -- Индексы: (status, created_at) — очередь воркера; (created_at DESC) — дашборд; (schema_id) — поиск
+
 ```
+
 
 ### Миграции
 
@@ -466,6 +530,8 @@ task_results            # Результаты задач для веба (ми�
 - `004_create_web_sessions_table` — создаёт таблицу `web_sessions`
 - `005_create_task_results_table` — создаёт таблицу `task_results`
 - `006_add_web_user_id_to_schemas` — добавляет `web_user_id` в `schemas`, делает `user_id` nullable, partial unique indexes
+- `007_create_mapping_jobs_table` — таблица заданий AI-агента `mapping_jobs` + индексы (v6.0)
+
 
 ### Ключевые особенности реализации
 
@@ -513,6 +579,147 @@ async def get_user_task_results(self, web_user_id, limit=20) -> List[Dict]
 ```
 
 ---
+
+### Методы Database для AI-агента (v6.0)
+
+```python
+# === Задания агента (mapping_jobs) ===
+async def create_mapping_job(self, job_id, task_type, schema_id, payload, channels,
+                             category_name=None, attribute_name=None) -> None
+    # Создаёт задание в статусе pending (вызывается POST /v1/mapping-tasks)
+async def claim_pending_mapping_job(self) -> Optional[Dict]
+    # Атомарно забирает старейшее pending-задание:
+    # UPDATE ... WHERE id = (SELECT ... FOR UPDATE SKIP LOCKED) — FIFO, конкурентная безопасность
+    # Возвращает {job_id, task_type, schema_id, payload} или None
+async def mark_mapping_job_completed(self, job_id, result, matched_count=None, unresolved_count=None) -> None
+    # duration_sec вычисляется В SQL: EXTRACT(EPOCH FROM (NOW() - started_at))
+async def mark_mapping_job_failed(self, job_id, error_message) -> None
+async def get_mapping_job(self, job_id) -> Optional[Dict]
+    # Для GET-поллинга FDM: {job_id, task_type, status, result, error_message}
+async def get_mapping_jobs_list(self, search='', limit=50, offset=0) -> List[Dict]
+    # Дашборд /agent: поиск по schema_id (текст) / category_name / attribute_name, новые сверху
+async def get_mapping_jobs_count(self, search='') -> int
+async def get_mapping_job_detail(self, job_id) -> Optional[Dict]
+    # Полная запись с payload и result для страницы детализации
+async def recover_stale_mapping_jobs(self, stale_seconds=0) -> int
+    # Зависшие processing → failed; вызывается при старте MappingJobWorker
+async def cleanup_old_mapping_jobs(self, retention_days) -> int
+    # Удаляет completed/failed старше retention_days; активные не удаляются никогда
+```
+
+---
+
+## Правка 10. Вставка: новый раздел «AI-агент маппинга PIM+FDM (v6.0)»
+
+Место: после раздела «TaskQueue и TaskWorker (v4.5–v5.1)», перед «Веб-приложение: детали реализации».
+
+```markdown
+## AI-агент маппинга PIM+FDM (v6.0)
+
+### Назначение
+
+Внешняя система FDM (PIM) присылает через REST API задания на AI-сопоставление:
+- **attribute_mapping** — атрибуты конечной категории ↔ атрибуты категорий каналов (маркетплейсов)
+- **reference_value_mapping** — значения справочника атрибута ↔ значения справочников каналов (в контексте одной связки атрибута)
+
+Результаты (связки с confidence + нераспознанное) возвращаются FDM для создания маппингов в их системе. История доступна оператору через дашборд `/agent`.
+
+### Протокол HTTP
+
+| Метод | URL | Назначение | Ответ |
+|---|---|---|---|
+| POST | `/v1/mapping-tasks` | Создать задание | `202 {jobId, status: "pending"}` |
+| GET | `/v1/mapping-tasks/{jobId}` | Статус/результат (поллинг) | `200` (см. ниже) |
+| DELETE | `/v1/mapping-tasks/{jobId}` | Не реализован (отложен) | `405` от aiohttp |
+
+Аутентификация: заголовок `Authorization: Bearer <FDM_API_TOKEN>` обязателен на все `/v1/*`.
+
+GET-ответы по статусам:
+- `pending` / `processing` → `{"jobId", "status"}`
+- `completed` → `{"jobId", "status", ...result}` — ключи result разворачиваются на верхний уровень (`results`+`unresolved` для задачи 1, `channels` для задачи 2)
+- `failed` → `{"jobId", "status", "error": "<причина>"}`
+
+Коды ошибок POST: 400 (тело не JSON), 422 (семантические ошибки валидации — с путём до поля), 401 (нет/невалиден токен), 503 (агент выключен: `FDM_API_TOKEN` пуст). Все ответы — JSON (включая 404/405/500 на `/v1/*` — см. errors-middleware).
+
+Рекомендации FDM: поллинг каждые 3 сек, бюджет 5 минут — сверх него задание гарантированно в терминальном статусе (таймаут обработки 240 сек).
+
+### Поток обработки
+
+FDM → POST /v1/mapping-tasks (Bearer)
+→ валидация payload (validators.py; 400/422)
+→ create_mapping_job → mapping_jobs (pending) → 202 {jobId}
+FDM → GET /v1/mapping-tasks/{jobId} каждые 3 сек
+
+MappingJobWorker (цикл, пауза 5 сек при пустой очереди)
+→ claim_pending_mapping_job (FOR UPDATE SKIP LOCKED, FIFO)
+→ parse_mapping_task → маршрутизация по task_type
+→ AttributeMapper | ReferenceValueMapper
+→ ОДИН AI-запрос через общий AIComparator (call_ai_json)
+→ пост-валидация всех ID против входных данных
+→ mark_mapping_job_completed(result, счётчики) | failed(error)
+→ FDM получает result при следующем GET
+
+
+### Валидация payload (`services/mapping/validators.py`)
+
+- Разбор JSON → dataclass-модели (`services/mapping/models.py`); ошибки — `MappingValidationError(status, message)` с путём до поля: `channels[3].attributes[10].channelAttributeId: обязательное поле`
+- Лимиты защиты промпта (Config, override в .env): `AGENT_MAX_ATTRIBUTES=100`, `AGENT_MAX_CHANNELS=20`, `AGENT_MAX_CHANNEL_ATTRIBUTES=500`, `AGENT_MAX_REFERENCE_VALUES=1000`, `AGENT_MAX_REFERENCE_CHANNEL_VALUES=2000`
+- Проверки: уникальность mappingId/channelAttributeId/schemaChannelId, согласованность reference_type и полей задачи 2
+
+### Мапперы (паттерн Strategy, общий контракт: задача → один AI-запрос → пост-валидация → result)
+
+**AttributeMapper** (`attribute_mapper.py`, промпт `prompts/attribute_mapping.txt`):
+- Плейсхолдеры промпта: `category_name`, `category_path`, `attributes_json`, `channels_json`
+- LLM возвращает `matches[]`: `{mappingId, confidence, comment, channelMatches[{schemaChannelId, channelAttributeId, confidence}]}`
+- Пост-валидация: mappingId существует во входных атрибутах; schemaChannelId/channelAttributeId существуют и в ЭТОМ канале; атрибут канала используется один раз по результату; связка без валидных channelMatches → unresolved
+- `infomodelAttributeId` берётся из входных данных по mappingId (LLM его не возвращает)
+- `unresolved` вычисляется детерминированно: все входные mappingId минус решённые — списку AI не доверяется
+
+**ReferenceValueMapper** (`reference_value_mapper.py`, промпт `prompts/reference_value_mapping.txt`):
+- Плейсхолдеры: `attribute_name`, `attribute_slug`, `reference_type`, `category_values_json`, `channels_json`
+- LLM возвращает `channels[].matches[]`: `{infoValue, channelValue, channelValueId, confidence}`
+- Пара (channelValueId, channelValue) обязана ссылаться на ОДНО значение справочника канала — любое несовпадение → null (`channelValue` сохраняется в FDM как есть, ошибка привязки хуже пустой)
+- Полнота гарантируется кодом: ровно одна запись на каждое значение категории в каждом канале; недостающие/отклонённые → детерминированные null
+- Быстрый путь: все справочники каналов пусты → null-результат без AI-запроса
+
+**Общие хелперы** (публичные функции `attribute_mapper.py`): `sanitize_confidence()` (число 0..1, проценты 87 → 0.87), `truncate_comment()` (≤200 символов).
+
+### MappingJobWorker (`services/mapping/job_worker.py`)
+
+- Параллелизм: `Semaphore(AGENT_MAX_CONCURRENT_JOBS=3)` — слот берётся ПОСЛЕ claim и ДО создания Task (backpressure)
+- Таймаут: `wait_for(AGENT_JOB_TIMEOUT_SEC=240)` → failed «Превышен таймаут обработки» (укладывается в 5-минутный бюджет поллинга FDM)
+- Отличие таймаута от остановки: таймаут → TimeoutError → «таймаут»; stop() → CancelledError → «воркер остановлен» — FDM в обоих случаях получает внятный error
+- Остановка: grace 30 сек, затем отмена остатка; `_safe_fail` пишет причину best-effort
+- Обслуживание: раз в 24 ч `cleanup_old_mapping_jobs(AGENT_JOBS_RETENTION_DAYS=30)`
+- При старте: `recover_stale_mapping_jobs(0)` — processing-задания от упавшего процесса → failed
+
+### Публичный API AIComparator (v6.0)
+
+```python
+await comparator.call_ai(prompt, model=None, temperature=None) -> str
+await comparator.call_ai_json(prompt, model=None, temperature=None) -> Dict
+# Семафор(5), retry с backoff, прокси — общие со синхронизацией файлов.
+# model=None → AI_MODEL; мапперы передают AGENT_AI_MODEL (пусто → None → общая модель).
+```
+
+Безопасность: два независимых контура
+Сайт (/auth, /schemas, /agent, ...)	API (/v1/*)
+Аутентификация	cookie MARKETPLACE_SESSION	Bearer FDM_API_TOKEN
+Защита форм	CSRF (Double Submit Cookie)	не нужна — Bearer-заголовок сам доказывает происхождение
+Middleware	auth + csrf (обе пропускают /v1/*)	api_auth (constant-time, 401/503)
+secrets.compare_digest — исключает timing-атаки; WWW-Authenticate: Bearer по RFC 6750
+Отказы логируются с IP; текст единый — без раскрытия причин (защита от разведки)
+Пустой FDM_API_TOKEN → 503 на все /v1/* — безопасный деплой по умолчанию
+HTTP→HTTPS редирект nginx: токен ходит только по TLS
+Дашборд оператора (/agent)
+GET /agent — таблица: jobId (обрезан до 12 симв.), заголовок, тип, схема #, каналы, дата, длительность, статус-бейдж, счётчики ✓/?; поиск по schema_id/категории/атрибуту; пагинация 20/стр
+GET /agent/{job_id} — шапка задания, причина ошибки (failed), таблица связок (атрибут → соответствия по каналам, confidence-бейджи ≥85%/≥70%/ниже, комментарий LLM), блок unresolved-чипов; для задачи 2 — матрица «значение категории × каналы»
+Доступ: @admin_required (owner/admin); пункт меню «Агент» в base.html внутри условия owner/admin
+Названия атрибутов/каналов восстанавливаются из payload по ID (result хранит только ID по протоколу)
+Мониторинг
+Access-лог nginx: /var/log/nginx/agent_api_access.log (ротация стандартным logrotate)
+Логгеры приложения: mapping.job_worker, mapping.attribute_mapper, mapping.reference_value_mapper, web.routes.v1_api
+Дашборд /agent — история с длительностями и счётчиками
 
 ## Стандарты кодирования
 
@@ -974,6 +1181,7 @@ AI_TEMPERATURE=0.1
 - `AIComparator.compare_columns()` — `async def`
 - `AIComparator.compare_columns_mvm()` — `async def`
 - `AIComparator.match_value_with_list()` — `async def`
+- `AIComparator.call_ai()` / `AIComparator.call_ai_json()` — `async def` (v6.0, публичный API для маппинга PIM+FDM; семафор и retry наследуются)
 - `DataSynchronizer.synchronize_data()` — `async def`
 - `AiValidator.validate_multiple_values()` — `async def`
 - `AiValidator._validate_with_ai()` — `async def`
@@ -1136,6 +1344,11 @@ async def create_web_app(
 | POST | `/admin/users/role` | Изменение роли пользователя | Admin+ |
 | POST | `/api/categories/search` | Поиск категорий XML | Да |
 | GET | `/ws/tasks/{id}` | WebSocket прогресса | Да |
+| POST | `/v1/mapping-tasks` | Создание задания маппинга (внешний API FDM) | Bearer (api_auth) |
+| GET | `/v1/mapping-tasks/{jobId}` | Статус/результат задания (поллинг FDM) | Bearer (api_auth) |
+| GET | `/agent` | Дашборд заданий агента | Admin+ |
+| GET | `/agent/{job_id}` | Детализация задания агента | Admin+ |
+
 
 *Регистрация доступна только если `WEB_REGISTRATION_OPEN=true`
 
@@ -1310,9 +1523,24 @@ DOWNLOAD_DIR=/root/progect/downloads
 OUTPUT_DIR=/root/progect/output
 FILE_MAX_AGE_DAYS=7
 
+# === AI-агент маппинга PIM+FDM (v6.0; ПУСТОЙ FDM_API_TOKEN = агент ВЫКЛЮЧЕН, /v1/* → 503) ===
+FDM_API_TOKEN=            # python3 -c "import secrets; print(secrets.token_hex(32))"; тот же токен у FDM (FDM_AI_AGENT_API_KEY)
+AGENT_AI_MODEL=           # модель для заданий маппинга (пусто = AI_MODEL)
+AGENT_AI_TEMPERATURE=0.1
+AGENT_MAX_CONCURRENT_JOBS=3
+AGENT_POLL_INTERVAL_SEC=5
+AGENT_JOB_TIMEOUT_SEC=240
+AGENT_JOBS_RETENTION_DAYS=30
+AGENT_MAX_ATTRIBUTES=100
+AGENT_MAX_CHANNELS=20
+AGENT_MAX_CHANNEL_ATTRIBUTES=500
+AGENT_MAX_REFERENCE_VALUES=1000
+AGENT_MAX_REFERENCE_CHANNEL_VALUES=2000
+
 # === Прокси (опционально) ===
 PROXY_ENABLED=false
 PROXY_URL=http://user:pass@host:port
+
 ```
 
 ### Обязательные переменные
@@ -1413,14 +1641,16 @@ dp.callback_query.middleware(AccessControlMiddleware())
 
 ### Web Middleware
 
-**Порядок:** errors → auth → csrf
+**Порядок:** errors → auth → csrf → api_auth
 
-- **errors** — внешний слой: обрабатывает 404, 500, JSON errors
-- **auth** — загружает `request["user"]` из cookie-сессии. НЕ блокирует запросы, только загружает данные
+- **errors** — внешний слой: обрабатывает 404, 500, JSON errors; для `/v1/*` и `/api/*` ВСЕГДА JSON-тело (включая 422 — статус семантических ошибок валидации API)
+- **auth** — загружает `request["user"]` из cookie-сессии. НЕ блокирует запросы, только загружает данные. `/v1/*` пропускает без проверки
 - **csrf** — Double Submit Cookie: cookie httponly=False + hidden field / X-CSRF-Token header. Сравнение через `secrets.compare_digest` (constant-time)
+- **api_auth** — Bearer-аутентификация `/v1/*` (v6.0): `Authorization: Bearer <FDM_API_TOKEN>`, constant-time сравнение, 401 с `WWW-Authenticate` (RFC 6750), 503 при пустом токене. Прочие пути пропускает
 
 CSRF отключается через `WEB_CSRF_ENABLED=false` — только для отладки.
-CSRF НЕ проверяется для путей `/health`, `/ws/*`.
+CSRF НЕ проверяется для путей `/health`, `/ws/*`, `/v1/*`.
+
 
 ### Иерархия проверок
 
@@ -1550,6 +1780,9 @@ sudo cp /root/progect/nginx/ecommpedia.conf /etc/nginx/sites-available/ecommpedi
 sudo ln -sf /etc/nginx/sites-available/ecommpedia /etc/nginx/sites-enabled/
 sudo rm -f /etc/nginx/sites-enabled/default
 sudo nginx -t && sudo systemctl reload nginx
+sudo nginx -t && sudo systemctl reload nginx
+# Smoke-тест API: ожидаем JSON 401
+curl -s https://ecommpedia.ru/v1/mapping-tasks/abc123
 
 # 10. Тестовый запуск
 python3 main.py
@@ -1574,9 +1807,24 @@ server {
     listen 443 ssl http2;
     server_name ecommpedia.ru www.ecommpedia.ru;
 
-    # SSL (certbot)
+        # SSL (certbot)
     ssl_certificate /etc/letsencrypt/live/ecommpedia.ru/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/ecommpedia.ru/privkey.pem;
+
+    # Внешний REST API AI-агента PIM+FDM (v6.0):
+    # POST/GET /v1/mapping-tasks, Bearer-аутентификация в приложении.
+    # Таймауты не задаются: POST → 202 мгновенно, обработка в фоновом воркере.
+    location /v1/ {
+        proxy_pass http://marketplace_bot_web;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        client_max_body_size 10M;
+        access_log /var/log/nginx/agent_api_access.log;
+    }
+
 ```
 
 ---
@@ -1645,6 +1893,25 @@ server {
 - Для создания схемы через веб привязка telegram_user_id НЕ обязательна — схемы могут храниться с web_user_id (FK на web_users(id)), user_id nullable
 - Если у веб-пользователя есть привязанный telegram_user_id — при создании схемы записываются оба ID для совместимости с ботом
 - Проверка владения схемой выполняется по web_user_id ИЛИ по telegram_user_id (user_id в schemas)
+
+**AI-агент маппинга PIM+FDM (v6.0):**
+- `FDM_API_TOKEN` пустой = агент ВЫКЛЮЧЕН (`/v1/*` → 503) — безопасный деплой по умолчанию; токен передаётся FDM как `FDM_AI_AGENT_API_KEY`
+- `MappingJobWorker` использует ОБЩИЙ AIComparator из `bot/bot.py` — НЕ создавать собственный (глобальный семафор(5) на всё приложение)
+- Задания агента читаются из PostgreSQL (`mapping_jobs`), НЕ из Redis TaskQueue — разные очереди для разных жизненных циклов
+- `claim_pending_mapping_job()` — единственный способ забрать задание (FOR UPDATE SKIP LOCKED): конкурентные воркеры не заберут одно задание дважды
+- `duration_sec` вычисляется В SQL (`completed_at − started_at`) — НЕ измерять в Python
+- Пост-валидация ответов LLM в мапперах обязательна: каждый ID сверяется со входными данными; `unresolved` вычисляется детерминированно, списку AI не доверяется ни одна ссылка
+- Пара `(channelValueId, channelValue)` в reference_value_mapping обязана ссылаться на одно значение справочника канала — несовпадение → null
+- `channelValue` — авторитетная строка для FDM: сохраняется как есть, НЕ переформулировать
+- Порядок shutdown: `web_runner.cleanup()` → `task_worker.stop()` → `mapping_worker.stop()` → `task_queue.disconnect()` → `shutdown_storage()` — воркер агента пишет в БД, обязан завершиться до закрытия пула
+- При старте воркер вызывает `recover_stale_mapping_jobs(0)` — processing-задания прошлого процесса → failed
+- Таймаут `AGENT_JOB_TIMEOUT_SEC=240` укладывается в 5-минутный бюджет поллинга FDM
+- `v1_api.py` возвращает ошибки напрямую через `web.json_response` (точные тексты валидации для FDM), НЕ через HTTPException — errors-middleware содержит только обобщённые тексты
+- jobId — `secrets.token_hex(16)` (32 hex): непредсказуем, защита от перебора чужих заданий
+- Пустой справочник канала (`referenceValues=[]`) — все значения категории получают null, AI-запрос не нужен
+- Дашборд `/agent` — `@admin_required`; названия в детализации восстанавливаются из payload (result хранит только ID)
+- Промпты маппинга (`attribute_mapping.txt`, `reference_value_mapping.txt`) читаются один раз в конструкторах мапперов — отсутствие файла = ошибка запуска воркера (fail fast)
+
 
 ### Критичные зависимости
 
@@ -1731,6 +1998,18 @@ server {
 - [x] Исправлена ошибка FK constraint при обработке веб-задач (user_id=0) (v5.1)
 - [x] Убрано требование привязки Telegram для создания схем через веб (миграция 006) (v5.1)
 - [x] Миграция домена с galina-blanka.ru на ecommpedia.ru (v5.1.2)
+- [x] Миграция домена с galina-blanka.ru на ecommpedia.ru (v5.1.2)
+- [x] AI-агент маппинга PIM+FDM: REST API `/v1/mapping-tasks` (POST 202 + GET-поллинг) (v6.0)
+- [x] Маппинг атрибутов категорий (attribute_mapping) с пост-валидацией ID против входных данных (v6.0)
+- [x] Маппинг справочных значений (reference_value_mapping) с гарантией полноты matches (v6.0)
+- [x] Таблица mapping_jobs + миграция 007 + методы Database (очередь FOR UPDATE SKIP LOCKED) (v6.0)
+- [x] MappingJobWorker: параллелизм 3, таймаут 240 сек, восстановление зависших, ретеншен 30 дн (v6.0)
+- [x] Bearer-аутентификация `/v1/*` — независимый контур безопасности (constant-time, 401/503) (v6.0)
+- [x] Дашборд оператора `/agent` с поиском, пагинацией и детализацией связок (v6.0)
+- [x] Nginx `location /v1/` + отдельный access-лог `agent_api_access.log` (v6.0)
+- [ ] DELETE /v1/mapping-tasks/{jobId} — отмена задания (статус 'cancelled' уже зарезервирован в CHECK)
+
+
 
 ### Будущее
 - [ ] Создание МВМ-схем через веб (create_mvm.html + выбор категорий)
@@ -1773,6 +2052,17 @@ server {
 - Шаблон edit.html для редактирования сопоставлений пока не реализован — редактирование доступно только через Telegram-бота
 - Создание стандартных схем доступно через веб без привязки Telegram-аккаунта (POST /schemas/create, multipart, синхронный AI-запрос 5-15 сек)
 - Схемы, созданные через веб без telegram_user_id, НЕ видны в Telegram-боте до привязки аккаунта
+
+**AI-агент маппинга PIM+FDM (v6.0):**
+- `FDM_API_TOKEN` пустой — агент выключен: `/v1/*` отвечает 503, бот/веб работают
+- Таймаут обработки задания 240 сек (`AGENT_JOB_TIMEOUT_SEC`) — сверх него задание → failed
+- Максимум 3 параллельных задания агента (`AGENT_MAX_CONCURRENT_JOBS`), остальные ждут в БД (FIFO)
+- Payload ограничен валидатором: ≤100 атрибутов категории, ≤20 каналов, ≤500 атрибутов канала, ≤1000 значений категории, ≤2000 значений канала (сверх — 422)
+- Поллинг FDM: рекомендация 3 сек, бюджет 5 мин — сверх бюджета задание гарантированно терминальное
+- DELETE-эндпоинт не реализован (отложен) — aiohttp отвечает 405
+- История заданий хранится 30 дней (`AGENT_JOBS_RETENTION_DAYS`), затем удаляется
+- Тело запроса `/v1/*`: nginx ограничивает 10 МБ (`client_max_body_size`); превышение — HTML 413 от nginx (на практике недостижимо: валидатор режет раньше)
+
 
 ---
 
@@ -1864,8 +2154,34 @@ Double Submit Cookie: при GET генерируется токен в cookie (
 **Видна ли в боте схема, созданная через веб без привязки Telegram?**
 Нет. Бот ищет схемы по `user_id` (Telegram ID). Если при создании схемы `telegram_user_id` не был привязан — схема будет видна только на вебе. После привязки Telegram-аккаунта в профиле все схемы пользователя станут доступны в обоих каналах.
 
+### AI-агент маппинга (v6.0)
+
+**Как включить агента?**
+Сгенерировать токен: `python3 -c "import secrets; print(secrets.token_hex(32))"`, записать в `.env` как `FDM_API_TOKEN`, перезапустить бота. Токен и base URL (`https://ecommpedia.ru/v1`) передать команде FDM (у них — `FDM_AI_AGENT_API_KEY`). Миграция БД применится автоматически при старте.
+
+**Почему задания агента в PostgreSQL, а не в Redis-очереди?**
+Внешний API требует персистентности и статусов: FDM поллит GET, дашборд показывает историю, зависшие задания восстанавливаются при рестарте. Redis TaskQueue — для файловых задач с доставкой пользователю; у них другой жизненный цикл.
+
+**Почему один AI-запрос на задание?**
+Задание — одна связка (категория или атрибут). Промпт получает компактный JSON всех атрибутов/значений и всех каналов сразу; один ответ покрывает всё. Дешевле и быстрее, чем N запросов.
+
+**Что если LLM придумает несуществующий ID?**
+Пост-валидация в мапперах сверяет каждый ID со входными данными: галлюцинации отбрасываются, недостающие записи дополняются null (задача 2) или попадают в unresolved (задача 1). Результату AI не доверяет ни одна ссылка.
+
+**Чем отличается таймаут от остановки воркера?**
+Таймаут (240 сек) → failed «Превышен таймаут обработки». Остановка сервиса → failed «Воркер агента остановлен во время обработки». FDM в обоих случаях получает внятный `error` вместо вечного поллинга.
+
+**Где смотреть историю запросов FDM?**
+Веб → пункт «Агент» (owner/admin): список с поиском, детализация со связками и confidence. Access-лог: `/var/log/nginx/agent_api_access.log`.
+
+**Можно ли агенту отдельную модель?**
+Да: `AGENT_AI_MODEL` в `.env` (пусто = общая `AI_MODEL`). Температура — `AGENT_AI_TEMPERATURE`.
+
+**Почему /v1/* исключён из CSRF?**
+CSRF-атака эксплуатирует автоматическую отправку cookie браузером. FDM сознательно кладёт `Authorization` в заголовок — сторонняя страница не способна его прочитать или заставить браузер отправить. Bearer-заголовок сам является proof-of-origin.
+
 ---
 
-**Версия документации:** 5.1.2
-**Дата обновления:** Июль 2026
+**Версия документации:** 6.0
+**Дата обновления:** Август 2026
 **Автор проекта:** Александр

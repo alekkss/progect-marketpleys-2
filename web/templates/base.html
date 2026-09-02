@@ -74,6 +74,10 @@
                        class="nav-link{% if request.path.startswith('/admin') %} nav-link-active{% endif %}">
                         Админ
                     </a>
+                    <a href="/agent"
+                       class="nav-link{% if request.path.startswith('/agent') %} nav-link-active{% endif %}">
+                        Агент
+                    </a>
                     {% endif %}
                 </div>
 
@@ -119,6 +123,7 @@
                 <a href="/tasks" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-100">Задачи</a>
                 {% if user.role in ('owner', 'admin') %}
                 <a href="/admin/users" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-100">Админ</a>
+                <a href="/agent" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-100">Агент</a>
                 {% endif %}
             </div>
         </div>

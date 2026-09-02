@@ -1755,3 +1755,437 @@ class Database:
             })
 
         return results
+
+    # =================================================================
+    # Задания AI-агента маппинга PIM+FDM (mapping_jobs)
+    # =================================================================
+    # Таблица совмещает очередь заданий (claim_pending_mapping_job)
+    # и историю/статистику для дашборда оператора.
+    #
+    # Жизненный цикл (п. 4.2 доработок):
+    #     pending → processing → completed | failed
+    #
+    # Длительность (duration_sec) вычисляется на стороне SQL из
+    # started_at и completed_at — единый источник истины, воркер
+    # не измеряет время сам и не может разойтись с БД.
+    # =================================================================
+
+    @staticmethod
+    def _parse_jsonb_field(value: object) -> Optional[object]:
+        """
+        Разбирает значение JSONB-столбца в Python-объект.
+
+        asyncpg без кастомных кодеков возвращает JSONB строкой;
+        при установленных кодеках — уже разобранным объектом.
+        Метод безопасно обрабатывает оба случая.
+
+        Args:
+            value: Сырое значение столбца
+
+        Returns:
+            Разобранный объект (dict/list) или None
+        """
+        if value is None:
+            return None
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except (json.JSONDecodeError, TypeError):
+                return None
+        return value
+
+    async def create_mapping_job(
+        self,
+        job_id: str,
+        task_type: str,
+        schema_id: int,
+        payload: Dict,
+        channels: List[Dict],
+        category_name: Optional[str] = None,
+        attribute_name: Optional[str] = None,
+    ) -> None:
+        """
+        Создаёт задание в статусе pending.
+
+        Вызывается маршрутом POST /v1/mapping-tasks после успешной
+        валидации. Каналы и человекочитаемые названия сохраняются
+        отдельными столбцами — дашборд читает их без парсинга payload.
+
+        Args:
+            job_id: Идентификатор задания (генерирует API-слой)
+            task_type: 'attribute_mapping' или 'reference_value_mapping'
+            schema_id: Идентификатор схемы FDM
+            payload: Полный исходный JSON запроса
+            channels: Список [{platform, name, schemaChannelId}]
+            category_name: Название категории (для дашборда)
+            attribute_name: Название атрибута (для дашборда)
+        """
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO mapping_jobs
+                    (id, task_type, schema_id, payload, channels,
+                     category_name, attribute_name, status)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
+                """,
+                job_id, task_type, schema_id,
+                json.dumps(payload, ensure_ascii=False),
+                json.dumps(channels, ensure_ascii=False),
+                category_name, attribute_name,
+            )
+        logger.info(
+            "Задание агента создано: id=%s, тип=%s, схема=%s",
+            job_id, task_type, schema_id,
+        )
+
+    async def claim_pending_mapping_job(self) -> Optional[Dict]:
+        """
+        Атомарно забирает старейшее pending-задание в обработку.
+
+        Переводит статус pending → processing и фиксирует started_at
+        одним UPDATE с подзапросом FOR UPDATE SKIP LOCKED:
+        строка блокируется только для текущей транзакции, конкурентные
+        выборки не ждут друг друга и не забирают одну строку дважды.
+
+        Вызывается MappingJobWorker.
+
+        Returns:
+            Словарь {job_id, task_type, schema_id, payload}
+            (payload — разобранный JSON) или None, если очередь пуста
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE mapping_jobs
+                SET status = 'processing',
+                    started_at = NOW()
+                WHERE id = (
+                    SELECT id
+                    FROM mapping_jobs
+                    WHERE status = 'pending'
+                    ORDER BY created_at ASC
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING id, task_type, schema_id, payload
+                """
+            )
+
+        if row is None:
+            return None
+
+        payload = self._parse_jsonb_field(row['payload'])
+        return {
+            'job_id': row['id'],
+            'task_type': row['task_type'],
+            'schema_id': row['schema_id'],
+            'payload': payload if isinstance(payload, dict) else {},
+        }
+
+    async def mark_mapping_job_completed(
+        self,
+        job_id: str,
+        result: Dict,
+        matched_count: Optional[int] = None,
+        unresolved_count: Optional[int] = None,
+    ) -> None:
+        """
+        Завершает задание успешно.
+
+        Длительность вычисляется в SQL: completed_at − started_at.
+
+        Args:
+            job_id: Идентификатор задания
+            result: Итоговый JSON по протоколу (to_dict() результата)
+            matched_count: Число сопоставленных связок/значений
+            unresolved_count: Число несопоставленных (unresolved/null)
+        """
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE mapping_jobs
+                SET status = 'completed',
+                    result = $2,
+                    matched_count = $3,
+                    unresolved_count = $4,
+                    completed_at = NOW(),
+                    duration_sec = EXTRACT(EPOCH FROM (NOW() - started_at))
+                WHERE id = $1
+                """,
+                job_id,
+                json.dumps(result, ensure_ascii=False),
+                matched_count,
+                unresolved_count,
+            )
+        logger.info("Задание агента %s завершено успешно", job_id)
+
+    async def mark_mapping_job_failed(
+        self,
+        job_id: str,
+        error_message: str,
+    ) -> None:
+        """
+        Завершает задание с ошибкой.
+
+        Args:
+            job_id: Идентификатор задания
+            error_message: Текст ошибки (возвращается FDM в поле error)
+        """
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE mapping_jobs
+                SET status = 'failed',
+                    error_message = $2,
+                    completed_at = NOW(),
+                    duration_sec = EXTRACT(EPOCH FROM (NOW() - started_at))
+                WHERE id = $1
+                """,
+                job_id, error_message,
+            )
+        logger.error("Задание агента %s завершено с ошибкой: %s", job_id, error_message)
+
+    async def get_mapping_job(self, job_id: str) -> Optional[Dict]:
+        """
+        Получает задание по ID для GET-поллинга FDM.
+
+        Args:
+            job_id: Идентификатор задания
+
+        Returns:
+            Словарь с данными задания или None если не найдено.
+            result — разобранный JSON (None для pending/processing)
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT id, task_type, status, result, error_message
+                FROM mapping_jobs
+                WHERE id = $1
+                """,
+                job_id,
+            )
+
+        if row is None:
+            return None
+
+        result = self._parse_jsonb_field(row['result'])
+        return {
+            'job_id': row['id'],
+            'task_type': row['task_type'],
+            'status': row['status'],
+            'result': result if isinstance(result, dict) else None,
+            'error_message': row['error_message'],
+        }
+
+    async def get_mapping_jobs_list(
+        self,
+        search: str = '',
+        limit: int = 50,
+        offset: int = 0,
+    ) -> List[Dict]:
+        """
+        Получает список заданий для дашборда оператора (п. 6.1-6.2).
+
+        Сортировка — новые сверху. Поиск — по schemaId (как текст),
+        названию категории и названию атрибута.
+
+        Args:
+            search: Строка поиска (пустая — без фильтра)
+            limit: Количество записей на странице
+            offset: Смещение страницы (пагинация)
+
+        Returns:
+            Список словарей с данными для таблицы дашборда
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    id, task_type, schema_id, status,
+                    category_name, attribute_name,
+                    jsonb_array_length(channels) AS channels_count,
+                    matched_count, unresolved_count, duration_sec,
+                    error_message, created_at, started_at, completed_at
+                FROM mapping_jobs
+                WHERE ($1 = '' OR
+                       schema_id::text LIKE '%' || $1 || '%' OR
+                       category_name ILIKE '%' || $1 || '%' OR
+                       attribute_name ILIKE '%' || $1 || '%')
+                ORDER BY created_at DESC
+                LIMIT $2 OFFSET $3
+                """,
+                search, limit, offset,
+            )
+
+        jobs: List[Dict] = []
+        for row in rows:
+            jobs.append({
+                'job_id': row['id'],
+                'task_type': row['task_type'],
+                'schema_id': row['schema_id'],
+                'status': row['status'],
+                'category_name': row['category_name'],
+                'attribute_name': row['attribute_name'],
+                'channels_count': row['channels_count'],
+                'matched_count': row['matched_count'],
+                'unresolved_count': row['unresolved_count'],
+                'duration_sec': row['duration_sec'],
+                'error_message': row['error_message'],
+                'created_at': str(row['created_at']) if row['created_at'] else None,
+                'started_at': str(row['started_at']) if row['started_at'] else None,
+                'completed_at': str(row['completed_at']) if row['completed_at'] else None,
+            })
+        return jobs
+
+    async def get_mapping_jobs_count(self, search: str = '') -> int:
+        """
+        Возвращает количество заданий с учётом поиска — для пагинации.
+
+        Args:
+            search: Строка поиска (пустая — без фильтра)
+
+        Returns:
+            Общее количество записей по фильтру
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM mapping_jobs
+                WHERE ($1 = '' OR
+                       schema_id::text LIKE '%' || $1 || '%' OR
+                       category_name ILIKE '%' || $1 || '%' OR
+                       attribute_name ILIKE '%' || $1 || '%')
+                """,
+                search,
+            )
+        return row['cnt']
+
+    async def get_mapping_job_detail(self, job_id: str) -> Optional[Dict]:
+        """
+        Получает полную запись задания для страницы детализации (п. 6.3).
+
+        Включает payload и result целиком — страница показывает
+        произведённые связки, уверенность и нераспознанное.
+
+        Args:
+            job_id: Идентификатор задания
+
+        Returns:
+            Словарь со всеми полями задания или None
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    id, task_type, schema_id, status, payload, result,
+                    channels, category_name, attribute_name,
+                    matched_count, unresolved_count, duration_sec,
+                    error_message, created_at, started_at, completed_at
+                FROM mapping_jobs
+                WHERE id = $1
+                """,
+                job_id,
+            )
+
+        if row is None:
+            return None
+
+        payload = self._parse_jsonb_field(row['payload'])
+        result = self._parse_jsonb_field(row['result'])
+        channels = self._parse_jsonb_field(row['channels'])
+
+        return {
+            'job_id': row['id'],
+            'task_type': row['task_type'],
+            'schema_id': row['schema_id'],
+            'status': row['status'],
+            'payload': payload if isinstance(payload, dict) else {},
+            'result': result if isinstance(result, dict) else None,
+            'channels': channels if isinstance(channels, list) else [],
+            'category_name': row['category_name'],
+            'attribute_name': row['attribute_name'],
+            'matched_count': row['matched_count'],
+            'unresolved_count': row['unresolved_count'],
+            'duration_sec': row['duration_sec'],
+            'error_message': row['error_message'],
+            'created_at': str(row['created_at']) if row['created_at'] else None,
+            'started_at': str(row['started_at']) if row['started_at'] else None,
+            'completed_at': str(row['completed_at']) if row['completed_at'] else None,
+        }
+
+    async def recover_stale_mapping_jobs(self, stale_seconds: int = 0) -> int:
+        """
+        Помечает failed задания, застрявшие в processing.
+
+        Вызывается MappingJobWorker при старте: единственный воркер
+        процесса не может иметь активных processing-заданий до запуска,
+        поэтому все такие записи — следы падения предыдущего процесса
+        (graceful degradation: FDM получит failed вместо вечного поллинга).
+
+        Args:
+            stale_seconds: Порог зависания в секундах
+                (0 — считать зависшими все processing-задания)
+
+        Returns:
+            Количество переведённых в failed заданий
+        """
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE mapping_jobs
+                SET status = 'failed',
+                    error_message = 'Воркер агента перезапущен во время '
+                                    'обработки — задание прервано',
+                    completed_at = NOW()
+                WHERE status = 'processing'
+                  AND started_at < NOW() - make_interval(secs => $1)
+                """,
+                stale_seconds,
+            )
+            try:
+                count = int(result.split()[-1])
+            except (IndexError, ValueError):
+                count = 0
+
+        if count > 0:
+            logger.warning(
+                "Восстановление заданий агента: %d зависших переведены в failed",
+                count,
+            )
+        return count
+
+    async def cleanup_old_mapping_jobs(self, retention_days: int) -> int:
+        """
+        Удаляет завершённые задания старше указанного срока.
+
+        Вызывается циклом обслуживания воркера агента.
+        Активные задания (pending/processing) не удаляются никогда.
+
+        Args:
+            retention_days: Срок хранения заданий в днях
+
+        Returns:
+            Количество удалённых записей
+        """
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                DELETE FROM mapping_jobs
+                WHERE status IN ('completed', 'failed')
+                  AND created_at < NOW() - make_interval(days => $1)
+                """,
+                retention_days,
+            )
+            try:
+                count = int(result.split()[-1])
+            except (IndexError, ValueError):
+                count = 0
+
+        if count > 0:
+            logger.info(
+                "Очистка заданий агента: удалено %d записей старше %d дн.",
+                count, retention_days,
+            )
+        return count

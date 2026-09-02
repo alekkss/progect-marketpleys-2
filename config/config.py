@@ -164,6 +164,40 @@ class Config:
     WEB_REGISTRATION_OPEN: bool = os.getenv("WEB_REGISTRATION_OPEN", "false").lower() == "true"
     WEB_CSRF_ENABLED: bool = os.getenv("WEB_CSRF_ENABLED", "true").lower() == "true"
 
+        # ===================================================================
+    # AI-агент маппинга PIM+FDM (REST API /v1/mapping-tasks)
+    # ===================================================================
+    # Внешний контур: FDM отправляет задания на маппинг атрибутов и
+    # справочных значений (POST /v1/mapping-tasks) и поллит статус
+    # (GET /v1/mapping-tasks/{jobId}). Аутентификация — Bearer-токен,
+    # полностью независимый от cookie-сессий сайта.
+    #
+    # FDM_API_TOKEN               — Bearer-токен для /v1/*. Пустой —
+    #                               агент выключен, /v1/* отвечает 503
+    # AGENT_AI_MODEL              — модель для маппинга; "" → AI_MODEL
+    # AGENT_AI_TEMPERATURE        — температура (0.0 — детерминированность)
+    # AGENT_MAX_CONCURRENT_JOBS   — одновременных заданий агента (свой семафор)
+    # AGENT_POLL_INTERVAL_SEC     — интервал опроса БД воркером агента
+    # AGENT_JOB_TIMEOUT_SEC       — таймаут задания → failed (поллинг FDM 5 мин)
+    # AGENT_JOBS_RETENTION_DAYS   — срок хранения заданий в БД
+    # AGENT_MAX_ATTRIBUTES        — лимит атрибутов категории (422 сверх)
+    # AGENT_MAX_CHANNEL_ATTRIBUTES — лимит атрибутов на один канал (422 сверх)
+    # AGENT_MAX_REFERENCE_VALUES  — лимит значений справочника (422 сверх)
+    # AGENT_MAX_CHANNELS          — максимум каналов в задании (спека: 3)
+    # ===================================================================
+    FDM_API_TOKEN: str = os.getenv("FDM_API_TOKEN", "")
+    AGENT_AI_MODEL: str = os.getenv("AGENT_AI_MODEL", "")
+    AGENT_AI_TEMPERATURE: float = _safe_float_env("AGENT_AI_TEMPERATURE", 0.0)
+    AGENT_MAX_CONCURRENT_JOBS: int = _safe_int_env("AGENT_MAX_CONCURRENT_JOBS", 2)
+    AGENT_POLL_INTERVAL_SEC: float = _safe_float_env("AGENT_POLL_INTERVAL_SEC", 2.0)
+    AGENT_JOB_TIMEOUT_SEC: int = _safe_int_env("AGENT_JOB_TIMEOUT_SEC", 240)
+    AGENT_JOBS_RETENTION_DAYS: int = _safe_int_env("AGENT_JOBS_RETENTION_DAYS", 30)
+    AGENT_MAX_ATTRIBUTES: int = _safe_int_env("AGENT_MAX_ATTRIBUTES", 300)
+    AGENT_MAX_CHANNEL_ATTRIBUTES: int = _safe_int_env("AGENT_MAX_CHANNEL_ATTRIBUTES", 500)
+    AGENT_MAX_REFERENCE_VALUES: int = _safe_int_env("AGENT_MAX_REFERENCE_VALUES", 1000)
+    AGENT_MAX_CHANNELS: int = _safe_int_env("AGENT_MAX_CHANNELS", 3)
+
+
     # Конфигурация файлов для каждого маркетплейса
     FILE_CONFIGS: Dict[str, Dict[str, Any]] = {
         "wildberries": {
@@ -562,6 +596,52 @@ class Config:
                 cls.WEB_SESSION_MAX_AGE,
             )
 
+        # ===============================================================
+        # Валидация AI-агента маппинга PIM+FDM
+        # ===============================================================
+        # Пустой FDM_API_TOKEN — НЕ ошибка: агент просто выключен,
+        # маршруты /v1/* отвечают 503. Безопасный деплой по умолчанию.
+        # ===============================================================
+        if cls.FDM_API_TOKEN:
+            if not cls.WEB_HOST:
+                import logging
+                logging.getLogger('config').warning(
+                    "FDM_API_TOKEN задан, но WEB_HOST пуст — веб-сервер "
+                    "не запускается, AI-агент маппинга недоступен."
+                )
+            if len(cls.FDM_API_TOKEN) < 16:
+                import logging
+                logging.getLogger('config').warning(
+                    "FDM_API_TOKEN короче 16 символов — слабый токен. "
+                    "Сгенерируйте: python3 -c 'import secrets; print(secrets.token_hex(32))'"
+                )
+            if not (0.0 <= cls.AGENT_AI_TEMPERATURE <= 2.0):
+                raise ValueError(
+                    f"AGENT_AI_TEMPERATURE должен быть в диапазоне [0.0, 2.0], "
+                    f"получено: {cls.AGENT_AI_TEMPERATURE}. Рекомендуется 0.0."
+                )
+            if cls.AGENT_MAX_CONCURRENT_JOBS <= 0:
+                raise ValueError(
+                    f"AGENT_MAX_CONCURRENT_JOBS должен быть >= 1, "
+                    f"получено: {cls.AGENT_MAX_CONCURRENT_JOBS}."
+                )
+            if cls.AGENT_JOB_TIMEOUT_SEC <= 0:
+                raise ValueError(
+                    f"AGENT_JOB_TIMEOUT_SEC должен быть >= 1, "
+                    f"получено: {cls.AGENT_JOB_TIMEOUT_SEC}."
+                )
+            if cls.AGENT_POLL_INTERVAL_SEC <= 0:
+                raise ValueError(
+                    f"AGENT_POLL_INTERVAL_SEC должен быть > 0, "
+                    f"получено: {cls.AGENT_POLL_INTERVAL_SEC}."
+                )
+        else:
+            import logging
+            logging.getLogger('config').info(
+                "FDM_API_TOKEN не задан — AI-агент маппинга выключен "
+                "(маршруты /v1/* будут отвечать 503)."
+            )
+
         return True
 
     # Прокси настройки
@@ -648,3 +728,16 @@ WEB_SECRET_KEY = Config.WEB_SECRET_KEY
 WEB_SESSION_MAX_AGE = Config.WEB_SESSION_MAX_AGE
 WEB_REGISTRATION_OPEN = Config.WEB_REGISTRATION_OPEN
 WEB_CSRF_ENABLED = Config.WEB_CSRF_ENABLED
+# AI-агент маппинга PIM+FDM
+FDM_API_TOKEN = Config.FDM_API_TOKEN
+AGENT_AI_MODEL = Config.AGENT_AI_MODEL
+AGENT_AI_TEMPERATURE = Config.AGENT_AI_TEMPERATURE
+AGENT_MAX_CONCURRENT_JOBS = Config.AGENT_MAX_CONCURRENT_JOBS
+AGENT_POLL_INTERVAL_SEC = Config.AGENT_POLL_INTERVAL_SEC
+AGENT_JOB_TIMEOUT_SEC = Config.AGENT_JOB_TIMEOUT_SEC
+AGENT_JOBS_RETENTION_DAYS = Config.AGENT_JOBS_RETENTION_DAYS
+AGENT_MAX_ATTRIBUTES = Config.AGENT_MAX_ATTRIBUTES
+AGENT_MAX_CHANNEL_ATTRIBUTES = Config.AGENT_MAX_CHANNEL_ATTRIBUTES
+AGENT_MAX_REFERENCE_VALUES = Config.AGENT_MAX_REFERENCE_VALUES
+AGENT_MAX_CHANNELS = Config.AGENT_MAX_CHANNELS
+

@@ -182,20 +182,25 @@ class Config:
     # AGENT_JOBS_RETENTION_DAYS   — срок хранения заданий в БД
     # AGENT_MAX_ATTRIBUTES        — лимит атрибутов категории (422 сверх)
     # AGENT_MAX_CHANNEL_ATTRIBUTES — лимит атрибутов на один канал (422 сверх)
-    # AGENT_MAX_REFERENCE_VALUES  — лимит значений справочника (422 сверх)
-    # AGENT_MAX_CHANNELS          — максимум каналов в задании (спека: 3)
+    # AGENT_MAX_REFERENCE_VALUES  — лимит значений справочника категории (422 сверх)
+    # AGENT_MAX_REFERENCE_CHANNEL_VALUES — лимит значений справочника ОДНОГО канала
+    # AGENT_MAX_CHANNELS          — лимит каналов в задании (422 сверх)
     # ===================================================================
     FDM_API_TOKEN: str = os.getenv("FDM_API_TOKEN", "")
     AGENT_AI_MODEL: str = os.getenv("AGENT_AI_MODEL", "")
     AGENT_AI_TEMPERATURE: float = _safe_float_env("AGENT_AI_TEMPERATURE", 0.0)
-    AGENT_MAX_CONCURRENT_JOBS: int = _safe_int_env("AGENT_MAX_CONCURRENT_JOBS", 2)
-    AGENT_POLL_INTERVAL_SEC: float = _safe_float_env("AGENT_POLL_INTERVAL_SEC", 2.0)
+    AGENT_MAX_CONCURRENT_JOBS: int = _safe_int_env("AGENT_MAX_CONCURRENT_JOBS", 3)
+    AGENT_POLL_INTERVAL_SEC: float = _safe_float_env("AGENT_POLL_INTERVAL_SEC", 5.0)
     AGENT_JOB_TIMEOUT_SEC: int = _safe_int_env("AGENT_JOB_TIMEOUT_SEC", 240)
     AGENT_JOBS_RETENTION_DAYS: int = _safe_int_env("AGENT_JOBS_RETENTION_DAYS", 30)
-    AGENT_MAX_ATTRIBUTES: int = _safe_int_env("AGENT_MAX_ATTRIBUTES", 300)
+    AGENT_MAX_ATTRIBUTES: int = _safe_int_env("AGENT_MAX_ATTRIBUTES", 100)
     AGENT_MAX_CHANNEL_ATTRIBUTES: int = _safe_int_env("AGENT_MAX_CHANNEL_ATTRIBUTES", 500)
     AGENT_MAX_REFERENCE_VALUES: int = _safe_int_env("AGENT_MAX_REFERENCE_VALUES", 1000)
-    AGENT_MAX_CHANNELS: int = _safe_int_env("AGENT_MAX_CHANNELS", 3)
+    AGENT_MAX_REFERENCE_CHANNEL_VALUES: int = _safe_int_env(
+        "AGENT_MAX_REFERENCE_CHANNEL_VALUES", 2000
+    )
+    AGENT_MAX_CHANNELS: int = _safe_int_env("AGENT_MAX_CHANNELS", 20)
+
 
 
     # Конфигурация файлов для каждого маркетплейса
@@ -739,5 +744,6 @@ AGENT_JOBS_RETENTION_DAYS = Config.AGENT_JOBS_RETENTION_DAYS
 AGENT_MAX_ATTRIBUTES = Config.AGENT_MAX_ATTRIBUTES
 AGENT_MAX_CHANNEL_ATTRIBUTES = Config.AGENT_MAX_CHANNEL_ATTRIBUTES
 AGENT_MAX_REFERENCE_VALUES = Config.AGENT_MAX_REFERENCE_VALUES
+AGENT_MAX_REFERENCE_CHANNEL_VALUES = Config.AGENT_MAX_REFERENCE_CHANNEL_VALUES
 AGENT_MAX_CHANNELS = Config.AGENT_MAX_CHANNELS
 

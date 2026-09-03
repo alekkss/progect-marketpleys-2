@@ -586,10 +586,10 @@ def _check_reference_task_limits(task: ReferenceValueMappingTask) -> None:
 
     for channel in task.channels:
         count = len(channel.reference_values)
-        if count > Config.AGENT_MAX_REFERENCE_VALUES:
+        if count > Config.AGENT_MAX_REFERENCE_CHANNEL_VALUES:
             raise MappingValidationError(
                 f"channels[schemaChannelId={channel.schema_channel_id}]"
                 f".referenceValues: превышен лимит — {count} значений "
-                f"при максимуме {Config.AGENT_MAX_REFERENCE_VALUES} "
-                f"(переменная AGENT_MAX_REFERENCE_VALUES)"
+                f"при максимуме {Config.AGENT_MAX_REFERENCE_CHANNEL_VALUES} "
+                f"(переменная AGENT_MAX_REFERENCE_CHANNEL_VALUES)"
             )

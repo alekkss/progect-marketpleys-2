@@ -6,8 +6,27 @@
 - консоль: человекочитаемый формат с белым списком ключей контекста
 - файл: полный JSON-формат с ротацией (RotatingFileHandler)
 
-Паттерн: Singleton на уровне корневого файлового handler —
-файл app.log создаётся один раз при первом вызове setup_logger().
+Архитектура handler'ов (исправление дублей v6.1):
+    - ОБА handler'а (консоль + файл) живут ТОЛЬКО на корневом логгере
+      и устанавливаются один раз при первом вызове setup_logger();
+    - модульные логгеры НЕ получают собственных handler'ов — записи
+      доходят до корня через propagate и выводятся ровно один раз,
+      независимо от вложенности имени (web.routes.v1_api → web.routes
+      → root: свои handler'а есть только у root).
+
+Уровни:
+    - модульные логгеры (setup_logger) — LOG_LEVEL из .env (по умолчанию INFO);
+      фильтр уровня проверяется на источнике записи, поэтому они
+      НЕ зависят от уровня корневого логгера;
+    - корневой логгер — WARNING: фильтрует INFO-шум «голых» логгеров
+      сторонних библиотек (aiohttp, aiogram, asyncpg), у которых нет
+      собственных handler'ов; их WARNING/ERROR проходят в консоль и файл.
+
+Побочный эффект схемы: INFO-записи логгеров БЕЗ setup_logger
+(например, 'config' из Config.validate()) в консоль не выводятся —
+только WARNING и выше. Это осознанное решение: INFO-шум сторонних
+библиотек в journalctl недопустим, а важные предупреждения config
+пишутся именно уровнем WARNING.
 """
 
 import json
@@ -31,13 +50,16 @@ _LOG_FILE_PATH: str = os.getenv("LOG_FILE_PATH", "./logs/app.log")
 _LOG_LEVEL_STR: str = os.getenv("LOG_LEVEL", "INFO").upper()
 _LOG_LEVEL: int = getattr(logging, _LOG_LEVEL_STR, logging.INFO)
 
+# Уровень корневого логгера: фильтрует «голые» логгеры сторонних библиотек
+_ROOT_LEVEL: int = logging.WARNING
+
 # Ключи контекста, разрешённые к выводу в консоль
 _CONSOLE_CONTEXT_WHITELIST: frozenset[str] = frozenset(
     {"path", "file", "error", "error_type", "step", "current", "total", "directory"}
 )
 
-# Флаг: файловый handler уже добавлен в корневой логгер
-_file_handler_installed: bool = False
+# Флаг: handler'ы корневого логгера уже установлены
+_root_handlers_installed: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -127,23 +149,30 @@ class AppLogger(logging.LoggerAdapter):
 
 
 # ---------------------------------------------------------------------------
-# Установка файлового handler (один раз для всего процесса)
+# Установка handler'ов корневого логгера (один раз для всего процесса)
 # ---------------------------------------------------------------------------
 
-def _install_file_handler() -> None:
+def _install_root_handlers() -> None:
     """
-    Добавляет RotatingFileHandler в корневой логгер.
+    Добавляет console + file handler'ы на КОРНЕВОЙ логгер.
 
-    Вызывается только один раз благодаря флагу _file_handler_installed.
-    Все дочерние логгеры автоматически наследуют этот handler.
+    Вызывается только один раз благодаря флагу _root_handlers_installed.
+    Все модульные логгеры (setup_logger) наследуют эти handler'ы через
+    propagate — каждая запись выводится в консоль и файл РОВНО ОДИН РАЗ.
     """
-    global _file_handler_installed
-    if _file_handler_installed:
+    global _root_handlers_installed
+    if _root_handlers_installed:
         return
 
     log_path = Path(_LOG_FILE_PATH)
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # --- Консоль: один handler на всё приложение ---
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(_LOG_LEVEL)
+    console_handler.setFormatter(_ConsoleFormatter())
+
+    # --- Файл: ротация 10 МБ × 5 бэкапов ---
     file_handler = logging.handlers.RotatingFileHandler(
         filename=log_path,
         maxBytes=10 * 1024 * 1024,  # 10 МБ
@@ -154,10 +183,14 @@ def _install_file_handler() -> None:
     file_handler.setFormatter(_JsonFileFormatter())
 
     root_logger = logging.getLogger()
+    root_logger.addHandler(console_handler)
     root_logger.addHandler(file_handler)
-    root_logger.setLevel(logging.DEBUG)
+    # WARNING для «голых» логгеров (aiohttp, aiogram, config):
+    # их INFO не спамит консоль; наши модульные логгеры не зависят
+    # от этого уровня (фильтр уровня проверяется на источнике записи)
+    root_logger.setLevel(_ROOT_LEVEL)
 
-    _file_handler_installed = True
+    _root_handlers_installed = True
 
 
 # ---------------------------------------------------------------------------
@@ -166,11 +199,13 @@ def _install_file_handler() -> None:
 
 def setup_logger(name: str) -> AppLogger:
     """
-    Создаёт и возвращает именованный логгер с двумя handler-ами.
+    Создаёт и возвращает именованный логгер приложения.
 
-    При первом вызове устанавливает единый файловый handler
-    на корневой логгер (RotatingFileHandler → logs/app.log).
-    Каждый вызов возвращает логгер с консольным handler для модуля.
+    При первом вызове устанавливает console + file handler'ы на
+    корневой логгер (единая точка вывода). Сам модульный логгер
+    handler'ов НЕ получает: записи доходят до корня через propagate
+    и выводятся один раз — дублирование вложенных логгеров
+    (web.routes.v1_api внутри web.routes) исключено.
 
     Args:
         name: имя модуля, например 'upload', 'task_worker', 'ai_comparator'
@@ -178,21 +213,12 @@ def setup_logger(name: str) -> AppLogger:
     Returns:
         AppLogger — адаптер с поддержкой context и trace_id
     """
-    # Устанавливаем файловый handler один раз
-    _install_file_handler()
+    _install_root_handlers()
 
     logger = logging.getLogger(name)
     logger.setLevel(_LOG_LEVEL)
-
-    # Консольный handler добавляем только если его ещё нет
-    if not any(isinstance(h, logging.StreamHandler) and h.stream is sys.stdout
-               for h in logger.handlers):
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(_LOG_LEVEL)
-        console_handler.setFormatter(_ConsoleFormatter())
-        logger.addHandler(console_handler)
-
-    # Не передаём записи в корневой логгер повторно через консоль
-    logger.propagate = True
+    # Handler'ов на модульном логгере НЕТ — вывод только через root.
+    # propagate остаётся True по умолчанию: это и есть маршрут записи
+    # к единственным console/file handler'ам приложения.
 
     return AppLogger(logger, {"trace_id": ""})

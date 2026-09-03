@@ -82,6 +82,10 @@ async def api_auth_middleware(
 
     Безопасность:
         - secrets.compare_digest исключает timing-атаки;
+        - сравнение выполняется в БАЙТАХ: передача двух не-ASCII
+          строк (str) вызывает TypeError → необработанное исключение
+          → HTTP 500. Байтовое сравнение стабильно для любых
+          входных значений;
         - подробности отказа не раскрываются (нет/невалиден/
           не совпал — единый ответ "невалидный токен"), чтобы
           не давать внешнему сканеру информацию о состоянии;
@@ -128,8 +132,11 @@ async def api_auth_middleware(
             "Требуется заголовок Authorization: Bearer <токен>"
         )
 
-    # Шаг 4: constant-time сравнение
-    if not secrets.compare_digest(token.strip(), expected_token):
+    # Шаг 4: constant-time сравнение (в байтах — см. docstring)
+    if not secrets.compare_digest(
+        token.strip().encode("utf-8"),
+        expected_token.encode("utf-8"),
+    ):
         logger.warning(
             "API агента: невалидный Bearer-токен (%s %s, IP=%s)",
             request.method, request.path, request.remote,

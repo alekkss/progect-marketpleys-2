@@ -17,6 +17,8 @@ POST /v1/mapping-tasks (п. 6 доработок):
 Паттерн: Controller — тонкие обработчики; данные готовятся
 в структуры для Jinja2-шаблонов web/templates/agent/*.
 Хранение — database.Database (mapping_jobs).
+Регистрация маршрутов — setup_agent_routes(app), вызывается
+из web/routes/__init__.py (единая точка setup_routes).
 """
 
 import math
@@ -29,6 +31,7 @@ from aiohttp.web import Request, Response
 from bot import storage
 from utils.logger_config import setup_logger
 from web.auth.decorators import admin_required
+from web.middleware.csrf import get_csrf_token
 
 logger = setup_logger("web.routes.agent")
 
@@ -130,7 +133,11 @@ async def agent_dashboard(request: Request) -> Response:
         page, pages     — текущая страница и их общее число
         total           — всего записей по фильтру
         prev_offset, next_offset — оффсеты соседних страниц
+        user, csrf_token — обязательные для base.html
     """
+    user_data = request["user"]
+    csrf_token = get_csrf_token(request)
+
     search = (request.query.get("search") or "").strip()[:_MAX_SEARCH_LENGTH]
 
     try:
@@ -176,6 +183,8 @@ async def agent_dashboard(request: Request) -> Response:
             "total": total,
             "prev_offset": page - 1 if page > 1 else None,
             "next_offset": page + 1 if page < pages else None,
+            "user": user_data,
+            "csrf_token": csrf_token,
         },
     )
 
@@ -193,7 +202,11 @@ async def agent_job_detail(request: Request) -> Response:
         attribute_rows  — строки для attribute_mapping
         unresolved_rows — названия нераспознанных атрибутов
         value_rows      — строки для reference_value_mapping
+        user, csrf_token — обязательные для base.html
     """
+    user_data = request["user"]
+    csrf_token = get_csrf_token(request)
+
     job_id = request.match_info["job_id"]
 
     job = await storage.db.get_mapping_job_detail(job_id)
@@ -203,6 +216,8 @@ async def agent_job_detail(request: Request) -> Response:
         )
 
     context: Dict[str, Any] = {
+        "user": user_data,
+        "csrf_token": csrf_token,
         "job": {
             "job_id": job["job_id"],
             "task_type": job["task_type"],
@@ -389,3 +404,18 @@ def _build_value_rows(job: Dict[str, Any]) -> List[Dict[str, Any]]:
         rows.append({"info_value": info_value, "cells": cells})
 
     return rows
+
+
+def setup_agent_routes(app: web.Application) -> None:
+    """
+    Регистрирует маршруты дашборда агента маппинга.
+
+    Вызывается из web/routes/__init__.py → setup_routes().
+    Порядок внутри не критичен: /agent — фиксированный путь,
+    /agent/{job_id} — динамический, конфликта нет.
+
+    Args:
+        app: Экземпляр aiohttp Application
+    """
+    app.router.add_get("/agent", agent_dashboard)
+    app.router.add_get("/agent/{job_id}", agent_job_detail)

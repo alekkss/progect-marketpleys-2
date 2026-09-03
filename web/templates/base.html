@@ -5,12 +5,20 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}Marketplace Sync{% endblock %}</title>
 
+    <!-- Шрифт Inter -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
     <!-- Tailwind CSS через CDN -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = {
             theme: {
                 extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'],
+                    },
                     colors: {
                         brand: {
                             50: '#eff6ff',
@@ -31,7 +39,7 @@
     </script>
 
     <!-- Кастомные стили -->
-    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="stylesheet" href="/static/css/style.css?v=2">
 
     {% block head_extra %}{% endblock %}
 </head>
@@ -39,63 +47,104 @@
 
     <!-- Навигация -->
     {% if user %}
-    <nav class="bg-white border-b border-slate-200 sticky top-0 z-50">
+    <nav class="sticky top-0 z-50 bg-white/85 backdrop-blur-md border-b border-slate-200/80">
         <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-            <div class="flex justify-between items-center h-16">
+            <div class="flex justify-between items-center h-16 gap-4">
                 <!-- Логотип -->
-                <a href="/dashboard" class="flex items-center gap-2 text-brand-600 font-bold text-lg hover:text-brand-700 transition-colors">
-                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-                              d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
-                    </svg>
-                    <span class="hidden sm:inline">Marketplace Sync</span>
+                <a href="/dashboard" class="flex items-center gap-2.5 group shrink-0">
+                    <span class="flex items-center justify-center w-9 h-9 rounded-xl bg-gradient-to-br from-brand-500 to-brand-700 text-white shadow-sm shadow-brand-500/30 group-hover:shadow-md group-hover:shadow-brand-500/40 transition-shadow">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                  d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+                        </svg>
+                    </span>
+                    <span class="hidden sm:block font-bold text-[15px] tracking-tight text-slate-900">
+                        Marketplace<span class="text-brand-600">Sync</span>
+                    </span>
                 </a>
 
-                <!-- Основная навигация -->
+                <!-- Основная навигация: рабочие разделы -->
                 <div class="hidden md:flex items-center gap-1">
                     <a href="/dashboard"
                        class="nav-link{% if request.path == '/dashboard' %} nav-link-active{% endif %}">
-                        Dashboard
+                        <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                  d="M3 12l9-9 9 9M5 10v10a1 1 0 001 1h3m10-11v10a1 1 0 01-1 1h-3m-6 0h6"/>
+                        </svg>
+                        Обзор
                     </a>
                     <a href="/schemas"
                        class="nav-link{% if request.path.startswith('/schemas') %} nav-link-active{% endif %}">
+                        <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                  d="M4 6h16M4 10h16M4 14h10M4 18h7"/>
+                        </svg>
                         Схемы
                     </a>
                     <a href="/upload"
                        class="nav-link{% if request.path.startswith('/upload') %} nav-link-active{% endif %}">
+                        <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                  d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/>
+                        </svg>
                         Загрузка
                     </a>
                     <a href="/tasks"
                        class="nav-link{% if request.path.startswith('/tasks') %} nav-link-active{% endif %}">
+                        <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                  d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/>
+                        </svg>
                         Задачи
                     </a>
-                    {% if user.role in ('owner', 'admin') %}
+                </div>
+
+                <!-- Основная навигация: служебные разделы (только owner/admin) -->
+                {% if user.role in ('owner', 'admin') %}
+                <div class="hidden md:flex items-center gap-1 ml-auto">
+                    <span class="text-[10px] font-semibold uppercase tracking-widest text-slate-300 mr-1 select-none">Управление</span>
+                    <span class="w-px h-5 bg-slate-200 mr-2"></span>
                     <a href="/admin/users"
-                       class="nav-link{% if request.path.startswith('/admin') %} nav-link-active{% endif %}">
+                       class="nav-link nav-link-muted{% if request.path.startswith('/admin') %} nav-link-active{% endif %}">
+                        <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                  d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z"/>
+                        </svg>
                         Админ
                     </a>
                     <a href="/agent"
-                       class="nav-link{% if request.path.startswith('/agent') %} nav-link-active{% endif %}">
+                       class="nav-link nav-link-muted{% if request.path.startswith('/agent') %} nav-link-active{% endif %}">
+                        <svg class="nav-icon" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                  d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z"/>
+                        </svg>
                         Агент
                     </a>
-                    {% endif %}
                 </div>
+                {% else %}
+                <div class="hidden md:block ml-auto"></div>
+                {% endif %}
 
                 <!-- Пользователь -->
-                <div class="flex items-center gap-3">
-                    <div class="hidden sm:flex items-center gap-2 text-sm text-slate-600">
-                        <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium
-                            {% if user.role == 'owner' %}bg-amber-100 text-amber-800
-                            {% elif user.role == 'admin' %}bg-blue-100 text-blue-800
-                            {% elif user.role == 'editor' %}bg-purple-100 text-purple-800
-                            {% else %}bg-slate-100 text-slate-600{% endif %}">
-                            {{ user.display_name or user.email }}
+                <div class="flex items-center gap-3 shrink-0">
+                    <div class="hidden sm:flex items-center gap-2">
+                        <span class="flex items-center justify-center w-8 h-8 rounded-full bg-brand-50 border border-brand-100 text-brand-700 text-xs font-bold">
+                            {{ (user.display_name or user.email)|first|upper }}
                         </span>
+                        <div class="leading-tight">
+                            <div class="text-[13px] font-semibold text-slate-700 truncate-text max-w-[140px]">
+                                {{ user.display_name or user.email }}
+                            </div>
+                            <div class="text-[10px] font-semibold uppercase tracking-wide
+                                {% if user.role == 'owner' %}text-amber-600{% elif user.role == 'admin' %}text-blue-600{% elif user.role == 'editor' %}text-purple-600{% else %}text-slate-400{% endif %}">
+                                {{ {'owner': 'Владелец', 'admin': 'Администратор', 'editor': 'Редактор', 'user': 'Пользователь'}.get(user.role, user.role) }}
+                            </div>
+                        </div>
                     </div>
                     <form method="POST" action="/auth/logout" class="inline">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                         <button type="submit"
-                                class="text-sm text-slate-500 hover:text-red-600 transition-colors px-2 py-1 rounded hover:bg-red-50"
+                                class="flex items-center justify-center w-9 h-9 rounded-lg text-slate-400 border border-transparent hover:text-red-600 hover:border-red-200 hover:bg-red-50 transition-colors"
                                 title="Выйти">
                             <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
@@ -117,11 +166,13 @@
         <!-- Мобильное меню (выпадающее) -->
         <div id="mobileMenu" class="hidden md:hidden border-t border-slate-200 bg-white">
             <div class="px-4 py-3 space-y-1">
-                <a href="/dashboard" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-100">Dashboard</a>
+                <p class="px-3 pt-1 pb-1 text-[10px] font-semibold uppercase tracking-widest text-slate-300">Разделы</p>
+                <a href="/dashboard" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-100">Обзор</a>
                 <a href="/schemas" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-100">Схемы</a>
                 <a href="/upload" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-100">Загрузка</a>
                 <a href="/tasks" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-100">Задачи</a>
                 {% if user.role in ('owner', 'admin') %}
+                <p class="px-3 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-widest text-slate-300">Управление</p>
                 <a href="/admin/users" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-100">Админ</a>
                 <a href="/agent" class="block px-3 py-2 rounded-lg text-sm font-medium text-slate-700 hover:bg-slate-100">Агент</a>
                 {% endif %}

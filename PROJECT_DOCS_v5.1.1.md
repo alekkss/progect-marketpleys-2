@@ -1,4 +1,4 @@
-# Marketplace Sync — Актуальная документация проекта (v6.0)
+# Marketplace Sync — Актуальная документация проекта (v6.1)
 
 ## Назначение
 
@@ -67,6 +67,7 @@ Telegram-бот и веб-приложение для автоматическо
 | Real-time | WebSocket (aiohttp встроенный) | Прогресс обработки |
 | Reverse Proxy | Nginx | SSL, static, WebSocket proxy |
 | SSL | certbot (Let's Encrypt) | HTTPS для ecommpedia.ru |
+| Шрифт | Inter (Google Fonts, CDN) | Типографика веб-интерфейса (v6.1) |
 
 ### Ключевые архитектурные принципы
 
@@ -153,7 +154,8 @@ Telegram-бот и веб-приложение для автоматическо
 
 │   │
 │   ├── /templates/
-│   │   ├── base.html                 # Layout: nav, footer, Tailwind CDN, scripts
+│   │   ├── base.html                 # Layout: навигация (2 группы + SVG-иконки), Inter +
+│   │   │                             # Tailwind CDN, flash, scripts (v6.1)
 │   │   ├── /auth/
 │   │   │   ├── login.html
 │   │   │   └── register.html
@@ -177,7 +179,8 @@ Telegram-бот и веб-приложение для автоматическо
 │   │
 │   └── /static/
 │       ├── /css/
-│       │   └── style.css             # Кастомные стили (Tailwind через CDN)
+│       │   └── style.css             # Кастомные стили: nav-link/nav-icon, badges,
+│       │                             # drop-zone, progress, modal (Tailwind через CDN)
 │       └── /js/                      # Зарезервировано для будущего выноса JS
 │
 ├── /shared/                          # === ОБЩИЕ АДАПТЕРЫ ===
@@ -609,11 +612,7 @@ async def cleanup_old_mapping_jobs(self, retention_days) -> int
 
 ---
 
-## Правка 10. Вставка: новый раздел «AI-агент маппинга PIM+FDM (v6.0)»
 
-Место: после раздела «TaskQueue и TaskWorker (v4.5–v5.1)», перед «Веб-приложение: детали реализации».
-
-```markdown
 ## AI-агент маппинга PIM+FDM (v6.0)
 
 ### Назначение
@@ -720,6 +719,33 @@ GET /agent/{job_id} — шапка задания, причина ошибки (
 Access-лог nginx: /var/log/nginx/agent_api_access.log (ротация стандартным logrotate)
 Логгеры приложения: mapping.job_worker, mapping.attribute_mapper, mapping.reference_value_mapper, web.routes.v1_api
 Дашборд /agent — история с длительностями и счётчиками
+
+### Безопасность: два независимых контура
+
+| | Сайт (/auth, /schemas, /agent, ...) | API (/v1/*) |
+|---|---|---|
+| Аутентификация | cookie MARKETPLACE_SESSION | Bearer FDM_API_TOKEN |
+| Защита форм | CSRF (Double Submit Cookie) | не нужна — Bearer-заголовок сам доказывает происхождение |
+| Middleware | auth + csrf (обе пропускают /v1/*) | api_auth (constant-time, 401/503) |
+
+- `secrets.compare_digest` — исключает timing-атаки; `WWW-Authenticate: Bearer` по RFC 6750
+- Отказы логируются с IP; текст единый — без раскрытия причин (защита от разведки)
+- Пустой FDM_API_TOKEN → 503 на все /v1/* — безопасный деплой по умолчанию
+- HTTP→HTTPS редирект nginx: токен ходит только по TLS
+
+### Дашборд оператора (/agent)
+
+- `GET /agent` — таблица: jobId (обрезан до 12 симв.), заголовок, тип, схема #, каналы, дата, длительность, статус-бейдж, счётчики ✓/?; поиск по schema_id/категории/атрибуту; пагинация 20/стр
+- `GET /agent/{job_id}` — шапка задания, причина ошибки (failed), таблица связок (атрибут → соответствия по каналам, confidence-бейджи ≥85%/≥70%/ниже, комментарий LLM), блок unresolved-чипов; для задачи 2 — матрица «значение категории × каналы»
+- Доступ: @admin_required (owner/admin); пункт меню «Агент» в base.html внутри условия owner/admin
+- Названия атрибутов/каналов восстанавливаются из payload по ID (result хранит только ID по протоколу)
+
+### Мониторинг
+
+- Access-лог nginx: /var/log/nginx/agent_api_access.log (ротация стандартным logrotate)
+- Логгеры приложения: mapping.job_worker, mapping.attribute_mapper, mapping.reference_value_mapper, web.routes.v1_api
+- Дашборд /agent — история с длительностями и счётчиками
+
 
 ## Стандарты кодирования
 
@@ -1423,7 +1449,40 @@ class WebSocketManager:
 8. Фронтенд подключает WebSocket, показывает прогресс
 9. По завершении — кнопки "Скачать WB", "Скачать Ozon", "Скачать Яндекс", "Скачать отчёт"
 
+### Интерфейс (v6.1)
+
+Редизайн веб-интерфейса без изменения логики, URL и Python-кода (кроме регистрации
+маршрутов агента — см. Правку 5). Изменены только `base.html`, `style.css`, `dashboard.html`.
+
+**Навигация (`base.html`):**
+- Две смысловые группы: рабочие разделы (Обзор, Схемы, Загрузка, Задачи) слева;
+  служебные (Админ, Агент, только owner/admin) — справа за разделителем с подписью
+  «УПРАВЛЕНИЕ»
+- Пункт «Dashboard» переименован в «Обзор» (URL `/dashboard` НЕ менялся)
+- SVG-иконки у каждого пункта (класс `nav-icon`), активный пункт — «пилюля»
+  с тонким кольцом (`nav-link-active` + inset box-shadow)
+- Логотип: градиентный бейдж + двухцветный «Marketplace**Sync**»
+- Блок пользователя: аватар-инициал (первая буква display_name/email), имя и роль
+  текстом (эмодзи-бейджи удалены)
+- Шапка: `sticky` + полупрозрачный фон с `backdrop-blur`
+- Мобильное меню повторяет группировку («Разделы» / «Управление»)
+
+**Типографика:** шрифт Inter (400/500/600/700/800) через Google Fonts CDN,
+подключён в `tailwind.config.fontFamily.sans`.
+
+**Dashboard (`dashboard.html`):** шапка с главным действием (кнопка «Загрузить файлы»),
+вертикальные карточки статистики, секции с капс-заголовками, статусы в таблице —
+точка-индикатор в бейдже вместо эмодзи.
+
+**Стили (`style.css`):** все имена классов СОХРАНЕНЫ (badge-*, drop-zone,
+progress-bar-*, table-hover, modal-*, pulse-dot, skeleton, btn-icon,
+truncate-text, scroll-hidden) — остальные шаблоны подхватили обновление без правок.
+Новые классы: `nav-icon`, `nav-link-muted`.
+
+
 ---
+
+
 
 ## Формат данных
 
@@ -1784,6 +1843,17 @@ sudo nginx -t && sudo systemctl reload nginx
 # Smoke-тест API: ожидаем JSON 401
 curl -s https://ecommpedia.ru/v1/mapping-tasks/abc123
 
+# 9.1. Права Nginx на статику (ОБЯЗАТЕЛЬНО — иначе /static/ отдаёт 403)
+# Nginx работает от www-data, а проект лежит в /root (закрыт для остальных пользователей)
+sudo apt install -y acl
+setfacl -m u:www-data:x /root
+setfacl -R -m u:www-data:rX /root/progect/web/static
+# Default-ACL: новые файлы (после git pull) автоматически получат права
+setfacl -R -d -m u:www-data:rX /root/progect/web/static
+# Проверка: должно вывести начало CSS-файла
+sudo -u www-data head -3 /root/progect/web/static/css/style.css
+
+
 # 10. Тестовый запуск
 python3 main.py
 
@@ -1868,6 +1938,8 @@ server {
 - Cookie name: `MARKETPLACE_SESSION`
 - Порядок middleware: errors → auth → csrf (errors — внешний слой)
 - Nginx отдаёт `/static/` напрямую — aiohttp НЕ обслуживает статику в production
+- Статика лежит в `/root/progect/web/static/`, Nginx читает её от www-data — ОБЯЗАТЕЛЬНЫ ACL-права (см. «Установка», шаг 9.1). После переноса проекта/переезда сервера проверять: `curl -s -o /dev/null -w "%{http_code}" https://ecommpedia.ru/static/css/style.css` → должно быть 200
+- Nginx кэширует статику в браузерах (`expires 7d`) — при каждом изменении `style.css` повышать версию в ссылке в `base.html` (`style.css?v=N`) — иначе пользователи до 7 дней будут видеть старые стили
 - `web_app['task_queue']` — та же очередь, что и бот (НЕ создавать отдельную)
 - `web_app['ai_comparator']` — тот же экземпляр (НЕ создавать новый)
 - Один event loop для бота и веба — НЕ разделять на процессы
@@ -1948,6 +2020,9 @@ server {
 - Создание схемы через веб возможно без привязки Telegram-аккаунта — используется web_user_id
 - Владение схемой проверяется двусторонне: по schemas.web_user_id И по schemas.user_id (telegram)
 - `get_web_user_schemas(web_user_id)` ищет схемы по web_user_id ИЛИ по привязанному telegram_user_id
+- `setup_agent_routes(app)` ОБЯЗАНА вызываться в `setup_routes()` (`web/routes/__init__.py`) — без неё `/agent` отдаёт 404, хотя шаблоны и обработчики существуют (исправлено в v6.1)
+- Обработчики `/agent` передают в контекст `user` + `csrf_token` (через `get_csrf_token` из `web.middleware.csrf`) — как и все HTML-маршруты, иначе `base.html` не отрисует навигацию
+
 
 ---
 
@@ -1998,7 +2073,6 @@ server {
 - [x] Исправлена ошибка FK constraint при обработке веб-задач (user_id=0) (v5.1)
 - [x] Убрано требование привязки Telegram для создания схем через веб (миграция 006) (v5.1)
 - [x] Миграция домена с galina-blanka.ru на ecommpedia.ru (v5.1.2)
-- [x] Миграция домена с galina-blanka.ru на ecommpedia.ru (v5.1.2)
 - [x] AI-агент маппинга PIM+FDM: REST API `/v1/mapping-tasks` (POST 202 + GET-поллинг) (v6.0)
 - [x] Маппинг атрибутов категорий (attribute_mapping) с пост-валидацией ID против входных данных (v6.0)
 - [x] Маппинг справочных значений (reference_value_mapping) с гарантией полноты matches (v6.0)
@@ -2007,6 +2081,9 @@ server {
 - [x] Bearer-аутентификация `/v1/*` — независимый контур безопасности (constant-time, 401/503) (v6.0)
 - [x] Дашборд оператора `/agent` с поиском, пагинацией и детализацией связок (v6.0)
 - [x] Nginx `location /v1/` + отдельный access-лог `agent_api_access.log` (v6.0)
+- [x] Редизайн веб-интерфейса: группировка меню (рабочие/управление), SVG-иконки, шрифт Inter, обновлённый dashboard,刷新лённые badges/drop-zone/modal (v6.1)
+- [x] Исправлена 404 на /agent: добавлена setup_agent_routes + регистрация в setup_routes, user/csrf_token в контексте шаблонов (v6.1)
+- [x] Исправлена 403 на /static/: ACL-права www-data на /root/progect/web/static + default-ACL для новых файлов (v6.1)
 - [ ] DELETE /v1/mapping-tasks/{jobId} — отмена задания (статус 'cancelled' уже зарезервирован в CHECK)
 
 
@@ -2047,7 +2124,7 @@ server {
 - Минимум 2 МП-файла для запуска обработки (из 3 возможных)
 - Файлы результатов удаляются `_FileCleanupService` через FILE_MAX_AGE_DAYS — ссылки на скачивание перестают работать
 - Polling fallback для задач: каждые 5 секунд (если WebSocket недоступен)
-- Tailwind CSS загружается через CDN (cdn.tailwindcss.com) — требуется интернет на стороне клиента
+- Tailwind CSS (cdn.tailwindcss.com) и шрифт Inter (fonts.googleapis.com) загружаются через CDN — требуется интернет на стороне клиента; без Inter сайт деградирует до системного шрифта (без Tailwind — до нестилизованного HTML)
 - Шаблон create_mvm.html для МВМ-схем пока не реализован — создание МВМ-схем доступно только через Telegram-бота
 - Шаблон edit.html для редактирования сопоставлений пока не реализован — редактирование доступно только через Telegram-бота
 - Создание стандартных схем доступно через веб без привязки Telegram-аккаунта (POST /schemas/create, multipart, синхронный AI-запрос 5-15 сек)
@@ -2154,6 +2231,17 @@ Double Submit Cookie: при GET генерируется токен в cookie (
 **Видна ли в боте схема, созданная через веб без привязки Telegram?**
 Нет. Бот ищет схемы по `user_id` (Telegram ID). Если при создании схемы `telegram_user_id` не был привязан — схема будет видна только на вебе. После привязки Telegram-аккаунта в профиле все схемы пользователя станут доступны в обоих каналах.
 
+**Почему сайт мог отдавать 403 на /static/?**
+Nginx отдаёт статику от пользователя www-data, а проект лежит в /root, закрытом
+для всех, кроме root. Лечится ACL: `setfacl -m u:www-data:x /root` и
+`setfacl -R -m u:www-data:rX /root/progect/web/static` (+ default-ACL для новых
+файлов). Диагностика: `curl -sI https://ecommpedia.ru/static/css/style.css` → 403.
+
+**Почему после изменения стилей пользователи видят старый сайт?**
+Nginx кэширует статику в браузере на 7 дней (`expires 7d`). При правке style.css
+нужно повышать версию в ссылке (`style.css?v=2`, `?v=3`, ...) в base.html.
+
+
 ### AI-агент маппинга (v6.0)
 
 **Как включить агента?**
@@ -2182,6 +2270,6 @@ CSRF-атака эксплуатирует автоматическую отпр
 
 ---
 
-**Версия документации:** 6.0
-**Дата обновления:** Август 2026
+**Версия документации:** 6.1
+**Дата обновления:** Сентябрь 2026
 **Автор проекта:** Александр

@@ -2,28 +2,40 @@
 Стратегия маппинга атрибутов схемы (задача 1 протокола PIM+FDM).
 
 Сопоставляет атрибуты конечной категории с атрибутами категорий
-каналов (маркетплейсов) одним AI-запросом. Обрабатывает ответ LLM
-в три этапа:
+каналов (маркетплейсов) и оркестрирует ДВА последовательных этапа:
 
-    1. Подготовка компактного JSON входных данных и форматирование
-       промпта prompts/attribute_mapping.txt.
-    2. Один запрос к LLM через ОБЩИЙ AIComparator приложения —
-       семафор компаратора ограничивает суммарную нагрузку на
-       LLM-провайдера (общую для синхронизации и маппинга).
-    3. Пост-валидация: каждый идентификатор ответа сверяется со
-       входными данными. Галлюцинации LLM отбрасываются, а список
-       unresolved вычисляется детерминированно из входных данных —
-       результату AI не доверяет ни одно поле-ссылка.
+    Этап 1 (категория ↔ каналы):
+        1. Подготовка компактного JSON входных данных и форматирование
+           промпта prompts/attribute_mapping.txt.
+        2. Один запрос к LLM через ОБЩИЙ AIComparator приложения —
+           семафор компаратора ограничивает суммарную нагрузку на
+           LLM-провайдера (общую для синхронизации и маппинга).
+        3. Пост-валидация: каждый идентификатор ответа сверяется со
+           входными данными. Галлюцинации LLM отбрасываются, а список
+           unresolved вычисляется детерминированно из входных данных —
+           результату AI не доверяет ни одно поле-ссылка.
+
+    Этап 2 (межканальные связки, v6.2):
+        4. Сбор остаточных атрибутов каналов — не вошедших ни в одну
+           связку results этапа 1.
+        5. Делегирование в CrossChannelMapper (Strategy внутри
+           Strategy): атрибуты разных каналов сопоставляются между
+           собой без участия категории каталога.
+
+Ошибки любого этапа поднимаются наверх: задание помечается failed
+целиком (частичного результата протокол не предусматривает).
 
 Паттерн: Strategy — одна из двух взаимозаменяемых стратегий
-обработки заданий (вторая — reference_value_mapper).
-Паттерн: Dependency Injection — AIComparator инжектируется извне
-(общий экземпляр приложения, НЕ создаётся здесь).
+обработки заданий на уровне воркера (вторая — reference_value_mapper).
+Этап 2 вынесен в отдельную стратегию CrossChannelMapper (SRP),
+инжектируемую сюда через конструктор.
+Паттерн: Dependency Injection — AIComparator и CrossChannelMapper
+инжектируются извне (общие экземпляры приложения, НЕ создаются здесь).
 """
 
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
 from config.config import Config
 from services.mapping.models import (
@@ -32,12 +44,17 @@ from services.mapping.models import (
     CategoryAttribute,
     ChannelInfo,
     ChannelMatch,
+    FullAttributeMappingResult,
     MatchedBundle,
 )
 from utils.logger_config import setup_logger
 
 if TYPE_CHECKING:
+    # Импорт только для типизации: CrossChannelMapper импортирует
+    # хелперы из ЭТОГО модуля в рантайме — прямой взаимный импорт
+    # создал бы циклическую зависимость
     from services.ai_comparator import AIComparator
+    from services.mapping.cross_channel_mapper import CrossChannelMapper
 
 logger = setup_logger("mapping.attribute_mapper")
 
@@ -53,8 +70,8 @@ _MAX_COMMENT_LENGTH = 200
 # ===================================================================
 # Общие хелперы нормализации полей ответа AI
 # ===================================================================
-# Публичные чистые функции: reference_value_mapper переиспользует их
-# на шаге 8. Если общих хелперов станет больше — выделим отдельный
+# Публичные чистые функции: reference_value_mapper и cross_channel_mapper
+# переиспользуют их. Если общих хелперов станет больше — выделим отдельный
 # модуль пакета (пока двух функций отдельный модуль избыточен).
 
 def sanitize_confidence(value: Any) -> Optional[float]:
@@ -119,7 +136,7 @@ def truncate_comment(value: Any, max_length: int = _MAX_COMMENT_LENGTH) -> Optio
 
 class AttributeMapper:
     """
-    Стратегия обработки заданий attribute_mapping.
+    Стратегия обработки заданий attribute_mapping (оба этапа).
 
     Жизненный цикл: один экземпляр на всё приложение (создаётся
     в MappingJobWorker), промпт читается с диска один раз
@@ -127,35 +144,51 @@ class AttributeMapper:
     (fail fast): воркер агента не должен стартовать без промпта.
     """
 
-    def __init__(self, ai_comparator: "AIComparator") -> None:
+    def __init__(
+        self,
+        ai_comparator: "AIComparator",
+        cross_channel_mapper: "CrossChannelMapper",
+    ) -> None:
         """
         Args:
             ai_comparator: Общий AIComparator приложения (DI).
                 НЕ создаёт собственный экземпляр — семафор компаратора
                 глобально ограничивает AI-запросы всех задач.
+            cross_channel_mapper: Стратегия этапа 2 (DI) — тот же
+                экземпляр, что создан воркером: его промпт читается
+                с диска один раз за жизненный цикл приложения.
 
         Raises:
             FileNotFoundError: если prompts/attribute_mapping.txt отсутствует
         """
         self._comparator = ai_comparator
+        self._cross_channel_mapper = cross_channel_mapper
         with open(_ATTRIBUTE_PROMPT_PATH, "r", encoding="utf-8") as f:
             self._prompt_template = f.read()
         logger.info("Промпт маппинга атрибутов загружен: %s", _ATTRIBUTE_PROMPT_PATH)
 
-    async def map_attributes(self, task: AttributeMappingTask) -> AttributeMappingResult:
+    async def map_attributes(
+        self, task: AttributeMappingTask
+    ) -> FullAttributeMappingResult:
         """
-        Выполняет маппинг атрибутов задания одним AI-запросом.
+        Выполняет маппинг атрибутов задания в два этапа.
+
+        Этап 1: один AI-запрос, атрибуты категории ↔ атрибуты каналов.
+        Этап 2: один AI-запрос, остаточные атрибуты каналов между собой
+        (пропускается без AI-запроса, если остатков нет или канал один).
 
         Args:
             task: Валидированное задание attribute_mapping
 
         Returns:
-            Готовый результат: results[] + unresolved[].
-            Все ID результата гарантированно существуют во входных данных.
+            Готовый результат обоих этапов: results[] + unresolved[]
+            (этап 1) и crossChannelMatches (этап 2). Все ID результата
+            гарантированно существуют во входных данных.
 
         Raises:
-            Exception: ошибки AI-запроса поднимаются наверх — решение
-                о статусе задания (failed) принимает MappingJobWorker
+            Exception: ошибки AI-запроса любого этапа поднимаются
+                наверх — решение о статусе задания (failed) принимает
+                MappingJobWorker
         """
         logger.info(
             "Маппинг атрибутов: категория='%s' (schemaId=%s), атрибутов=%d, каналов=%d",
@@ -165,20 +198,48 @@ class AttributeMapper:
             len(task.channels),
         )
 
+        # --- Этап 1: категория ↔ каналы (без изменений) ---
         prompt = self._build_prompt(task)
         response = await self._comparator.call_ai_json(
             prompt,
             model=self._model_override(),
             temperature=Config.AGENT_AI_TEMPERATURE,
         )
-        result = self._validate_and_build(task, response)
+        stage1 = self._validate_and_build(task, response)
+
+        # --- Этап 2: остаточные атрибуты каналов между собой (v6.2) ---
+        remaining_channels = self._collect_remaining_channels(task, stage1)
+        remaining_attributes = sum(
+            len(channel.attributes) for channel in remaining_channels
+        )
+        if remaining_attributes:
+            logger.info(
+                "Этап 2: остаточных атрибутов каналов=%d (каналов=%d)",
+                remaining_attributes,
+                len(remaining_channels),
+            )
+
+        stage2 = await self._cross_channel_mapper.map_cross_channel(
+            remaining_channels,
+            category_name=task.category.name,
+            category_path=task.category.path,
+        )
+
+        # --- Сборка объединённого результата ---
+        full_result = FullAttributeMappingResult(
+            results=stage1.results,
+            unresolved=stage1.unresolved,
+            cross_channel_matches=stage2.matches,
+        )
 
         logger.info(
-            "Маппинг атрибутов завершён: сопоставлено=%d, unresolved=%d",
-            len(result.results),
-            len(result.unresolved),
+            "Маппинг атрибутов завершён: связок=%d, unresolved=%d, "
+            "межканальных групп=%d",
+            len(full_result.results),
+            len(full_result.unresolved),
+            len(full_result.cross_channel_matches),
         )
-        return result
+        return full_result
 
     # ===================================================================
     # Подготовка промпта
@@ -262,7 +323,68 @@ class AttributeMapper:
         return model if model else None
 
     # ===================================================================
-    # Пост-валидация ответа LLM
+    # Сбор остаточных атрибутов для этапа 2 (v6.2)
+    # ===================================================================
+
+    @staticmethod
+    def _collect_remaining_channels(
+        task: AttributeMappingTask,
+        stage1_result: AttributeMappingResult,
+    ) -> List[ChannelInfo]:
+        """
+        Строит список каналов, содержащий ТОЛЬКО остаточные атрибуты.
+
+        Остаточный атрибут — channelAttributeId, не вошедший ни в одно
+        channelMatches результатов этапа 1. Пост-валидация этапа 1
+        гарантирует: все ID в results существуют в своих каналах,
+        поэтому множество занятых вычисляется из результата напрямую.
+
+        Создаются НОВЫЕ объекты ChannelInfo (исходное задание task
+        не мутируется — его данные принадлежат всей обработке задания).
+
+        Каналы без остатков в список не включаются.
+
+        Args:
+            task: Входное задание (источник полного списка атрибутов)
+            stage1_result: Результат этапа 1 (источник занятых ID)
+
+        Returns:
+            Список каналов, где attributes содержит только остатки;
+            пустой список — все атрибуты распределены этапом 1
+        """
+        # --- 1. Занятые атрибуты по каналам из результатов этапа 1 ---
+        used_attribute_ids: Dict[int, Set[int]] = {}
+        for bundle in stage1_result.results:
+            for match in bundle.channel_matches:
+                used_attribute_ids.setdefault(
+                    match.schema_channel_id, set()
+                ).add(match.channel_attribute_id)
+
+        # --- 2. Каналы только с остаточными атрибутами ---
+        remaining: List[ChannelInfo] = []
+        for channel in task.channels:
+            used = used_attribute_ids.get(channel.schema_channel_id, set())
+            leftover = [
+                attr
+                for attr in channel.attributes
+                if attr.channel_attribute_id not in used
+            ]
+            if not leftover:
+                continue
+
+            remaining.append(ChannelInfo(
+                schema_channel_id=channel.schema_channel_id,
+                channel_id=channel.channel_id,
+                platform=channel.platform,
+                name=channel.name,
+                attributes=leftover,
+                template_id=channel.template_id,
+            ))
+
+        return remaining
+
+    # ===================================================================
+    # Пост-валидация ответа LLM (этап 1)
     # ===================================================================
 
     def _validate_and_build(

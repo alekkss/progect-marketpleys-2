@@ -164,12 +164,16 @@ async def get_mapping_task_status(request: Request) -> Response:
     Формат ответа строго по протоколу (разделы 2.4, 3.2, 4.2):
         - pending / processing → {"jobId", "status"}
         - completed → {"jobId", "status", ...result}
-          (result содержит results+unresolved для attribute_mapping
-          или channels+matches для reference_value_mapping)
+          (result для attribute_mapping содержит results+unresolved
+          + crossChannelMatches — v6.2: межканальные связки остаточных
+          атрибутов каналов, отсутствующие в категории каталога;
+          для reference_value_mapping — channels+matches)
         - failed → {"jobId", "status", "error"}
 
     Результат читается из БД одним SELECT — источник истины о
-    статусе тот же, куда пишет MappingJobWorker.
+    статусе тот же, куда пишет MappingJobWorker. Ключи result
+    разворачиваются на верхний уровень как есть: новые ключи
+    будущих версий появляются в ответе без правок этого маршрута.
 
     Args:
         request: HTTP-запрос; jobId в параметрах маршрута

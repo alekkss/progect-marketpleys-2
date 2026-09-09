@@ -9,12 +9,16 @@
         - ReferenceValueMappingTask — задание маппинга справочных значений
 
     Результаты:
-        - AttributeMappingResult      — results[] + unresolved[]
+        - AttributeMappingResult      — results[] + unresolved[] (этап 1)
+        - CrossChannelMatch           — группа межканальных атрибутов (этап 2)
+        - CrossChannelMappingResult   — crossChannelMatches[] (этап 2)
+        - FullAttributeMappingResult  — объединённый результат этапов 1+2
         - ReferenceValueMappingResult — channels[] с matches[]
 
 Модели — ТОЛЬКО данные (dataclasses из стандартной библиотеки).
 Валидация входящего JSON выполняется в validators.py,
-бизнес-логика маппинга — в attribute_mapper.py и reference_value_mapper.py.
+бизнес-логика маппинга — в attribute_mapper.py,
+cross_channel_mapper.py и reference_value_mapper.py.
 
 Сериализация результатов (to_dict) формирует camelCase-ключи
 СТРОГО по протоколу — маршруты API отдают их без преобразований.
@@ -29,7 +33,6 @@ from typing import Dict, List, Literal, Optional, Union
 
 MappingTaskType = Literal["attribute_mapping", "reference_value_mapping"]
 MappingJobStatus = Literal["pending", "processing", "completed", "failed"]
-
 
 # ===================================================================
 # Задача 1: маппинг атрибутов схемы — входные данные
@@ -51,7 +54,6 @@ class CategoryAttribute:
     group_id: Optional[int] = None
     group_name: Optional[str] = None
 
-
 @dataclass
 class CategoryInfo:
     """
@@ -64,7 +66,6 @@ class CategoryInfo:
     name: str
     attributes: List[CategoryAttribute] = field(default_factory=list)
     path: Optional[str] = None
-
 
 @dataclass
 class ChannelAttribute:
@@ -82,7 +83,6 @@ class ChannelAttribute:
     unit: Optional[str] = None
     description: Optional[str] = None
 
-
 @dataclass
 class ChannelInfo:
     """
@@ -98,7 +98,6 @@ class ChannelInfo:
     attributes: List[ChannelAttribute] = field(default_factory=list)
     template_id: Optional[int] = None
 
-
 @dataclass
 class AttributeMappingTask:
     """
@@ -109,7 +108,6 @@ class AttributeMappingTask:
     schema_id: int
     category: CategoryInfo
     channels: List[ChannelInfo]
-
 
 # ===================================================================
 # Задача 2: маппинг справочных значений — входные данные
@@ -129,7 +127,6 @@ class ReferenceAttribute:
     reference_type: str
     reference_values: List[str] = field(default_factory=list)
 
-
 @dataclass
 class ChannelReferenceValue:
     """
@@ -140,7 +137,6 @@ class ChannelReferenceValue:
 
     id: int
     value: str
-
 
 @dataclass
 class ReferenceChannel:
@@ -156,7 +152,6 @@ class ReferenceChannel:
     reference_values: List[ChannelReferenceValue] = field(default_factory=list)
     channel_attribute_id: Optional[int] = None
 
-
 @dataclass
 class ReferenceValueMappingTask:
     """
@@ -169,10 +164,8 @@ class ReferenceValueMappingTask:
     attribute: ReferenceAttribute
     channels: List[ReferenceChannel]
 
-
 # Объединение для сигнатур воркера и валидатора
 MappingTask = Union[AttributeMappingTask, ReferenceValueMappingTask]
-
 
 # ===================================================================
 # Задача 1: маппинг атрибутов схемы — результат
@@ -199,7 +192,6 @@ class ChannelMatch:
         if self.confidence is not None:
             result["confidence"] = self.confidence
         return result
-
 
 @dataclass
 class MatchedBundle:
@@ -228,14 +220,17 @@ class MatchedBundle:
             result["comment"] = self.comment
         return result
 
-
 @dataclass
 class AttributeMappingResult:
     """
-    Результат маппинга атрибутов: results[] + unresolved[].
+    Результат первого этапа маппинга: results[] + unresolved[].
 
     unresolved — mappingId связок, для которых соответствие
     не найдено ни в одном канале.
+
+    Начиная с v6.2 остаётся в пакете для обратной совместимости
+    (этап 1 в изоляции); публичный тип возврата AttributeMapper —
+    FullAttributeMappingResult.
     """
 
     results: List[MatchedBundle] = field(default_factory=list)
@@ -248,6 +243,77 @@ class AttributeMappingResult:
             "unresolved": list(self.unresolved),
         }
 
+# ===================================================================
+# Задача 1: межканальные связки — результат этапа 2 (v6.2)
+# ===================================================================
+
+@dataclass
+class CrossChannelMatch:
+    """
+    Группа атрибутов каналов, семантически эквивалентных друг другу,
+    но не имеющих соответствия в категории каталога.
+
+    Соответствует элементу crossChannelMatches[] в GET-ответе.
+    Минимум 2 channelMatches — одиночный атрибут группой не является.
+    """
+
+    confidence: float
+    comment: Optional[str] = None
+    channel_matches: List[ChannelMatch] = field(default_factory=list)
+
+    def to_dict(self) -> Dict:
+        """
+        Сериализация в camelCase по протоколу.
+
+        comment отдаётся всегда (в т.ч. null) — стабильно для FDM:
+        поле читается без проверки наличия ключа.
+        """
+        result: Dict = {
+            "confidence": self.confidence,
+            "comment": self.comment,
+            "channelMatches": [m.to_dict() for m in self.channel_matches],
+        }
+        return result
+
+@dataclass
+class CrossChannelMappingResult:
+    """
+    Результат второго этапа: список межканальных групп.
+
+    Пустой список — норма: все атрибуты каналов уже распределены
+    по связкам results первого этапа (или сопоставлять не с кем).
+    """
+
+    matches: List[CrossChannelMatch] = field(default_factory=list)
+
+    def to_dict(self) -> Dict:
+        """Сериализация: единый ключ crossChannelMatches по протоколу."""
+        return {
+            "crossChannelMatches": [m.to_dict() for m in self.matches],
+        }
+
+@dataclass
+class FullAttributeMappingResult:
+    """
+    Объединённый результат обоих этапов маппинга атрибутов.
+
+    Возвращаемый тип AttributeMapper.map_attributes() начиная с v6.2.
+    to_dict() формирует полный JSON result для БД и GET-ответа.
+    """
+
+    results: List[MatchedBundle] = field(default_factory=list)
+    unresolved: List[int] = field(default_factory=list)
+    cross_channel_matches: List[CrossChannelMatch] = field(default_factory=list)
+
+    def to_dict(self) -> Dict:
+        """Сериализация для GET-ответа при status=completed."""
+        return {
+            "results": [r.to_dict() for r in self.results],
+            "unresolved": list(self.unresolved),
+            "crossChannelMatches": [
+                m.to_dict() for m in self.cross_channel_matches
+            ],
+        }
 
 # ===================================================================
 # Задача 2: маппинг справочных значений — результат
@@ -279,7 +345,6 @@ class ValueMatch:
             result["confidence"] = self.confidence
         return result
 
-
 @dataclass
 class ChannelValueMappingResult:
     """
@@ -298,7 +363,6 @@ class ChannelValueMappingResult:
             "schemaChannelId": self.schema_channel_id,
             "matches": [m.to_dict() for m in self.matches],
         }
-
 
 @dataclass
 class ReferenceValueMappingResult:

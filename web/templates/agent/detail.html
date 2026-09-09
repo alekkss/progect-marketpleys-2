@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{# Макрос бейджа уверенности: переиспользуется в обеих таблицах #}
+{# Макрос бейджа уверенности: переиспользуется во всех таблицах #}
 {% macro confidence_badge(value) -%}
     {%- if value is not none -%}
         {%- if value >= 0.85 -%}
@@ -164,6 +164,46 @@
         <span class="inline-flex px-2.5 py-1 rounded-md bg-amber-50 border border-amber-200 text-amber-800 text-xs">
             {{ name }}
         </span>
+        {% endfor %}
+    </div>
+</div>
+{% endif %}
+
+<!-- Задача 1: межканальные связки без атрибута категории (v6.2) -->
+{% if job.task_type == 'attribute_mapping' and cross_channel_rows %}
+<div class="bg-white rounded-xl border border-slate-200 shadow-sm p-5 mb-6">
+    <h2 class="text-sm font-semibold text-slate-700 mb-1">
+        Межканальные связки
+        <span class="text-slate-400 font-normal">(без атрибута категории: {{ cross_channel_rows|length }})</span>
+    </h2>
+    <p class="text-xs text-slate-400 mb-4">
+        Атрибуты каналов, не имеющие соответствия в категории каталога,
+        но связанные между собой по смыслу.
+    </p>
+    <div class="space-y-3">
+        {% for group in cross_channel_rows %}
+        <div class="rounded-lg border border-slate-200 bg-slate-50 p-4">
+            <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+                <span class="text-xs font-medium text-slate-500 uppercase tracking-wide">
+                    Группа {{ loop.index }}
+                </span>
+                {{ confidence_badge(group.confidence) }}
+            </div>
+            <ul class="space-y-1.5">
+                {% for m in group.matches %}
+                <li class="text-xs text-slate-600 flex items-center flex-wrap gap-1">
+                    <span class="font-medium text-slate-700">{{ m.channel_name }}:</span>
+                    «{{ m.attribute_name }}»
+                    {{ confidence_badge(m.confidence) }}
+                </li>
+                {% endfor %}
+            </ul>
+            {% if group.comment %}
+            <p class="mt-2 pt-2 border-t border-slate-200 text-xs text-slate-500">
+                <span class="font-medium text-slate-600">Комментарий AI:</span> {{ group.comment }}
+            </p>
+            {% endif %}
+        </div>
         {% endfor %}
     </div>
 </div>

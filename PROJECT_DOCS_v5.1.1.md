@@ -1,4 +1,4 @@
-# Marketplace Sync — Актуальная документация проекта (v6.1)
+# Marketplace Sync — Актуальная документация проекта (v6.2)
 
 ## Назначение
 
@@ -7,7 +7,8 @@ Telegram-бот и веб-приложение для автоматическо
 Три канала доступа:
 - **Telegram-бот** — существующий интерфейс, работает без изменений
 - **Веб-сайт** (`https://ecommpedia.ru`) — браузерный интерфейс с drag&drop загрузкой, real-time прогрессом через WebSocket, скачиванием результатов
-- **Внешний REST API** (`https://ecommpedia.ru/v1/mapping-tasks`) — AI-агент маппинга PIM+FDM (v6.0): принимает задания от внешней системы FDM на сопоставление атрибутов категорий и справочных значений между маркетплейсами, Bearer-аутентификация, асинхронная обработка с GET-поллингом статуса
+- **Внешний REST API** (`https://ecommpedia.ru/v1/mapping-tasks`) — AI-агент маппинга PIM+FDM (v6.0): принимает задания от внешней системы FDM на сопоставление атрибутов категорий и справочных значений между маркетплейсами, Bearer-аутентификация, асинхронная обработка с GET-поллингом статуса. Задание attribute_mapping выполняется в два этапа (v6.2): сначала атрибуты категории ↔ атрибуты каналов, затем несопоставленные атрибуты каналов — между собой (блок `crossChannelMatches` в ответе)
+
 
 Все каналы используют общую бизнес-логику, единый пул БД и общий AIComparator с глобальным семафором AI-запросов. Файловые задачи идут через Redis TaskQueue, задания агента — через таблицу mapping_jobs в PostgreSQL (разные жизненные циклы).
 
@@ -28,7 +29,8 @@ Telegram-бот и веб-приложение для автоматическо
 │   ├─ sync/ (7 компонентов)                                      │
 │   └─ mapping/ (AI-агент PIM+FDM, v6.0):                          │
 │      models, validators, attribute_mapper,                      │
-│      reference_value_mapper, job_worker                         │
+│      reference_value_mapper, cross_channel_mapper (v6.2),       │
+│      job_worker                                                 │
 └───────────────────────────────┬──────────────────────────────────┘
                                  │
                 ┌────────────────┼─────────────────┐
@@ -75,7 +77,8 @@ Telegram-бот и веб-приложение для автоматическо
 - **Единая очередь** — и бот, и веб ставят задачи в одну TaskQueue. TaskWorker обрабатывает их одинаково, доставка результата зависит от `delivery_channel` в Task.
 - **Strategy для доставки** — `ResultDelivery` абстракция с двумя реализациями: `TelegramDelivery` (Bot.send_document) и `WebDelivery` (сохранение + WebSocket-уведомление).
 - **Бот не изменён** — все существующие хендлеры, FSM, клавиатуры работают как раньше. Веб-интерфейс — параллельный канал, а не замена.
-- **AI-агент маппинга PIM+FDM (v6.0)** — асинхронные задания из PostgreSQL (не Redis-очередь): `POST /v1/mapping-tasks` → таблица `mapping_jobs` → `MappingJobWorker` → результат через GET-поллинг FDM. Использует общий AIComparator: семафор(5) ограничивает AI-запросы суммарно с синхронизацией файлов.
+- **AI-агент маппинга PIM+FDM (v6.0)** — асинхронные задания из PostgreSQL (не Redis-очереди): `POST /v1/mapping-tasks` → таблица `mapping_jobs` → `MappingJobWorker` → результат через GET-поллинг FDM. Использует общий AIComparator: семафор(5) ограничивает AI-запросы суммарно с синхронизацией файлов.
+- **Двухэтапный маппинг атрибутов (v6.2)** — задание attribute_mapping оркестрирует два этапа внутри AttributeMapper: этап 1 (категория ↔ каналы, без изменений) и этап 2 (CrossChannelMapper: остаточные атрибуты каналов между собой). Второй этап — вложенная Strategy с собственным промптом; при отсутствии остатков пропускается без AI-запроса.
 - **Два независимых контура безопасности** — сайт: cookie-сессии + CSRF; API `/v1/*`: Bearer-токен `FDM_API_TOKEN`. `/v1/*` исключён из auth/csrf middleware, проверяется `api_auth_middleware` (constant-time сравнение, 401/503).
 
 ---
@@ -94,7 +97,8 @@ Telegram-бот и веб-приложение для автоматическо
 │   ├── value_validation.txt          # Валидация значений против справочников
 │   ├── mvm_column_matching.txt       # МВМ-сопоставление (4 источника)
 │   ├── attribute_mapping.txt         # Маппинг атрибутов PIM+FDM (v6.0)
-│   └── reference_value_mapping.txt   # Маппинг справочных значений PIM+FDM (v6.0)
+│   ├── reference_value_mapping.txt   # Маппинг справочных значений PIM+FDM (v6.0)
+│   └── cross_channel_attribute_mapping.txt # Межканальный маппинг остаточных атрибутов (v6.2)
 ├── /bot/                             # === TELEGRAM БОТ (без изменений) ===
 │   ├── bot.py                        # Инициализация бота, веб-сервера, жизненный цикл
 │   ├── storage.py                    # Глобальный Database + SessionStorage + init/shutdown
@@ -174,8 +178,8 @@ Telegram-бот и веб-приложение для автоматическо
 │   │   │   └── users.html            # Whitelist управление
 │   │   └── /agent/                   # Дашборд AI-агента (v6.0)
 │   │       ├── list.html             # История заданий FDM: поиск, пагинация
-│   │       └── detail.html           # Детализация: связки, confidence, unresolved
-
+│   │       └── detail.html           # Детализация: связки, confidence, unresolved,
+│   │                                 межканальные связки (v6.2)
 │   │
 │   └── /static/
 │       ├── /css/
@@ -200,10 +204,15 @@ Telegram-бот и веб-приложение для автоматическо
 │   │                                 # _FileCleanupService — раз в 24 ч удаляет файлы старше FILE_MAX_AGE_DAYS
 │   ├── /mapping/                     # === AI-АГЕНТ МАППИНГА PIM+FDM (v6.0) ===
 │   │   ├── __init__.py               # Пакет, экспорты
-│   │   ├── models.py                 # Dataclass-модели задач/результатов + to_dict() по протоколу
+│   │   ├── models.py                 # Dataclass-модели задач/результатов + to_dict() по протоколу;
+│   │   │                             # v6.2: +CrossChannelMatch, CrossChannelMappingResult,
+│   │   │                             # FullAttributeMappingResult (возвращаемый тип map_attributes)
 │   │   ├── validators.py             # Валидация payload (MappingValidationError: 400/422, путь до поля)
-│   │   ├── attribute_mapper.py       # Стратегия attribute_mapping + sanitize_confidence/truncate_comment
+│   │   ├── attribute_mapper.py       # Стратегия attribute_mapping (этап 1) + оркестрация этапа 2 (v6.2)
+│   │   │                             # + публичные хелперы sanitize_confidence/truncate_comment
 │   │   ├── reference_value_mapper.py # Стратегия reference_value_mapping (гарантия полноты matches)
+│   │   ├── cross_channel_mapper.py   # Стратегия этапа 2: межканальные связки остаточных
+│   │   │                             # атрибутов, промпт + пост-валидация групп (v6.2)
 │   │   └── job_worker.py             # MappingJobWorker: цикл очереди из БД, таймауты, graceful stop
 │   └── /sync/                        # Подпакет компонентов синхронизации (v4.2)
 │       ├── __init__.py               # Экспорты подпакета
@@ -281,7 +290,7 @@ Telegram-бот и веб-приложение для автоматическо
 7.1. **[Условно] Запуск MappingJobWorker** (v6.0, если `FDM_API_TOKEN` задан):
    - Создаётся с общим `ai_comparator` из шага 4 — НЕ собственный (глобальный семафор AI-запросов)
    - `recover_stale_mapping_jobs(0)` — зависшие processing-задания (следы падения процесса) → failed
-   - Основной цикл: `claim_pending_mapping_job()` (FOR UPDATE SKIP LOCKED, FIFO) + маршрутизация по `task_type` в мапперы
+   - Основной цикл: `claim_pending_mapping_job()` (FOR UPDATE SKIP LOCKED, FIFO) + маршрутизация по `task_type` в мапперы; attribute_mapping оркестрирует два этапа: AttributeMapper (этап 1) → CrossChannelMapper (этап 2, v6.2)
    - Цикл обслуживания: раз в 24 ч `cleanup_old_mapping_jobs(AGENT_JOBS_RETENTION_DAYS)`
    - Graceful degradation: ошибка запуска агента (нет промпта, сбой БД) — бот и веб продолжают работу, `/v1/*` отвечает 503
 
@@ -498,11 +507,11 @@ mapping_jobs            # Задания AI-агента маппинга PIM+FD
   - schema_id BIGINT NOT NULL        -- ИД схемы FDM (внешняя система, НЕ FK)
   - status TEXT DEFAULT 'pending'    -- pending → processing → completed | failed (CHECK; 'cancelled' зарезервирован)
   - payload JSONB NOT NULL           -- исходный JSON запроса FDM
-  - result JSONB                     -- итоговый JSON по протоколу
+  - result JSONB                     -- итоговый JSON по протоколу (задача 1 v6.2: results + unresolved + crossChannelMatches)
   - channels JSONB DEFAULT '[]'      -- [{platform, name, schemaChannelId}] для дашборда
   - category_name TEXT               -- заголовок задания в дашборде (задача 1)
   - attribute_name TEXT              -- заголовок задания в дашборде (задача 2)
-  - matched_count INTEGER            -- сопоставлено связок/значений
+  - matched_count INTEGER            -- задача 1: связки results + межканальные группы (v6.2); задача 2: значения
   - unresolved_count INTEGER         -- без соответствий
   - duration_sec REAL                -- completed_at − started_at (вычисляется в SQL)
   - error_message TEXT
@@ -635,7 +644,8 @@ async def cleanup_old_mapping_jobs(self, retention_days) -> int
 
 GET-ответы по статусам:
 - `pending` / `processing` → `{"jobId", "status"}`
-- `completed` → `{"jobId", "status", ...result}` — ключи result разворачиваются на верхний уровень (`results`+`unresolved` для задачи 1, `channels` для задачи 2)
+- `completed` → `{"jobId", "status", ...result}` — ключи result разворачиваются на верхний уровень (`results`+`unresolved`+`crossChannelMatches` для задачи 1, `channels` для задачи 2)
+- `crossChannelMatches[]` (v6.2) — межканальные группы: `{confidence, comment|null, channelMatches[{schemaChannelId, channelAttributeId, confidence}]}`. Атрибуты каналов, не имеющие соответствия в категории каталога, но связанные между собой по смыслу. Ключ присутствует всегда у новых заданий (может быть пустым массивом `[]`); FDM безопасно игнорирует его при отсутствии обработки
 - `failed` → `{"jobId", "status", "error": "<причина>"}`
 
 Коды ошибок POST: 400 (тело не JSON), 422 (семантические ошибки валидации — с путём до поля), 401 (нет/невалиден токен), 503 (агент выключен: `FDM_API_TOKEN` пуст). Все ответы — JSON (включая 404/405/500 на `/v1/*` — см. errors-middleware).
@@ -652,9 +662,13 @@ FDM → GET /v1/mapping-tasks/{jobId} каждые 3 сек
 MappingJobWorker (цикл, пауза 5 сек при пустой очереди)
 → claim_pending_mapping_job (FOR UPDATE SKIP LOCKED, FIFO)
 → parse_mapping_task → маршрутизация по task_type
-→ AttributeMapper | ReferenceValueMapper
-→ ОДИН AI-запрос через общий AIComparator (call_ai_json)
-→ пост-валидация всех ID против входных данных
+→ AttributeMapper (этап 1: атрибуты категории ↔ каналы) | ReferenceValueMapper
+→ [только attribute_mapping, v6.2] сбор остаточных атрибутов каналов
+  (не вошедших ни в одну связку results) → CrossChannelMapper
+  (этап 2: атрибуты каналов ↔ атрибуты каналов)
+→ ДО ДВУХ AI-запросов на задание attribute_mapping, ОДИН — для остальных
+  (общий AIComparator, call_ai_json, глобальный семафор)
+→ пост-валидация всех ID против входных данных (обоих этапов)
 → mark_mapping_job_completed(result, счётчики) | failed(error)
 → FDM получает result при следующем GET
 
@@ -670,6 +684,9 @@ MappingJobWorker (цикл, пауза 5 сек при пустой очеред
 **AttributeMapper** (`attribute_mapper.py`, промпт `prompts/attribute_mapping.txt`):
 - Плейсхолдеры промпта: `category_name`, `category_path`, `attributes_json`, `channels_json`
 - LLM возвращает `matches[]`: `{mappingId, confidence, comment, channelMatches[{schemaChannelId, channelAttributeId, confidence}]}`
+- Оркестрация двух этапов (v6.2): конструктор принимает инжектируемый CrossChannelMapper; после этапа 1 `_collect_remaining_channels()` строит каналы только с остаточными атрибутами (без мутации task — новые объекты ChannelInfo) и делегирует этап 2
+- Возвращаемый тип (v6.2): `FullAttributeMappingResult` (results + unresolved + cross_channel_matches); `AttributeMappingResult` сохранён для обратной совместимости (этап 1 в изоляции)
+- Ошибка любого этапа → задание failed целиком: частичный результат протоколом не предусмотрен
 - Пост-валидация: mappingId существует во входных атрибутах; schemaChannelId/channelAttributeId существуют и в ЭТОМ канале; атрибут канала используется один раз по результату; связка без валидных channelMatches → unresolved
 - `infomodelAttributeId` берётся из входных данных по mappingId (LLM его не возвращает)
 - `unresolved` вычисляется детерминированно: все входные mappingId минус решённые — списку AI не доверяется
@@ -681,6 +698,16 @@ MappingJobWorker (цикл, пауза 5 сек при пустой очеред
 - Полнота гарантируется кодом: ровно одна запись на каждое значение категории в каждом канале; недостающие/отклонённые → детерминированные null
 - Быстрый путь: все справочники каналов пусты → null-результат без AI-запроса
 
+**CrossChannelMapper** (`cross_channel_mapper.py`, промпт `prompts/cross_channel_attribute_mapping.txt`, v6.2):
+- Стратегия этапа 2 задания attribute_mapping: межканальные связки остаточных атрибутов каналов
+- Плейсхолдеры промпта: `category_name`, `category_path`, `channels_json` (в каналах — ТОЛЬКО остаточные атрибуты)
+- LLM возвращает `groups[]`: `{confidence, comment, channelMatches[{schemaChannelId, channelAttributeId, confidence}]}`
+- Быстрые пути без AI-запроса: каналов с остаточными атрибутами меньше двух
+- Пост-валидация: каждый ID — против входных данных; группа валидна только при ≥ 2 РАЗНЫХ schemaChannelId (одиночный атрибут — не межканальная связка)
+- Двухфазная фиксация занятости: channelAttributeId помечается занятым только ПОСЛЕ принятия группы — отклонённая группа освобождает атрибуты для последующих групп LLM, при сохранении глобальной уникальности по результату
+- Переиспользует публичные хелперы `sanitize_confidence`/`truncate_comment` из attribute_mapper
+
+
 **Общие хелперы** (публичные функции `attribute_mapper.py`): `sanitize_confidence()` (число 0..1, проценты 87 → 0.87), `truncate_comment()` (≤200 символов).
 
 ### MappingJobWorker (`services/mapping/job_worker.py`)
@@ -688,6 +715,9 @@ MappingJobWorker (цикл, пауза 5 сек при пустой очеред
 - Параллелизм: `Semaphore(AGENT_MAX_CONCURRENT_JOBS=3)` — слот берётся ПОСЛЕ claim и ДО создания Task (backpressure)
 - Таймаут: `wait_for(AGENT_JOB_TIMEOUT_SEC=240)` → failed «Превышен таймаут обработки» (укладывается в 5-минутный бюджет поллинга FDM)
 - Отличие таймаута от остановки: таймаут → TimeoutError → «таймаут»; stop() → CancelledError → «воркер остановлен» — FDM в обоих случаях получает внятный error
+- Счётчики (v6.2): для attribute_mapping `matched_count = len(results) + len(crossChannelMatches)` — суммарные связки обоих этапов; `unresolved_count` — только атрибуты категории без пары (межканальные группы туда не входят)
+- Мапперы создаются в порядке: CrossChannelMapper → AttributeMapper(…, cross_channel_mapper) → ReferenceValueMapper — CrossChannelMapper является зависимостью AttributeMapper
+- Задание attribute_mapping делает до двух AI-запросов — по-прежнему укладывается в AGENT_JOB_TIMEOUT_SEC=240 и 5-минутный бюджет поллинга FDM
 - Остановка: grace 30 сек, затем отмена остатка; `_safe_fail` пишет причину best-effort
 - Обслуживание: раз в 24 ч `cleanup_old_mapping_jobs(AGENT_JOBS_RETENTION_DAYS=30)`
 - При старте: `recover_stale_mapping_jobs(0)` — processing-задания от упавшего процесса → failed
@@ -736,14 +766,15 @@ Access-лог nginx: /var/log/nginx/agent_api_access.log (ротация ста�
 ### Дашборд оператора (/agent)
 
 - `GET /agent` — таблица: jobId (обрезан до 12 симв.), заголовок, тип, схема #, каналы, дата, длительность, статус-бейдж, счётчики ✓/?; поиск по schema_id/категории/атрибуту; пагинация 20/стр
-- `GET /agent/{job_id}` — шапка задания, причина ошибки (failed), таблица связок (атрибут → соответствия по каналам, confidence-бейджи ≥85%/≥70%/ниже, комментарий LLM), блок unresolved-чипов; для задачи 2 — матрица «значение категории × каналы»
+- `GET /agent/{job_id}` — шапка задания, причина ошибки (failed), таблица связок (атрибут → соответствия по каналам, confidence-бейджи ≥85%/≥70%/ниже, комментарий LLM), блок unresolved-чипов; блок «Межканальные связки» (v6.2: группы атрибутов каналов без атрибута категории — канал → «название», confidence-бейджи, комментарий AI; скрывается при пустом списке и у старых заданий); для задачи 2 — матрица «значение категории × каналы»
+- `_build_cross_channel_rows` в `web/routes/agent.py` восстанавливает названия каналов/атрибутов из payload по ID; lookup-хелперы каналов общие с `_build_attribute_rows`
 - Доступ: @admin_required (owner/admin); пункт меню «Агент» в base.html внутри условия owner/admin
 - Названия атрибутов/каналов восстанавливаются из payload по ID (result хранит только ID по протоколу)
 
 ### Мониторинг
 
 - Access-лог nginx: /var/log/nginx/agent_api_access.log (ротация стандартным logrotate)
-- Логгеры приложения: mapping.job_worker, mapping.attribute_mapper, mapping.reference_value_mapper, web.routes.v1_api
+- Логгеры приложения: mapping.job_worker, mapping.attribute_mapper, mapping.reference_value_mapper, mapping.cross_channel_mapper, web.routes.v1_api
 - Дашборд /agent — история с длительностями и счётчиками
 
 
@@ -1982,7 +2013,14 @@ server {
 - jobId — `secrets.token_hex(16)` (32 hex): непредсказуем, защита от перебора чужих заданий
 - Пустой справочник канала (`referenceValues=[]`) — все значения категории получают null, AI-запрос не нужен
 - Дашборд `/agent` — `@admin_required`; названия в детализации восстанавливаются из payload (result хранит только ID)
-- Промпты маппинга (`attribute_mapping.txt`, `reference_value_mapping.txt`) читаются один раз в конструкторах мапперов — отсутствие файла = ошибка запуска воркера (fail fast)
+- Промпты маппинга (`attribute_mapping.txt`, `reference_value_mapping.txt`, `cross_channel_attribute_mapping.txt`) читаются один раз в конструкторах мапперов — отсутствие любого файла = ошибка запуска воркера (fail fast)
+- `AttributeMapper` создаётся с двумя аргументами: `AttributeMapper(ai_comparator, cross_channel_mapper)` — порядок создания в `MappingJobWorker.__init__` критичен: сначала CrossChannelMapper, затем AttributeMapper
+- Один и тот же `channelAttributeId` канала встречается не более одного раза по всему результату задания — ни в `results`, ни в `crossChannelMatches`
+- Межканальная группа валидна только при ≥ 2 РАЗНЫХ `schemaChannelId`; занятость атрибута фиксируется ПОСЛЕ принятия группы (двухфазная схема) — НЕ переносить проверку уникальности внутрь валидации элемента
+- `_collect_remaining_channels` НЕ мутирует task — создаются новые ChannelInfo с остаточными атрибутами
+- `crossChannelMapper` импортирует `sanitize_confidence`/`truncate_comment` из `attribute_mapper` в рантайме — обратный импорт в attribute_mapper только через `if TYPE_CHECKING` (исключение циклической зависимости)
+- `crossChannelMatches` всегда присутствует в result новых заданий attribute_mapping (может быть `[]`) — стабильная структура ответа для FDM; у заданий до v6.2 ключа нет, дашборд рендерится без блока
+
 
 
 ### Критичные зависимости
@@ -2084,6 +2122,11 @@ server {
 - [x] Редизайн веб-интерфейса: группировка меню (рабочие/управление), SVG-иконки, шрифт Inter, обновлённый dashboard,刷新лённые badges/drop-zone/modal (v6.1)
 - [x] Исправлена 404 на /agent: добавлена setup_agent_routes + регистрация в setup_routes, user/csrf_token в контексте шаблонов (v6.1)
 - [x] Исправлена 403 на /static/: ACL-права www-data на /root/progect/web/static + default-ACL для новых файлов (v6.1)
+- [x] Межканальный маппинг атрибутов (v6.2): этап 2 задания attribute_mapping — CrossChannelMapper, блок crossChannelMatches в GET-ответе
+- [x] Модели CrossChannelMatch, CrossChannelMappingResult, FullAttributeMappingResult (v6.2)
+- [x] Промпт cross_channel_attribute_mapping.txt + пост-валидация групп (минимум 2 разных канала, двухфазная фиксация занятости) (v6.2)
+- [x] Счётчик matched_count суммарный по этапам; result JSONB + crossChannelMatches — без миграции БД (v6.2)
+- [x] Дашборд /agent: блок «Межканальные связки» в детализации с восстановлением названий из payload (v6.2)
 - [ ] DELETE /v1/mapping-tasks/{jobId} — отмена задания (статус 'cancelled' уже зарезервирован в CHECK)
 
 
@@ -2132,13 +2175,16 @@ server {
 
 **AI-агент маппинга PIM+FDM (v6.0):**
 - `FDM_API_TOKEN` пустой — агент выключен: `/v1/*` отвечает 503, бот/веб работают
-- Таймаут обработки задания 240 сек (`AGENT_JOB_TIMEOUT_SEC`) — сверх него задание → failed
+- Таймаут обработки задания 240 сек (`AGENT_JOB_TIMEOUT_SEC`) — сверх него задание → failed; задание attribute_mapping выполняет до двух AI-запросов (этапы 1 и 2), но укладывается в таймаут
+- Этап 2 attribute_mapping пропускается без AI-запроса, если каналов с остаточными атрибутами меньше двух
 - Максимум 3 параллельных задания агента (`AGENT_MAX_CONCURRENT_JOBS`), остальные ждут в БД (FIFO)
 - Payload ограничен валидатором: ≤100 атрибутов категории, ≤20 каналов, ≤500 атрибутов канала, ≤1000 значений категории, ≤2000 значений канала (сверх — 422)
 - Поллинг FDM: рекомендация 3 сек, бюджет 5 мин — сверх бюджета задание гарантированно терминальное
 - DELETE-эндпоинт не реализован (отложен) — aiohttp отвечает 405
 - История заданий хранится 30 дней (`AGENT_JOBS_RETENTION_DAYS`), затем удаляется
 - Тело запроса `/v1/*`: nginx ограничивает 10 МБ (`client_max_body_size`); превышение — HTML 413 от nginx (на практике недостижимо: валидатор режет раньше)
+- GET-ответ completed содержит поле `crossChannelMatches` (v6.2) — FDM обязан корректно обрабатывать неизвестные поля (или обновить интеграцию)
+
 
 
 ---
@@ -2268,8 +2314,21 @@ Nginx кэширует статику в браузере на 7 дней (`expi
 **Почему /v1/* исключён из CSRF?**
 CSRF-атака эксплуатирует автоматическую отправку cookie браузером. FDM сознательно кладёт `Authorization` в заголовок — сторонняя страница не способна его прочитать или заставить браузер отправить. Bearer-заголовок сам является proof-of-origin.
 
+**Что такое crossChannelMatches в ответе?**
+Межканальные связки (v6.2): атрибуты каналов, не сопоставленные с категорией каталога на этапе 1, но связанные между собой по смыслу (например, «Особенности модели» у Ozon ↔ «Особенности» у WB). FDM использует их, чтобы присвоить связкам общий атрибут категории (копированием или вручную). Поле всегда присутствует у новых заданий и может быть пустым массивом.
+
+**Почему задание attribute_mapping делает два AI-запроса?**
+Этап 1 — атрибуты категории ↔ атрибуты каналов (как в v6.1). Этап 2 — остаточные атрибуты каналов между собой. Второй запрос пропускается, если остатков нет или канал с остатками один.
+
+**Что если LLM сгруппирует атрибуты одного канала?**
+Пост-валидация требует минимум два РАЗНЫХ schemaChannelId в группе; невалидная группа отбрасывается, а её атрибуты освобождаются для других групп (двухфазная фиксация занятости). Списку AI, как и на этапе 1, не доверяется ни одна ссылка.
+
+**Что происходит при ошибке второго этапа?**
+Задание помечается failed целиком — частичный результат (этап 1 без этапа 2) протоколом не предусмотрен. FDM повторяет запрос.
+
+
 ---
 
-**Версия документации:** 6.1
+**Версия документации:** 6.2
 **Дата обновления:** Сентябрь 2026
 **Автор проекта:** Александр

@@ -11,21 +11,31 @@
     2. Основной цикл атомарно забирает старейшее pending-задание
        из БД (FOR UPDATE SKIP LOCKED) и запускает обработку.
     3. Маршрутизация по task_type (Strategy):
-        - attribute_mapping       → AttributeMapper
+        - attribute_mapping       → AttributeMapper (этап 1) +
+                                    CrossChannelMapper (этап 2, v6.2:
+                                    межканальные связки остаточных
+                                    атрибутов)
         - reference_value_mapping → ReferenceValueMapper
     4. Таймаут AGENT_JOB_TIMEOUT_SEC: зависшее задание помечается
        failed — укладывается в 5-минутный бюджет поллинга FDM.
     5. Раз в сутки удаляются завершённые задания старше
        AGENT_JOBS_RETENTION_DAYS.
 
+Счётчик matched_count задания attribute_mapping — суммарное число
+связок ОБОИХ этапов: results + crossChannelMatches (v6.2). Поле
+unresolved_count — только атрибуты категории без соответствия,
+межканальные группы туда не входят.
+
 AI-запросы идут через ОБЩИЙ AIComparator приложения: глобальный
 семафор компаратора ограничивает суммарную нагрузку на LLM-провайдера
 вместе с синхронизацией файлов (п. 4.3 доработок).
 
 Паттерн: Service Layer — координация очереди, стратегий и БД.
-Паттерн: Strategy — выбор маппера по task_type.
+Паттерн: Strategy — выбор маппера по task_type; этап 2 маппинга
+атрибутов — вложенная стратегия CrossChannelMapper.
 Паттерн: Dependency Injection — AIComparator инжектируется извне,
-Database берётся из bot.storage (глобальный пул приложения).
+CrossChannelMapper передаётся в AttributeMapper явно, Database
+берётся из bot.storage (глобальный пул приложения).
 """
 
 import asyncio
@@ -33,8 +43,9 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set
 
 from config.config import Config
 from services.mapping.attribute_mapper import AttributeMapper
+from services.mapping.cross_channel_mapper import CrossChannelMapper
 from services.mapping.models import (
-    AttributeMappingResult,
+    FullAttributeMappingResult,
     ReferenceValueMappingResult,
 )
 from services.mapping.reference_value_mapper import ReferenceValueMapper
@@ -100,8 +111,12 @@ class MappingJobWorker:
         self._maintenance_task: Optional[asyncio.Task] = None
         self._active_tasks: Set[asyncio.Task] = set()
 
-        # Стратегии обработки: создаются один раз, промпты с диска — один раз
-        self._attribute_mapper = AttributeMapper(ai_comparator)
+        # Стратегии обработки: создаются один раз, промпты с диска — один раз.
+        # Порядок критичен: CrossChannelMapper — зависимость AttributeMapper.
+        self._cross_channel_mapper = CrossChannelMapper(ai_comparator)
+        self._attribute_mapper = AttributeMapper(
+            ai_comparator, self._cross_channel_mapper
+        )
         self._reference_mapper = ReferenceValueMapper(ai_comparator)
 
     # ===================================================================
@@ -338,6 +353,11 @@ class MappingJobWorker:
             2. Маршрутизация по task_type в стратегию.
             3. Запись результата и счётчиков в БД (completed).
 
+        Задание attribute_mapping оркестрирует оба этапа внутри
+        AttributeMapper (этап 2 — CrossChannelMapper); суммарная
+        длительность укладывается в AGENT_JOB_TIMEOUT_SEC (каждый
+        этап — один AI-запрос).
+
         Args:
             job: {job_id, task_type, schema_id, payload}
 
@@ -351,9 +371,13 @@ class MappingJobWorker:
         task = parse_mapping_task(job["payload"])
 
         if task.task_type == "attribute_mapping":
-            result: AttributeMappingResult = await self._attribute_mapper.map_attributes(task)
+            result: FullAttributeMappingResult = (
+                await self._attribute_mapper.map_attributes(task)
+            )
             result_dict = result.to_dict()
-            matched_count = len(result.results)
+            # Суммарные связки обоих этапов: results + межканальные
+            # группы (v6.2) — полная картина в дашборде без разбиения
+            matched_count = len(result.results) + len(result.cross_channel_matches)
             unresolved_count = len(result.unresolved)
         else:
             value_result: ReferenceValueMappingResult = (

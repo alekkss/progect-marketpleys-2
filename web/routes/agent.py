@@ -8,7 +8,10 @@ POST /v1/mapping-tasks (п. 6 доработок):
                            схема, каналы, тип маппинга, дата,
                            длительность, статус, счётчики
     GET /agent/{job_id}  — детализация: произведённые связки
-                           с confidence и нераспознанное
+                           с confidence и нераспознанное; для
+                           attribute_mapping дополнительно блок
+                           межканальных связок без атрибута
+                           категории (v6.2)
 
 Доступ — через СУЩЕСТВУЮЩУЮ cookie-авторизацию сайта,
 только роли admin и owner (@admin_required, п. 6.4 доработок).
@@ -195,14 +198,17 @@ async def agent_job_detail(request: Request) -> Response:
     GET /agent/{job_id} — детализация задания (п. 6.3).
 
     Показывает произведённые связки (атрибуты или значения),
-    уверенность каждой связки и нераспознанное.
+    уверенность каждой связки и нераспознанное. Для заданий
+    attribute_mapping дополнительно готовятся межканальные
+    связки без атрибута категории (v6.2).
 
     Контекст шаблона agent/detail.html:
-        job             — общие данные задания (заголовок, статусы)
-        attribute_rows  — строки для attribute_mapping
-        unresolved_rows — названия нераспознанных атрибутов
-        value_rows      — строки для reference_value_mapping
-        user, csrf_token — обязательные для base.html
+        job                — общие данные задания (заголовок, статусы)
+        attribute_rows     — строки для attribute_mapping
+        unresolved_rows    — названия нераспознанных атрибутов
+        cross_channel_rows — межканальные группы атрибутов (v6.2)
+        value_rows         — строки для reference_value_mapping
+        user, csrf_token   — обязательные для base.html
     """
     user_data = request["user"]
     csrf_token = get_csrf_token(request)
@@ -234,16 +240,18 @@ async def agent_job_detail(request: Request) -> Response:
         },
         "attribute_rows": [],
         "unresolved_rows": [],
+        "cross_channel_rows": [],
         "value_rows": [],
     }
 
     result = job.get("result")
 
-    # --- Задача 1: связки атрибутов ---
+    # --- Задача 1: связки атрибутов + межканальные группы (v6.2) ---
     if job["task_type"] == "attribute_mapping":
         context["attribute_rows"], context["unresolved_rows"] = (
             _build_attribute_rows(job)
         )
+        context["cross_channel_rows"] = _build_cross_channel_rows(job)
     # --- Задача 2: пары значений ---
     elif job["task_type"] == "reference_value_mapping" and result:
         context["value_rows"] = _build_value_rows(job)
@@ -259,9 +267,53 @@ async def agent_job_detail(request: Request) -> Response:
 # Подготовка строк детализации
 # ===================================================================
 # Хелперы собирают плоские структуры из payload и result — шаблон
-# (шаг 23) остаётся чистым отображением без вложенной логики.
-# Данные достаются из payload потому, что результат хранит только ID,
+# остаётся чистым отображением без вложенной логики. Данные
+# достаются из payload потому, что результат хранит только ID,
 # а оператору нужны человекочитаемые названия атрибутов и каналов.
+
+def _build_payload_channel_index(payload: Dict[str, Any]) -> Dict[Any, Dict[str, Any]]:
+    """
+    Индекс каналов payload: schemaChannelId → канал.
+
+    Общий хелпер для построителей строк tasks 1 и v6.2 —
+    и связки, и межканальные группы ссылаются на одни каналы.
+    """
+    return {
+        ch.get("schemaChannelId"): ch
+        for ch in payload.get("channels", [])
+        if isinstance(ch, dict)
+    }
+
+
+def _channel_display_name(
+    channels_by_id: Dict[Any, Dict[str, Any]],
+    schema_channel_id: Any,
+) -> str:
+    """
+    Название канала по schemaChannelId (с fallback на ID).
+    """
+    channel = channels_by_id.get(schema_channel_id)
+    if not channel:
+        return f"Канал {schema_channel_id}"
+    return str(channel.get("name") or channel.get("platform") or schema_channel_id)
+
+
+def _channel_attribute_display_name(
+    channels_by_id: Dict[Any, Dict[str, Any]],
+    schema_channel_id: Any,
+    channel_attribute_id: Any,
+) -> str:
+    """
+    Название атрибута канала по паре ID (с fallback на ID).
+    """
+    channel = channels_by_id.get(schema_channel_id)
+    if not channel:
+        return f"Атрибут {channel_attribute_id}"
+    for attr in channel.get("attributes", []):
+        if isinstance(attr, dict) and attr.get("channelAttributeId") == channel_attribute_id:
+            return str(attr.get("name") or channel_attribute_id)
+    return f"Атрибут {channel_attribute_id}"
+
 
 def _build_attribute_rows(job: Dict[str, Any]) -> tuple:
     """
@@ -280,32 +332,13 @@ def _build_attribute_rows(job: Dict[str, Any]) -> tuple:
     payload = job.get("payload") or {}
     result = job.get("result") or {}
 
-    # Индексы payload: ID → названия
+    # Индекс payload: mappingId → атрибут категории
     attrs_by_mapping: Dict[int, Dict[str, Any]] = {
         attr.get("mappingId"): attr
         for attr in payload.get("category", {}).get("attributes", [])
         if isinstance(attr, dict)
     }
-    channels_by_id: Dict[int, Dict[str, Any]] = {
-        ch.get("schemaChannelId"): ch
-        for ch in payload.get("channels", [])
-        if isinstance(ch, dict)
-    }
-
-    def _channel_name(schema_channel_id: Any) -> str:
-        channel = channels_by_id.get(schema_channel_id)
-        if not channel:
-            return f"Канал {schema_channel_id}"
-        return str(channel.get("name") or channel.get("platform") or schema_channel_id)
-
-    def _channel_attr_name(schema_channel_id: Any, channel_attribute_id: Any) -> str:
-        channel = channels_by_id.get(schema_channel_id)
-        if not channel:
-            return f"Атрибут {channel_attribute_id}"
-        for attr in channel.get("attributes", []):
-            if isinstance(attr, dict) and attr.get("channelAttributeId") == channel_attribute_id:
-                return str(attr.get("name") or channel_attribute_id)
-        return f"Атрибут {channel_attribute_id}"
+    channels_by_id = _build_payload_channel_index(payload)
 
     rows: List[Dict[str, Any]] = []
     for match in result.get("results", []):
@@ -323,10 +356,11 @@ def _build_attribute_rows(job: Dict[str, Any]) -> tuple:
             if not isinstance(channel_match, dict):
                 continue
             channel_matches.append({
-                "channel_name": _channel_name(
-                    channel_match.get("schemaChannelId")
+                "channel_name": _channel_display_name(
+                    channels_by_id, channel_match.get("schemaChannelId")
                 ),
-                "attribute_name": _channel_attr_name(
+                "attribute_name": _channel_attribute_display_name(
+                    channels_by_id,
                     channel_match.get("schemaChannelId"),
                     channel_match.get("channelAttributeId"),
                 ),
@@ -349,6 +383,59 @@ def _build_attribute_rows(job: Dict[str, Any]) -> tuple:
         )
 
     return rows, unresolved_rows
+
+
+def _build_cross_channel_rows(job: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Строит строки межканальных связок для detail-страницы (v6.2).
+
+    Для каждой группы из result.crossChannelMatches[] подставляет
+    названия атрибутов каналов из payload (по channelAttributeId)
+    и названия каналов (по schemaChannelId). Структура matches
+    идентична _build_attribute_rows — шаблон переиспользует
+    тот же паттерн отрисовки.
+
+    Старые задания (до v6.2) не содержат ключ crossChannelMatches
+    в result — get() возвращает пустой список, блок просто
+    не отображается.
+
+    Returns:
+        Список [{confidence, comment, matches:
+        [{channel_name, attribute_name, confidence}]}]
+    """
+    payload = job.get("payload") or {}
+    result = job.get("result") or {}
+
+    channels_by_id = _build_payload_channel_index(payload)
+
+    rows: List[Dict[str, Any]] = []
+    for group in result.get("crossChannelMatches", []):
+        if not isinstance(group, dict):
+            continue
+
+        channel_matches: List[Dict[str, Any]] = []
+        for channel_match in group.get("channelMatches", []):
+            if not isinstance(channel_match, dict):
+                continue
+            channel_matches.append({
+                "channel_name": _channel_display_name(
+                    channels_by_id, channel_match.get("schemaChannelId")
+                ),
+                "attribute_name": _channel_attribute_display_name(
+                    channels_by_id,
+                    channel_match.get("schemaChannelId"),
+                    channel_match.get("channelAttributeId"),
+                ),
+                "confidence": channel_match.get("confidence"),
+            })
+
+        rows.append({
+            "confidence": group.get("confidence"),
+            "comment": group.get("comment"),
+            "matches": channel_matches,
+        })
+
+    return rows
 
 
 def _build_value_rows(job: Dict[str, Any]) -> List[Dict[str, Any]]:
